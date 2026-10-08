@@ -1,0 +1,120 @@
+diff --git a/.github/workflows/soroban-compatibility.yml b/.github/workflows/soroban-compatibility.yml
+new file mode 100644
+index 0000000..508a5f4
+--- /dev/null
++++ b/.github/workflows/soroban-compatibility.yml
+@@ -0,0 +1,42 @@
++name: Soroban 21 Compatibility
++
++on:
++  pull_request:
++    branches: [main]
++    paths:
++      - Cargo.toml
++      - Cargo.lock
++      - src/**
++      - .github/workflows/soroban-compatibility.yml
++  push:
++    branches: [main]
++    paths:
++      - Cargo.toml
++      - Cargo.lock
++      - src/**
++      - .github/workflows/soroban-compatibility.yml
++
++permissions:
++  contents: read
++
++jobs:
++  compatibility:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Install Rust
++        uses: dtolnay/rust-toolchain@stable
++        with:
++          targets: wasm32v1-none
++
++      - name: Test against the Soroban host simulator without warnings
++        env:
++          RUSTFLAGS: -D warnings
++        run: cargo test --lib
++
++      - name: Install Stellar CLI
++        run: cargo install --locked stellar-cli
++
++      - name: Build Soroban runtime artifact
++        run: stellar contract build
+diff --git a/Cargo.toml b/Cargo.toml
+index 6d1aae7..826f3ac 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -2,6 +2,7 @@
+ name = "latterfix-smart-contract"
+ version = "0.2.0"
+ edition = "2021"
++rust-version = "1.84"
+ authors = ["LatterFix Team"]
+ description = "Decentralized task management protocol with escrow, governance, and reputation system on Stellar/Soroban"
+ license = "MIT"
+@@ -15,10 +16,10 @@ name = "task_manager_pro"
+ crate-type = ["cdylib", "rlib"]
+ 
+ [dependencies]
+-soroban-sdk = "21.7.0"
++soroban-sdk = "=21.7.7"
+ 
+ [dev-dependencies]
+-soroban-sdk = { version = "21.7.0", features = ["testutils"] }
++soroban-sdk = { version = "=21.7.7", features = ["testutils"] }
+ # Used only by tests to produce real Ed25519 signatures for the gasless
+ # assignment path; already in the lock graph via soroban-sdk testutils.
+ ed25519-dalek = "2"
+@@ -41,4 +42,4 @@ opt-level = 1
+ debug = true
+ 
+ [package.metadata.docs.rs]
+-targets = ["wasm32-unknown-unknown"]
++targets = ["wasm32v1-none"]
+diff --git a/README.md b/README.md
+index 99c14be..1119c03 100644
+--- a/README.md
++++ b/README.md
+@@ -3,11 +3,11 @@
+ ### Prerequisites
+ 
+ ```bash
+-# Install Rust
++# Install Rust (1.84+ provides the Soroban-supported wasm32v1-none target)
+ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+ 
+ # Add WebAssembly target
+-rustup target add wasm32-unknown-unknown
++rustup target add wasm32v1-none
+ 
+ # Install Stellar CLI
+ cargo install --locked stellar-cli
+@@ -16,17 +16,11 @@ cargo install --locked stellar-cli
+ ### Run Tests
+ 
+ ```bash
+-cargo test
++RUSTFLAGS="-D warnings" cargo test --lib
+ ```
+ 
+ ### Build WASM Binary
+ 
+-```bash
+-cargo build --target wasm32-unknown-unknown --release
+-```
+-
+-### Build Optimized WASM
+-
+ ```bash
+ stellar contract build
+ ```
+@@ -41,7 +35,7 @@ stellar network add testnet  
+ # Deploy
+ stellar contract deploy -  --wasm target/wasm32-unknown-unknown/release/task_manager_pro.wasm +  --wasm target/wasm32v1-none/release/task_manager_pro.wasm    --network testnet    --source <your-account>
+ ```

@@ -1,0 +1,70 @@
+From ff3ef3e951691988e448a286dea2fc81d81c7969 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:56:32 +0000
+Subject: [PATCH] test: assert early-exit penalty breakdown and backdrop cancel
+ (#1909)
+
+Extend the CommitmentEarlyExitModal suite with the two behaviours named in
+the issue that were not yet asserted:
+
+- the original amount, penalty label/amount and net amount are all rendered
+  while the user is asked to acknowledge the penalty
+- clicking the backdrop calls onCancel, while clicks inside the panel do not
+  (panel stopPropagation), and neither path calls onConfirm
+---
+ .../CommitmentEarlyExitModal.test.tsx         | 41 +++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/src/components/CommitmentEarlyExitModal/CommitmentEarlyExitModal.test.tsx b/src/components/CommitmentEarlyExitModal/CommitmentEarlyExitModal.test.tsx
+index d77f3284..2af3f5f3 100644
+--- a/src/components/CommitmentEarlyExitModal/CommitmentEarlyExitModal.test.tsx
++++ b/src/components/CommitmentEarlyExitModal/CommitmentEarlyExitModal.test.tsx
+@@ -103,4 +103,45 @@ describe('CommitmentEarlyExitModal', () => {
+     expect(onCancel).toHaveBeenCalledTimes(1);
+     expect(onConfirm).not.toHaveBeenCalled();
+   });
++
++  it('shows the penalty breakdown the user is acknowledging', () => {
++    render(
++      <CommitmentEarlyExitModal
++        {...amounts}
++        isOpen
++        hasAcknowledged={false}
++        onChangeAcknowledged={vi.fn()}
++        onCancel={vi.fn()}
++        onConfirm={vi.fn()}
++      />,
++    );
++
++    expect(screen.getByText('$100.00')).toBeInTheDocument();
++    expect(screen.getByText('Penalty (3%)')).toBeInTheDocument();
++    expect(screen.getByText('-$3.00')).toBeInTheDocument();
++    expect(screen.getByText('$97.00')).toBeInTheDocument();
++  });
++
++  it('cancels from the backdrop but not from clicks inside the panel', () => {
++    const onCancel = vi.fn();
++    const onConfirm = vi.fn();
++
++    render(
++      <CommitmentEarlyExitModal
++        {...amounts}
++        isOpen
++        hasAcknowledged={false}
++        onChangeAcknowledged={vi.fn()}
++        onCancel={onCancel}
++        onConfirm={onConfirm}
++      />,
++    );
++
++    fireEvent.click(screen.getByRole('heading', { name: 'Early Exit' }));
++    expect(onCancel).not.toHaveBeenCalled();
++
++    fireEvent.click(screen.getByRole('dialog'));
++    expect(onCancel).toHaveBeenCalledTimes(1);
++    expect(onConfirm).not.toHaveBeenCalled();
++  });
+ });
+-- 
+2.43.0
+

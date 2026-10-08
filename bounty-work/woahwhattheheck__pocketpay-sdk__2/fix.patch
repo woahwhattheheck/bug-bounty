@@ -1,0 +1,114 @@
+From 3c309b0d996243b9d3a2d05dc462efa42f73fe52 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <brycembusiness2@gmail.com>
+Date: Wed, 7 Oct 2026 23:48:11 -0400
+Subject: [PATCH 1/2] fix(payments): reject amount overflow in shared
+ validation (#307)
+
+---
+ docs/amount-model.md      |  6 ++++--
+ src/utils/index.ts        | 16 ++++++++++++++++
+ tests/safe-amount.test.ts |  8 ++++++++
+ 3 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/docs/amount-model.md b/docs/amount-model.md
+index b2159c6..ef4edf5 100644
+--- a/docs/amount-model.md
++++ b/docs/amount-model.md
+@@ -88,8 +88,10 @@ negative result (`negative_result`). `equals` and `compare` work on value, so
+ `validateAmount`, `stroopsToXLM` and `xlmToStroops` remain exported with their
+ existing signatures. They no longer lose precision silently:
+ 
+-- **`validateAmount`** — unchanged behaviour and error codes; exactness is now
+-  delegated to the shared parser.
++- **`validateAmount`** — delegates precision and range to the shared parser; retains
++  `INVALID_AMOUNT_PRECISION` for more than 7 decimal places, and `INVALID_AMOUNT`
++  for invalid format, zero or values above signed int64 stroops. An overflow
++  cannot silently pass legacy payment or vault validation.
+ - **`stroopsToXLM`** — exact across the whole range; rejects a `number` that is
+   not a safe integer instead of rounding it. Pass large values as strings.
+ - **`xlmToStroops`** — **deprecated.** Still returns a `number`, but now throws
+diff --git a/src/utils/index.ts b/src/utils/index.ts
+index 78883c3..df72b45 100644
+--- a/src/utils/index.ts
++++ b/src/utils/index.ts
+@@ -181,6 +181,22 @@ export function validateAmount(amount: string): boolean {
+       }
+     );
+   }
++  // A syntactically valid amount can still exceed Stellar's signed int64
++  // stroop range. Never ignore the safe parser's rejected result: the shared
++  // payment/vault validator must fail closed before any transaction is built.
++  if (!parsed.valid) {
++    throw new PocketPayError(
++      `Invalid amount: "${amount}". Exceeds the maximum Stellar amount.`,
++      'INVALID_AMOUNT',
++      {
++        validation: {
++          field: 'amount',
++          reason: parsed.error.validation?.reason ?? 'invalid_amount',
++          value: amount
++        }
++      }
++    );
++  }
+   return true;
+ }
+ 
+diff --git a/tests/safe-amount.test.ts b/tests/safe-amount.test.ts
+index 0c5e6c5..68b4e49 100644
+--- a/tests/safe-amount.test.ts
++++ b/tests/safe-amount.test.ts
+@@ -245,6 +245,14 @@ describe('legacy helpers no longer lose precision silently', () => {
+     expect(() => validateAmount('10abc')).toThrow(PocketPayError);
+   });
+ 
++  it('rejects amounts above Stellar int64 stroops through legacy validateAmount', () => {
++    expect(validateAmount(formatStroops(MAX_STROOPS))).toBe(true);
++    const tooBig = formatStroops(MAX_STROOPS + 1n);
++    const error = capture(() => validateAmount(tooBig));
++    expect(error.code).toBe('INVALID_AMOUNT');
++    expect(error.validation?.reason).toBe('exceeds_maximum');
++  });
++
+   it('keeps xlmToStroops returning a number for representable amounts', () => {
+     expect(xlmToStroops('1')).toBe(10_000_000);
+     expect(xlmToStroops('0.0000001')).toBe(1);
+-- 
+2.43.0
+
+
+From 62ec4dd3b9df855d06bbbe39e70d72c74064c3e2 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <brycembusiness2@gmail.com>
+Date: Wed, 7 Oct 2026 23:50:01 -0400
+Subject: [PATCH 2/2] test(amount): cover legacy overflow boundary (#307)
+
+---
+ tests/utils.test.ts | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/tests/utils.test.ts b/tests/utils.test.ts
+index 891410b..787ee6c 100644
+--- a/tests/utils.test.ts
++++ b/tests/utils.test.ts
+@@ -124,6 +124,18 @@ describe('Utils Module', () => {
+         expect.objectContaining({ code: 'INVALID_AMOUNT_PRECISION' })
+       );
+     });
++    it('rejects values above the signed int64 stroop limit', () => {
++      expect(validateAmount('922337203685.4775807')).toBe(true);
++      expect(() => validateAmount('922337203685.4775808')).toThrow(
++        expect.objectContaining({
++          code: 'INVALID_AMOUNT',
++          validation: expect.objectContaining({ reason: 'exceeds_maximum' }),
++        })
++      );
++      expect(() => validateAmount('922337203686')).toThrow(
++        expect.objectContaining({ code: 'INVALID_AMOUNT' })
++      );
++    });
+   });
+ 
+   describe('validateMemo', () => {
+-- 
+2.43.0
+

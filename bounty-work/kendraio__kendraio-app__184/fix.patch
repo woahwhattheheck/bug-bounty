@@ -1,0 +1,3728 @@
+From 676597c1f6f03820290ff974a5d289b7841cf925 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:31:21 +0000
+Subject: [PATCH] feat(blocks): add MusicBrainz block for search, lookup,
+ browse and release submission (#184)
+
+Adds a `musicbrainz` Flow block backed by a shared MusicBrainzService for
+the MusicBrainz WS/2 API:
+
+- search, lookup (MBID + inc=) and browse (linked entities) for all
+  MusicBrainz entity types, with request validation and readable errors
+- one app-wide request queue at most one request per second, retry with
+  back-off on 503/429, de-duplication and a short response cache
+- User-Agent "KendraioApp/<version> ( contact url )" as MusicBrainz asks;
+  only headers allowed by MusicBrainz CORS are sent (no ngsw-bypass)
+- seed-release operation: prepares MusicBrainz release editor seeding
+  fields and opens the editor so artists can submit a release
+- demo Flows under /musicbrainz (dashboard, search artists / releases /
+  recordings, artist, release group, release, recording, submit release),
+  also packaged as an installable `musicbrainz` adapter in the built-in
+  adapter repository
+- block documentation and focused unit tests
+
+Refs #184
+---
+ docs/index.rst                                |    1 +
+ docs/workflow/blocks/musicbrainz.rst          |  207 ++++
+ src/app/app.module.ts                         |    2 +
+ .../musicbrainz-block.component.html          |   16 +
+ .../musicbrainz-block.component.scss          |   13 +
+ .../musicbrainz-block.component.spec.ts       |  170 +++
+ .../musicbrainz-block.component.ts            |  168 +++
+ .../musicbrainz-flows.spec.ts                 |   81 ++
+ .../blocks-workflow.component.html            |    1 +
+ .../dialogs/add-block-dialog/block-types.ts   |   17 +
+ src/app/services/musicbrainz.service.spec.ts  |  269 +++++
+ src/app/services/musicbrainz.service.ts       |  622 ++++++++++
+ src/assets/adapters/index.json                |   12 +
+ .../adapters/kendraio-adapter-repo.json       |    3 +-
+ src/assets/adapters/musicbrainz.json          | 1011 +++++++++++++++++
+ src/assets/adapters/musicbrainz/artist.json   |  103 ++
+ .../adapters/musicbrainz/dashboard.json       |   41 +
+ .../adapters/musicbrainz/recording.json       |  104 ++
+ src/assets/adapters/musicbrainz/release.json  |  106 ++
+ .../adapters/musicbrainz/releaseGroup.json    |  122 ++
+ .../adapters/musicbrainz/searchArtists.json   |   93 ++
+ .../musicbrainz/searchRecordings.json         |   89 ++
+ .../adapters/musicbrainz/searchReleases.json  |  100 ++
+ .../adapters/musicbrainz/submitRelease.json   |  125 ++
+ 24 files changed, 3475 insertions(+), 1 deletion(-)
+ create mode 100644 docs/workflow/blocks/musicbrainz.rst
+ create mode 100644 src/app/blocks/musicbrainz-block/musicbrainz-block.component.html
+ create mode 100644 src/app/blocks/musicbrainz-block/musicbrainz-block.component.scss
+ create mode 100644 src/app/blocks/musicbrainz-block/musicbrainz-block.component.spec.ts
+ create mode 100644 src/app/blocks/musicbrainz-block/musicbrainz-block.component.ts
+ create mode 100644 src/app/blocks/musicbrainz-block/musicbrainz-flows.spec.ts
+ create mode 100644 src/app/services/musicbrainz.service.spec.ts
+ create mode 100644 src/app/services/musicbrainz.service.ts
+ create mode 100644 src/assets/adapters/musicbrainz.json
+ create mode 100644 src/assets/adapters/musicbrainz/artist.json
+ create mode 100644 src/assets/adapters/musicbrainz/dashboard.json
+ create mode 100644 src/assets/adapters/musicbrainz/recording.json
+ create mode 100644 src/assets/adapters/musicbrainz/release.json
+ create mode 100644 src/assets/adapters/musicbrainz/releaseGroup.json
+ create mode 100644 src/assets/adapters/musicbrainz/searchArtists.json
+ create mode 100644 src/assets/adapters/musicbrainz/searchRecordings.json
+ create mode 100644 src/assets/adapters/musicbrainz/searchReleases.json
+ create mode 100644 src/assets/adapters/musicbrainz/submitRelease.json
+
+diff --git a/docs/index.rst b/docs/index.rst
+index e018e0e8..d19ed801 100644
+--- a/docs/index.rst
++++ b/docs/index.rst
+@@ -69,6 +69,7 @@ Kendraio App
+    workflow/blocks/mapping
+    workflow/blocks/message
+    workflow/blocks/multi
++   workflow/blocks/musicbrainz
+    workflow/blocks/parse_data
+    workflow/blocks/player
+    workflow/blocks/query
+diff --git a/docs/workflow/blocks/musicbrainz.rst b/docs/workflow/blocks/musicbrainz.rst
+new file mode 100644
+index 00000000..98627212
+--- /dev/null
++++ b/docs/workflow/blocks/musicbrainz.rst
+@@ -0,0 +1,207 @@
++MusicBrainz
++===========
++
++Search, look up and browse `MusicBrainz <https://musicbrainz.org>`_, the open music encyclopedia,
++and prepare releases for submission to it.
++
++The block talks to the `MusicBrainz web service (WS/2) <https://musicbrainz.org/doc/MusicBrainz_API>`_
++directly from the browser and follows the MusicBrainz
++`rate limiting rules <https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting>`_:
++
++- Every request carries a ``User-Agent`` of the form ``KendraioApp/<version> ( https://github.com/kendraio/kendraio-app )``.
++  MusicBrainz allows this header in its CORS policy. Browsers that do not let pages set it (Chromium-based browsers)
++  send their own User-Agent and the page Origin instead.
++- All MusicBrainz blocks in the app share one request queue that sends at most one request per second.
++  Requests that MusicBrainz throttles (HTTP 503 or 429) are retried with back-off.
++- Identical requests are only sent once: responses are cached for five minutes, and two blocks asking for the same
++  thing at the same time share one request.
++
++Default config
++--------------
++
++.. code-block:: json
++
++    {
++      "type": "musicbrainz",
++      "operation": "search",
++      "entity": "artist",
++      "limit": 25,
++      "resultsOnly": true,
++      "valueGetters": {
++        "query": "data.query"
++      }
++    }
++
++Supported properties
++--------------------
++
++- **operation** - ``search`` (default), ``lookup``, ``browse`` or ``seed-release``. See below.
++- **entity** - The MusicBrainz entity type, e.g. ``artist`` (default), ``release``, ``release-group``, ``recording``,
++  ``label``, ``work``, ``area``, ``event``, ``instrument``, ``place``, ``series``, ``url``.
++- **query** - ``search`` only. A `search query <https://musicbrainz.org/doc/MusicBrainz_API/Search>`_ string
++  (e.g. ``artist:Björk AND country:IS``) or an object of field/value pairs, e.g. ``{"artist": "Björk", "country": "IS"}``.
++  Object fields are AND-ed together, array values are OR-ed, empty values are ignored and values are quoted, so the
++  output of a form can be used directly.
++- **dismax** (boolean) - ``search`` only. Use the simpler "dismax" query parser for free text queries.
++- **mbid** - ``lookup`` only. The MusicBrainz identifier (MBID) of the entity.
++- **linkedEntity** and **linkedMbid** - ``browse`` only. List the entities linked to another entity, e.g. the
++  ``release-group`` entities of an ``artist``. The block reports an error if the combination is not supported by MusicBrainz.
++- **inc** - ``lookup`` and ``browse``. Extra data to include, as an array or a ``+`` separated string,
++  e.g. ``["aliases", "genres", "url-rels"]``. Unsupported values are reported before anything is sent.
++- **releaseType** and **releaseStatus** - Filter releases and release groups, e.g. ``["album", "ep"]`` and ``official``.
++- **limit** (1-100) and **offset** - Paging for ``search`` and ``browse``.
++- **resultsOnly** (boolean, default false) - Output only the list of results (e.g. the ``artists`` array of an artist search)
++  instead of the whole response, ready for a Grid block.
++- **valueGetters** - JMESPath expressions that compute any of the properties above from the incoming ``data`` or
++  the Flow ``context``, e.g. ``{"mbid": "context.queryParams.mbid"}``.
++- **skipInit** (boolean, default true) - Do not run on the initial, empty input of the Flow.
++- **apiRoot** - Web service root. Defaults to ``https://musicbrainz.org/ws/2``; use ``https://test.musicbrainz.org/ws/2``
++  or a mirror for testing.
++- **userAgent** - Override the User-Agent, e.g. to identify a Flow you publish: ``MyLabelCatalogue/1.0 ( me@example.com )``.
++- **sendUserAgent** (boolean, default true) - Set to false to not send the User-Agent header.
++- **minIntervalMs** (default 1000) - Minimum delay between requests. It can be raised but not lowered below 1000 for musicbrainz.org.
++- **maxRetries** (default 2) - How often a throttled request is retried.
++- **cacheTtlMs** (default 300000) - How long responses are cached. ``0`` disables the cache for this block.
++
++The block does nothing until it has something to ask: an empty search or a missing MBID is not sent.
++Errors (invalid MBIDs, unsupported ``inc`` values, MusicBrainz errors) are shown in the block.
++
++Search
++------
++
++Search for artists using the fields of a form:
++
++.. code-block:: json
++
++    [
++      {
++        "type": "form",
++        "jsonSchema": {
++          "type": "object",
++          "properties": {
++            "artist": { "type": "string", "title": "Artist name" },
++            "country": { "type": "string", "title": "Country code" }
++          }
++        },
++        "uiSchema": {}
++      },
++      {
++        "type": "musicbrainz",
++        "operation": "search",
++        "entity": "artist",
++        "limit": 50,
++        "resultsOnly": true,
++        "valueGetters": { "query": "data" }
++      },
++      {
++        "type": "grid",
++        "columnDefs": [
++          { "headerName": "Name", "field": "name" },
++          { "headerName": "Country", "field": "country" },
++          { "headerName": "Score", "field": "score" }
++        ]
++      }
++    ]
++
++Lookup
++------
++
++Look up the artist whose MBID is in the ``mbid`` query parameter of the page (``/musicbrainz/artist?mbid=...``):
++
++.. code-block:: json
++
++    {
++      "type": "musicbrainz",
++      "operation": "lookup",
++      "entity": "artist",
++      "inc": ["aliases", "genres", "url-rels"],
++      "valueGetters": { "mbid": "context.queryParams.mbid" }
++    }
++
++Browse
++------
++
++List the albums and EPs of an artist:
++
++.. code-block:: json
++
++    {
++      "type": "musicbrainz",
++      "operation": "browse",
++      "entity": "release-group",
++      "linkedEntity": "artist",
++      "releaseType": ["album", "ep"],
++      "limit": 100,
++      "resultsOnly": true,
++      "valueGetters": { "linkedMbid": "data.id" }
++    }
++
++Submitting a release (release editor seeding)
++---------------------------------------------
++
++MusicBrainz does not accept new releases through its web service. Instead, applications
++`seed the release editor <https://wiki.musicbrainz.org/Development/Release_Editor_Seeding>`_: the release details are
++POSTed to the MusicBrainz website, which opens its release editor with them filled in, so the user can check, complete
++and submit them under their own MusicBrainz account.
++
++With ``"operation": "seed-release"`` the block turns the incoming data (or the result of ``valueGetters.release``) into
++the release editor fields and shows a button that opens the editor in a new tab. The block also outputs
++``{"action": "<editor URL>", "fields": [{"name": "...", "value": "..."}]}``.
++
++.. code-block:: json
++
++    {
++      "type": "musicbrainz",
++      "operation": "seed-release",
++      "label": "Open in MusicBrainz release editor",
++      "siteRoot": "https://test.musicbrainz.org"
++    }
++
++``siteRoot`` defaults to ``https://musicbrainz.org``; use ``https://test.musicbrainz.org`` while trying things out.
++The release data has this shape (only ``name`` is required):
++
++.. code-block:: json
++
++    {
++      "name": "Night Drive",
++      "type": "ep",
++      "status": "official",
++      "barcode": "",
++      "artistCredit": [{ "name": "Example Artist", "mbid": "", "joinPhrase": "" }],
++      "events": [{ "date": "2026-09-01", "country": "XW" }],
++      "labels": [{ "name": "Example Records", "mbid": "", "catalogNumber": "EX001" }],
++      "mediums": [{
++        "format": "Digital Media",
++        "tracks": [{ "name": "Night Drive", "length": "3:41" }, { "name": "Daybreak", "length": 242000 }]
++      }],
++      "urls": ["https://example.com/night-drive"],
++      "editNote": "Details from the artist's own catalogue"
++    }
++
++``releaseGroup`` (an MBID) adds the release to an existing release group instead of creating one. ``artistCredit`` may also
++be a plain string. Track lengths are ``m:ss`` strings or milliseconds. When no ``editNote`` is given, the edit note says the
++release was seeded from Kendraio App.
++
++Example Flows
++-------------
++
++Ready-made Flows are included with the app under the ``musicbrainz`` adapter:
++
++- ``/musicbrainz/dashboard`` - links to all the Flows below
++- ``/musicbrainz/searchArtists``, ``/musicbrainz/searchReleases``, ``/musicbrainz/searchRecordings`` - search
++- ``/musicbrainz/artist?mbid=...`` - artist details and all release groups of the artist
++- ``/musicbrainz/releaseGroup?mbid=...`` - release group details and all its releases
++- ``/musicbrainz/release?mbid=...`` - release details and track list
++- ``/musicbrainz/recording?mbid=...`` - recording details and the releases it appears on
++- ``/musicbrainz/submitRelease`` - a form that prepares a release for submission to MusicBrainz
++
++Each result links to the next Flow, so you can move from an artist to its albums, to a specific edition, to a track and
++back to everything that track appears on.
++
++The same Flows are packaged as an installable adapter (``src/assets/adapters/musicbrainz.json``), listed in the app's
++built-in adapter repository. To install it, add ``/assets/adapters/`` under Settings > Adapters > Manage Repositories,
++refresh the adapter list and install MusicBrainz. This copies the Flows into the app so they can be edited, and adds
++MusicBrainz with its search and submission Flows to the services menu.
++
++MusicBrainz core data is CC0 (public domain); supplementary data such as tags, genres and annotations is available under
++CC BY-NC-SA 3.0. See https://musicbrainz.org/doc/About/Data_License
+diff --git a/src/app/app.module.ts b/src/app/app.module.ts
+index 4f559f6e..ffbb43ea 100644
+--- a/src/app/app.module.ts
++++ b/src/app/app.module.ts
+@@ -188,6 +188,7 @@ import {MatAutocompleteModule} from '@angular/material/autocomplete';
+ import {MatChipsModule} from '@angular/material/chips';
+ import { LinkActionComponent } from './blocks/link-action-block/link-action.component';
+ import { JsonDereferenceBlockComponent } from './blocks/json-dereference/json-dereference.component';
++import { MusicbrainzBlockComponent } from './blocks/musicbrainz-block/musicbrainz-block.component';
+ // AoT requires an exported function for factories
+ export function HttpLoaderFactory(http: HttpClient) {
+   return new TranslateHttpLoader(http);
+@@ -356,6 +357,7 @@ const monacoConfig: NgxMonacoEditorConfig = {
+         BlockComparisonBuilderBoxComponent,
+         LinkActionComponent,
+         JsonDereferenceBlockComponent,
++        MusicbrainzBlockComponent,
+     ],
+     bootstrap: [AppComponent], 
+     imports: [
+diff --git a/src/app/blocks/musicbrainz-block/musicbrainz-block.component.html b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.html
+new file mode 100644
+index 00000000..d102b7c1
+--- /dev/null
++++ b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.html
+@@ -0,0 +1,16 @@
++<mat-error *ngIf="hasError">
++  {{ errorMessage }}
++</mat-error>
++
++<div class="spinner-wrapper" *ngIf="isLoading">
++  <mat-spinner diameter="50"></mat-spinner>
++</div>
++
++<!-- Release editor seeding: a plain form POST that opens the MusicBrainz release editor in a new tab.
++     ngNoForm stops Angular's NgForm from intercepting the native submit. -->
++<form *ngIf="seedFields.length > 0" class="musicbrainz-seed-form" ngNoForm method="post"
++      accept-charset="utf-8" target="_blank" [attr.action]="seedAction">
++  <input *ngFor="let field of seedFields" type="hidden" [attr.name]="field.name" [value]="field.value">
++  <p class="musicbrainz-seed-summary">{{ seedSummary }}</p>
++  <button mat-flat-button color="primary" type="submit">{{ seedLabel }}</button>
++</form>
+diff --git a/src/app/blocks/musicbrainz-block/musicbrainz-block.component.scss b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.scss
+new file mode 100644
+index 00000000..bd878230
+--- /dev/null
++++ b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.scss
+@@ -0,0 +1,13 @@
++.spinner-wrapper {
++  display: flex;
++  justify-content: center;
++  padding: 8px 0;
++}
++
++.musicbrainz-seed-form {
++  padding: 8px 0;
++}
++
++.musicbrainz-seed-summary {
++  margin: 0 0 8px;
++}
+diff --git a/src/app/blocks/musicbrainz-block/musicbrainz-block.component.spec.ts b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.spec.ts
+new file mode 100644
+index 00000000..6541fa65
+--- /dev/null
++++ b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.spec.ts
+@@ -0,0 +1,170 @@
++import { fakeAsync, flushMicrotasks, TestBed } from '@angular/core/testing';
++import { FormsModule } from '@angular/forms';
++import { MatButtonModule } from '@angular/material/button';
++import { MatFormFieldModule } from '@angular/material/form-field';
++import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
++import { MusicbrainzBlockComponent } from './musicbrainz-block.component';
++import { MusicBrainzError, MusicBrainzService } from '../../services/musicbrainz.service';
++
++const ARTIST_MBID = '87c5dedd-371d-4a53-9f7f-80522fb7f3cb';
++
++describe('MusicbrainzBlockComponent', () => {
++  let component: MusicbrainzBlockComponent;
++  let musicbrainz: jasmine.SpyObj<MusicBrainzService>;
++  let emitted: any[];
++
++  beforeEach(() => {
++    musicbrainz = jasmine.createSpyObj('MusicBrainzService', ['request']);
++    component = new MusicbrainzBlockComponent(musicbrainz);
++    component.context = { queryParams: { mbid: ARTIST_MBID } };
++    emitted = [];
++    component.output.subscribe(value => emitted.push(value));
++  });
++
++  it('searches with values taken from the incoming data and emits the result list', fakeAsync(() => {
++    musicbrainz.request.and.returnValue(Promise.resolve({ count: 1, artists: [{ id: ARTIST_MBID, name: 'Björk' }] }));
++    component.config = {
++      type: 'musicbrainz', operation: 'search', entity: 'artist', limit: 10, resultsOnly: true,
++      valueGetters: { query: 'data.name' }
++    };
++    component.onData({ name: 'Björk' }, false);
++    flushMicrotasks();
++    expect(musicbrainz.request).toHaveBeenCalledWith(
++      { operation: 'search', entity: 'artist', query: 'Björk', limit: 10 }, {});
++    expect(emitted).toEqual([[{ id: ARTIST_MBID, name: 'Björk' }]]);
++    expect(component.hasError).toBeFalse();
++  }));
++
++  it('looks up an entity using the Flow context and passes client options through', fakeAsync(() => {
++    const artist = { id: ARTIST_MBID, name: 'Björk' };
++    musicbrainz.request.and.returnValue(Promise.resolve(artist));
++    component.config = {
++      type: 'musicbrainz', operation: 'lookup', entity: 'artist', inc: ['aliases', 'url-rels'],
++      userAgent: 'MyFlow/1.0 ( me@example.com )', cacheTtlMs: 0,
++      valueGetters: { mbid: 'context.queryParams.mbid' }
++    };
++    component.onData({}, false);
++    flushMicrotasks();
++    expect(musicbrainz.request).toHaveBeenCalledWith(
++      { operation: 'lookup', entity: 'artist', mbid: ARTIST_MBID, inc: ['aliases', 'url-rels'] },
++      { userAgent: 'MyFlow/1.0 ( me@example.com )', cacheTtlMs: 0 });
++    expect(emitted).toEqual([artist]);
++  }));
++
++  it('browses linked entities with release type and status filters', fakeAsync(() => {
++    musicbrainz.request.and.returnValue(Promise.resolve({ releases: [] }));
++    component.config = {
++      type: 'musicbrainz', operation: 'browse', entity: 'release', linkedEntity: 'artist',
++      releaseType: ['album', 'ep'], releaseStatus: 'official', offset: 25,
++      valueGetters: { linkedMbid: 'data.id' }
++    };
++    component.onData({ id: ARTIST_MBID }, false);
++    flushMicrotasks();
++    expect(musicbrainz.request).toHaveBeenCalledWith({
++      operation: 'browse', entity: 'release', linkedEntity: 'artist', linkedMbid: ARTIST_MBID,
++      type: ['album', 'ep'], status: 'official', offset: 25
++    }, {});
++  }));
++
++  it('does nothing on the initial empty model, or until there is something to search for', () => {
++    component.config = { type: 'musicbrainz', operation: 'search', entity: 'artist', valueGetters: { query: 'data.name' } };
++    component.onData({}, true);
++    component.onData({ name: '  ' }, false);
++    component.onData({}, false);
++    expect(musicbrainz.request).not.toHaveBeenCalled();
++    expect(component.hasError).toBeFalse();
++  });
++
++  it('shows request errors', fakeAsync(() => {
++    musicbrainz.request.and.returnValue(Promise.reject(new MusicBrainzError('"abc" is not a valid MusicBrainz identifier (MBID)')));
++    component.config = { type: 'musicbrainz', operation: 'lookup', entity: 'artist', mbid: 'abc' };
++    component.onData({}, false);
++    flushMicrotasks();
++    expect(component.hasError).toBeTrue();
++    expect(component.isLoading).toBeFalse();
++    expect(component.errorMessage).toContain('not a valid MusicBrainz identifier');
++    expect(emitted).toEqual([]);
++  }));
++
++  it('ignores responses that were superseded by newer input', fakeAsync(() => {
++    let resolveFirst;
++    musicbrainz.request.and.returnValues(
++      new Promise(resolve => resolveFirst = resolve),
++      Promise.resolve({ artists: [{ name: 'second' }] })
++    );
++    component.config = { type: 'musicbrainz', operation: 'search', entity: 'artist', valueGetters: { query: 'data.q' } };
++    component.onData({ q: 'first' }, false);
++    component.onData({ q: 'second' }, false);
++    flushMicrotasks();
++    resolveFirst({ artists: [{ name: 'first' }] });
++    flushMicrotasks();
++    expect(emitted).toEqual([{ artists: [{ name: 'second' }] }]);
++  }));
++
++  it('prepares release editor seed fields from the incoming data', () => {
++    component.config = { type: 'musicbrainz', operation: 'seed-release', siteRoot: 'https://test.musicbrainz.org' };
++    component.onData({ name: 'Demo EP', type: 'ep', mediums: [{ format: 'Digital Media', tracks: ['One', 'Two'] }] }, false);
++    expect(musicbrainz.request).not.toHaveBeenCalled();
++    expect(component.seedAction).toEqual('https://test.musicbrainz.org/release/add');
++    expect(component.seedSummary).toEqual('Demo EP (2 tracks)');
++    expect(component.seedFields.slice(0, 3)).toEqual([
++      { name: 'name', value: 'Demo EP' },
++      { name: 'type', value: 'ep' },
++      { name: 'mediums.0.format', value: 'Digital Media' }
++    ]);
++    expect(emitted).toEqual([{ action: 'https://test.musicbrainz.org/release/add', fields: component.seedFields }]);
++  });
++
++  it('waits for a release name before offering to seed the release editor', () => {
++    component.config = { type: 'musicbrainz', operation: 'seed-release', valueGetters: { release: 'data.release' } };
++    component.onData({ release: { type: 'album' } }, false);
++    expect(component.seedFields).toEqual([]);
++    expect(component.hasError).toBeFalse();
++    expect(emitted).toEqual([]);
++  });
++});
++
++describe('MusicbrainzBlockComponent template', () => {
++
++  beforeEach(() => {
++    TestBed.configureTestingModule({
++      // FormsModule is imported by the app module: the seed form must not be taken over by NgForm
++      imports: [FormsModule, MatButtonModule, MatFormFieldModule, MatProgressSpinnerModule],
++      declarations: [MusicbrainzBlockComponent],
++      providers: [{ provide: MusicBrainzService, useValue: jasmine.createSpyObj('MusicBrainzService', ['request']) }]
++    });
++  });
++
++  it('renders a native POST form that opens the release editor in a new tab', () => {
++    const fixture = TestBed.createComponent(MusicbrainzBlockComponent);
++    const component = fixture.componentInstance;
++    component.config = { type: 'musicbrainz', operation: 'seed-release', label: 'Send to MusicBrainz' };
++    component.context = {};
++    component.onData({ name: 'Demo', artistCredit: 'Someone', mediums: [{ tracks: ['Intro'] }] }, false);
++    fixture.detectChanges();
++
++    const form: HTMLFormElement = fixture.nativeElement.querySelector('form.musicbrainz-seed-form');
++    expect(form.getAttribute('action')).toEqual('https://musicbrainz.org/release/add');
++    expect(form.getAttribute('method')).toEqual('post');
++    expect(form.getAttribute('target')).toEqual('_blank');
++    const inputs = Array.from(form.querySelectorAll('input[type=hidden]')) as HTMLInputElement[];
++    expect(inputs.map(input => `${input.name}=${input.value}`)).toEqual(component.seedFields.map(f => `${f.name}=${f.value}`));
++    expect(inputs.map(input => input.name)).toContain('mediums.0.track.0.name');
++    expect(form.querySelector('button[type=submit]').textContent.trim()).toEqual('Send to MusicBrainz');
++
++    const submit = new Event('submit', { cancelable: true });
++    form.dispatchEvent(submit);
++    expect(submit.defaultPrevented).toBeFalse();
++  });
++
++  it('shows errors and no form for invalid release data', () => {
++    const fixture = TestBed.createComponent(MusicbrainzBlockComponent);
++    const component = fixture.componentInstance;
++    component.config = { type: 'musicbrainz', operation: 'seed-release' };
++    component.context = {};
++    component.onData({ name: 'Demo', mediums: [{ tracks: [] }] }, false);
++    fixture.detectChanges();
++    expect(fixture.nativeElement.querySelector('form')).toBeNull();
++    expect(fixture.nativeElement.querySelector('mat-error').textContent).toContain('Medium 1 needs at least one track');
++  });
++});
+diff --git a/src/app/blocks/musicbrainz-block/musicbrainz-block.component.ts b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.ts
+new file mode 100644
+index 00000000..9aa8be1f
+--- /dev/null
++++ b/src/app/blocks/musicbrainz-block/musicbrainz-block.component.ts
+@@ -0,0 +1,168 @@
++import { Component } from '@angular/core';
++import { get, has, isNil, isPlainObject, isString } from 'lodash-es';
++import { BaseBlockComponent } from '../base-block/base-block.component';
++import { mappingUtility } from '../mapping-block/mapping-util';
++import {
++  buildReleaseSeed,
++  extractMusicBrainzResults,
++  MusicBrainzClientOptions,
++  MusicBrainzRequest,
++  MusicBrainzSeedField,
++  MusicBrainzService,
++  MUSICBRAINZ_SITE_ROOT,
++  releaseEditorUrl
++} from '../../services/musicbrainz.service';
++
++/**
++ * MusicBrainz block: search, look up and browse the MusicBrainz database, or seed
++ * the MusicBrainz release editor so an artist can submit a release.
++ *
++ * Every request option can be set statically in the block config or computed from the
++ * incoming data / context with a JMESPath expression in `valueGetters`.
++ * See docs/workflow/blocks/musicbrainz.rst
++ */
++@Component({
++  selector: 'app-musicbrainz-block',
++  templateUrl: './musicbrainz-block.component.html',
++  styleUrls: ['./musicbrainz-block.component.scss']
++})
++export class MusicbrainzBlockComponent extends BaseBlockComponent {
++
++  isLoading = false;
++  hasError = false;
++  errorMessage = '';
++
++  seedFields: MusicBrainzSeedField[] = [];
++  seedAction = releaseEditorUrl();
++  seedLabel = 'Open in MusicBrainz release editor';
++  seedSummary = '';
++
++  // Used to ignore responses from requests that were superseded by newer input
++  private requestCounter = 0;
++
++  constructor(private readonly musicbrainz: MusicBrainzService) {
++    super();
++  }
++
++  onData(data: any, firstChange: boolean) {
++    if (firstChange && get(this.config, 'skipInit', true)) {
++      return;
++    }
++    const operation = this.resolve('operation', data) || 'search';
++    if (operation === 'seed-release') {
++      this.prepareReleaseSeed(data);
++    } else {
++      this.runRequest(operation, data);
++    }
++  }
++
++  /** Read a config value, preferring a JMESPath expression from `valueGetters` */
++  resolve(key: string, data: any) {
++    const getter = get(this.config, ['valueGetters', key]);
++    if (isString(getter) && getter.trim() !== '') {
++      return mappingUtility({ data, context: this.context }, getter);
++    }
++    return get(this.config, key);
++  }
++
++  buildRequest(operation: string, data: any): MusicBrainzRequest {
++    const request: any = { operation, entity: this.resolve('entity', data) || 'artist' };
++    // `type` is the block type in the block config, so the type/status filters are
++    // configured as `releaseType` and `releaseStatus`
++    const keys = {
++      query: 'query', mbid: 'mbid', inc: 'inc', linkedEntity: 'linkedEntity', linkedMbid: 'linkedMbid',
++      limit: 'limit', offset: 'offset', releaseType: 'type', releaseStatus: 'status', dismax: 'dismax'
++    };
++    Object.keys(keys).forEach(configKey => {
++      const value = this.resolve(configKey, data);
++      if (!isNil(value)) {
++        request[keys[configKey]] = value;
++      }
++    });
++    return request;
++  }
++
++  clientOptions(): MusicBrainzClientOptions {
++    const options: MusicBrainzClientOptions = {};
++    ['apiRoot', 'userAgent', 'sendUserAgent', 'minIntervalMs', 'maxRetries', 'cacheTtlMs'].forEach(key => {
++      if (has(this.config, key)) {
++        options[key] = get(this.config, key);
++      }
++    });
++    return options;
++  }
++
++  /** True when the request has nothing to ask yet (e.g. an empty search form) */
++  isIncomplete(request: MusicBrainzRequest) {
++    const empty = (value: any) => isNil(value) || (isString(value) && value.trim() === '')
++      || (isPlainObject(value) && Object.values(value).every(v => isNil(v) || String(v).trim() === ''));
++    switch (request.operation) {
++      case 'search':
++        return empty(request.query);
++      case 'lookup':
++        return empty(request.mbid);
++      case 'browse':
++        return empty(request.linkedMbid);
++      default:
++        return false;
++    }
++  }
++
++  async runRequest(operation: string, data: any) {
++    const requestId = ++this.requestCounter;
++    this.seedFields = [];
++    const request = this.buildRequest(operation, data);
++    if (this.isIncomplete(request)) {
++      // Nothing to ask yet: stay quiet instead of showing an error or calling the API
++      this.hasError = false;
++      this.isLoading = false;
++      return;
++    }
++    this.hasError = false;
++    this.isLoading = true;
++    try {
++      const response = await this.musicbrainz.request(request, this.clientOptions());
++      if (requestId !== this.requestCounter) {
++        return;
++      }
++      this.isLoading = false;
++      const output = get(this.config, 'resultsOnly', false)
++        ? extractMusicBrainzResults(request.entity, response)
++        : response;
++      this.output.emit(output);
++    } catch (error) {
++      if (requestId !== this.requestCounter) {
++        return;
++      }
++      this.isLoading = false;
++      this.hasError = true;
++      this.errorMessage = get(error, 'message', 'MusicBrainz request failed');
++    }
++  }
++
++  prepareReleaseSeed(data: any) {
++    ++this.requestCounter;
++    this.isLoading = false;
++    const hasGetter = !!get(this.config, 'valueGetters.release');
++    const release = hasGetter || has(this.config, 'release') ? this.resolve('release', data) : data;
++    if (!isPlainObject(release) || !isString(get(release, 'name')) || release.name.trim() === '') {
++      // Wait for the release details (e.g. from a form) before offering the button
++      this.seedFields = [];
++      this.hasError = false;
++      return;
++    }
++    try {
++      this.seedFields = buildReleaseSeed(release);
++      this.seedAction = releaseEditorUrl(get(this.config, 'siteRoot', MUSICBRAINZ_SITE_ROOT));
++      this.seedLabel = get(this.config, 'label', 'Open in MusicBrainz release editor');
++      const trackCount = this.seedFields.filter(field => /^mediums\.\d+\.track\.\d+\.name$/.test(field.name)).length;
++      this.seedSummary = `${release.name.trim()}${trackCount ? ` (${trackCount} track${trackCount === 1 ? '' : 's'})` : ''}`;
++      this.hasError = false;
++      this.output.emit({ action: this.seedAction, fields: this.seedFields });
++    } catch (error) {
++      this.seedFields = [];
++      this.hasError = true;
++      this.errorMessage = get(error, 'message', 'Invalid release data');
++    }
++  }
++}
+diff --git a/src/app/blocks/musicbrainz-block/musicbrainz-flows.spec.ts b/src/app/blocks/musicbrainz-block/musicbrainz-flows.spec.ts
+new file mode 100644
+index 00000000..fd27eb3b
+--- /dev/null
++++ b/src/app/blocks/musicbrainz-block/musicbrainz-flows.spec.ts
+@@ -0,0 +1,81 @@
++import adapterPackage from '../../../assets/adapters/musicbrainz.json';
++import artist from '../../../assets/adapters/musicbrainz/artist.json';
++import dashboard from '../../../assets/adapters/musicbrainz/dashboard.json';
++import recording from '../../../assets/adapters/musicbrainz/recording.json';
++import release from '../../../assets/adapters/musicbrainz/release.json';
++import releaseGroup from '../../../assets/adapters/musicbrainz/releaseGroup.json';
++import searchArtists from '../../../assets/adapters/musicbrainz/searchArtists.json';
++import searchRecordings from '../../../assets/adapters/musicbrainz/searchRecordings.json';
++import searchReleases from '../../../assets/adapters/musicbrainz/searchReleases.json';
++import submitRelease from '../../../assets/adapters/musicbrainz/submitRelease.json';
++import { buildMusicBrainzUrl } from '../../services/musicbrainz.service';
++import { mappingUtility } from '../mapping-block/mapping-util';
++import { MusicbrainzBlockComponent } from './musicbrainz-block.component';
++
++const SAMPLE_MBID = '87c5dedd-371d-4a53-9f7f-80522fb7f3cb';
++
++const flows: Record<string, any> = {
++  artist, dashboard, recording, release, releaseGroup, searchArtists, searchRecordings, searchReleases, submitRelease
++};
++
++/** All blocks of a Flow, including nested ones (multi batches, grid cell renderers, buttons) */
++function allBlocks(blocks: any[]): any[] {
++  return (blocks || []).reduce((found, block) => [
++    ...found,
++    block,
++    ...allBlocks(block.blocks),
++    ...(block.batches || []).reduce((a, batch) => [...a, ...allBlocks(batch.blocks)], []),
++    ...(block.buttons || []).reduce((a, button) => [...a, ...allBlocks(button.blocks)], []),
++    ...(block.columnDefs || []).reduce((a, col) => [...a, ...allBlocks(col.cellRendererParams?.blocks)], [])
++  ], []);
++}
++
++describe('MusicBrainz demo Flows', () => {
++
++  it('are packaged as an installable adapter that matches the Flow files', () => {
++    const pkg: any = adapterPackage;
++    expect(pkg.name).toEqual('musicbrainz');
++    expect(pkg.workflow.map(w => w.workflowId).sort()).toEqual(Object.keys(flows).sort());
++    pkg.workflow.forEach(w => {
++      expect(pkg.attachments[w.config]).withContext(w.workflowId).toEqual(flows[w.workflowId]);
++      expect(w.title).toEqual(flows[w.workflowId].title);
++    });
++    [pkg.dashboard, ...pkg.services].forEach(entry => expect(flows[entry.workflowId]).withContext(entry.workflowId).toBeDefined());
++  });
++
++  it('only send requests that are valid for the MusicBrainz web service', () => {
++    const sampleData = { artist: 'Björk', release: 'Homogenic', recording: 'Jóga', id: SAMPLE_MBID };
++    let checked = 0;
++    Object.keys(flows).forEach(id => {
++      allBlocks(flows[id].blocks)
++        .filter(block => block.type === 'musicbrainz' && block.operation !== 'seed-release')
++        .forEach(block => {
++          const component = new MusicbrainzBlockComponent(null);
++          component.config = block;
++          component.context = { queryParams: { mbid: SAMPLE_MBID } };
++          const request = component.buildRequest(block.operation, sampleData);
++          expect(component.isIncomplete(request)).withContext(id).toBeFalse();
++          expect(() => buildMusicBrainzUrl(request)).withContext(`${id}: ${JSON.stringify(request)}`).not.toThrow();
++          checked++;
++        });
++    });
++    expect(checked).toBeGreaterThanOrEqual(10);
++  });
++
++  it('only link to MusicBrainz Flows that exist', () => {
++    let checked = 0;
++    Object.keys(flows).forEach(id => {
++      allBlocks(flows[id].blocks)
++        .filter(block => block.type === 'link-action')
++        .forEach(block => {
++          const target = block.workflowIdGetter
++            ? mappingUtility({ data: { id: SAMPLE_MBID }, context: {} }, block.workflowIdGetter)
++            : block.workflowId;
++          expect(block.adapterName).toEqual('musicbrainz');
++          expect(flows[String(target).split('?')[0]]).withContext(`${id} -> ${target}`).toBeDefined();
++          checked++;
++        });
++    });
++    expect(checked).toBeGreaterThanOrEqual(8);
++  });
++});
+diff --git a/src/app/components/blocks-workflow/blocks-workflow.component.html b/src/app/components/blocks-workflow/blocks-workflow.component.html
+index c4cd6245..e745f375 100644
+--- a/src/app/components/blocks-workflow/blocks-workflow.component.html
++++ b/src/app/components/blocks-workflow/blocks-workflow.component.html
+@@ -59,6 +59,7 @@
+     <app-comparison class="block-wrapper" *ngSwitchCase="'comparison'" [context]="context" [config]="block" [model]="models[i]" (output)="updateModel(i + 1, $event)"></app-comparison>
+     <app-link-action class="block-wrapper" *ngSwitchCase="'link-action'" [context]="context" [config]="block" [model]="models[i]" (output)="updateModel(i + 1, $event)"></app-link-action>
+     <app-json-dereference-block class="block-wrapper" *ngSwitchCase="'json-dereference'" [context]="context" [config]="block" [model]="models[i]" (output)="updateModel(i + 1, $event)"></app-json-dereference-block>
++    <app-musicbrainz-block class="block-wrapper" *ngSwitchCase="'musicbrainz'" [context]="context" [config]="block" [model]="models[i]" (output)="updateModel(i + 1, $event)"></app-musicbrainz-block>
+   </ng-container>
+ </ng-container>
+ <!-- <pre>workblock: {{ context | json }}</pre> -->
+diff --git a/src/app/dialogs/add-block-dialog/block-types.ts b/src/app/dialogs/add-block-dialog/block-types.ts
+index 17856f42..1abac947 100644
+--- a/src/app/dialogs/add-block-dialog/block-types.ts
++++ b/src/app/dialogs/add-block-dialog/block-types.ts
+@@ -530,6 +530,23 @@ export const BLOCK_TYPES = [
+       height: 400
+     }
+   },
++  {
++    type: 'musicbrainz',
++    label: 'MusicBrainz',
++    description: 'Search, look up and browse the MusicBrainz music database, or seed a release for submission',
++    icon: 'library_music',
++    hasEditor: true,
++    defaultConfig: {
++      type: 'musicbrainz',
++      operation: 'search',
++      entity: 'artist',
++      limit: 25,
++      resultsOnly: true,
++      valueGetters: {
++        query: 'data.query'
++      }
++    }
++  },
+   {
+     type: 'graphql',
+     label: 'GraphQL',
+diff --git a/src/app/services/musicbrainz.service.spec.ts b/src/app/services/musicbrainz.service.spec.ts
+new file mode 100644
+index 00000000..abfb4a8c
+--- /dev/null
++++ b/src/app/services/musicbrainz.service.spec.ts
+@@ -0,0 +1,269 @@
++import { TestBed, fakeAsync, flushMicrotasks, tick } from '@angular/core/testing';
++import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
++import {
++  buildLuceneQuery,
++  buildMusicBrainzUrl,
++  buildReleaseSeed,
++  extractMusicBrainzResults,
++  MusicBrainzError,
++  MusicBrainzService,
++  MUSICBRAINZ_DEFAULT_EDIT_NOTE,
++  MUSICBRAINZ_USER_AGENT,
++  releaseEditorUrl
++} from './musicbrainz.service';
++
++const ARTIST_MBID = '87c5dedd-371d-4a53-9f7f-80522fb7f3cb';
++const RELEASE_MBID = 'b84ee12a-09ef-421b-82de-0441a926375b';
++const API = 'https://musicbrainz.org/ws/2';
++
++describe('MusicBrainz URL building', () => {
++
++  it('builds a search URL from a Lucene query string', () => {
++    expect(buildMusicBrainzUrl({ operation: 'search', entity: 'artist', query: 'artist:björk', limit: 5, offset: 10 }))
++      .toEqual(`${API}/artist?query=artist%3Abj%C3%B6rk&limit=5&offset=10&fmt=json`);
++  });
++
++  it('builds a search query from field values', () => {
++    const url = buildMusicBrainzUrl({ operation: 'search', entity: 'recording', query: { recording: 'Jóga', artist: 'Björk' } });
++    expect(decodeURIComponent(url)).toEqual(`${API}/recording?query=recording:"Jóga" AND artist:"Björk"&fmt=json`);
++  });
++
++  it('builds a lookup URL with includes and filters', () => {
++    const url = buildMusicBrainzUrl({
++      operation: 'lookup', entity: 'artist', mbid: ARTIST_MBID.toUpperCase(),
++      inc: ['aliases', 'release-groups'], type: 'album'
++    });
++    expect(url).toEqual(`${API}/artist/${ARTIST_MBID}?inc=aliases%2Brelease-groups&type=album&fmt=json`);
++  });
++
++  it('accepts includes as a "+" separated string', () => {
++    expect(buildMusicBrainzUrl({ operation: 'lookup', entity: 'release', mbid: RELEASE_MBID, inc: 'recordings+artist-credits' }))
++      .toContain('inc=recordings%2Bartist-credits');
++  });
++
++  it('builds a browse URL', () => {
++    const url = buildMusicBrainzUrl({
++      operation: 'browse', entity: 'release-group', linkedEntity: 'artist', linkedMbid: ARTIST_MBID,
++      type: ['album', 'ep'], limit: 100
++    }, 'https://mirror.example.org/ws/2/');
++    expect(url).toEqual(`https://mirror.example.org/ws/2/release-group?artist=${ARTIST_MBID}&type=album%7Cep&limit=100&fmt=json`);
++  });
++
++  it('rejects invalid requests with a readable error', () => {
++    const cases: Array<[any, RegExp]> = [
++      [{ operation: 'lookup', entity: 'artist', mbid: 'not-an-mbid' }, /not a valid MusicBrainz identifier/],
++      [{ operation: 'lookup', entity: 'artist', mbid: ARTIST_MBID, inc: 'recordings+bogus' }, /Unsupported inc value\(s\) for artist: bogus/],
++      [{ operation: 'browse', entity: 'release', linkedEntity: 'work', linkedMbid: ARTIST_MBID }, /Cannot browse release by "work"/],
++      [{ operation: 'search', entity: 'artist', query: '   ' }, /search query is required/],
++      [{ operation: 'search', entity: 'genre', query: 'rock' }, /Cannot search MusicBrainz for "genre"/],
++      [{ operation: 'search', entity: 'artist', query: 'x', limit: 500 }, /limit must be a whole number between 1 and 100/],
++      [{ operation: 'delete', entity: 'artist' }, /Unknown MusicBrainz operation/]
++    ];
++    cases.forEach(([request, message]) => {
++      expect(() => buildMusicBrainzUrl(request)).toThrowMatching(e => e instanceof MusicBrainzError && message.test(e.message));
++    });
++  });
++});
++
++describe('MusicBrainz helpers', () => {
++
++  it('escapes quotes, ORs arrays and skips empty values in Lucene queries', () => {
++    expect(buildLuceneQuery({ release: 'Say "Hi"', type: ['album', 'ep'], country: '', label: null }))
++      .toEqual('release:"Say \\"Hi\\"" AND (type:"album" OR type:"ep")');
++  });
++
++  it('extracts result lists from search and browse responses', () => {
++    expect(extractMusicBrainzResults('release-group', { count: 1, 'release-groups': [{ id: 'a' }] })).toEqual([{ id: 'a' }]);
++    const lookup = { id: ARTIST_MBID, name: 'Björk' };
++    expect(extractMusicBrainzResults('artist', lookup)).toBe(lookup);
++  });
++
++  it('converts a release into release editor seed fields', () => {
++    const fields = buildReleaseSeed({
++      name: ' Debut ',
++      type: ['album'],
++      status: 'official',
++      barcode: '5016958997028',
++      artistCredit: [{ mbid: ARTIST_MBID, name: 'Björk', joinPhrase: ' & ' }, { name: 'Guest' }],
++      events: [{ date: '1993-07-05', country: 'GB' }],
++      labels: [{ name: 'One Little Indian', catalogNumber: 'TPLP31' }],
++      mediums: [{ format: 'CD', tracks: [{ name: 'Human Behaviour', length: 254000 }, 'Crying'] }],
++      urls: ['https://bjork.com']
++    });
++    const asPairs = fields.map(({ name, value }) => `${name}=${value}`);
++    expect(asPairs).toEqual([
++      'name=Debut',
++      'type=album',
++      'barcode=5016958997028',
++      'status=official',
++      `artist_credit.names.0.mbid=${ARTIST_MBID}`,
++      'artist_credit.names.0.name=Björk',
++      'artist_credit.names.0.join_phrase= & ',
++      'artist_credit.names.1.name=Guest',
++      'events.0.date.year=1993',
++      'events.0.date.month=7',
++      'events.0.date.day=5',
++      'events.0.country=GB',
++      'labels.0.name=One Little Indian',
++      'labels.0.catalog_number=TPLP31',
++      'mediums.0.format=CD',
++      'mediums.0.track.0.name=Human Behaviour',
++      'mediums.0.track.0.length=254000',
++      'mediums.0.track.1.name=Crying',
++      'urls.0.url=https://bjork.com',
++      `edit_note=${MUSICBRAINZ_DEFAULT_EDIT_NOTE}`
++    ]);
++  });
++
++  it('prefers an existing release group over creating a new one', () => {
++    const fields = buildReleaseSeed({ name: 'Debut', releaseGroup: RELEASE_MBID, type: 'album', editNote: '' });
++    expect(fields).toEqual([{ name: 'name', value: 'Debut' }, { name: 'release_group', value: RELEASE_MBID }]);
++  });
++
++  it('keeps multi-word release group types together', () => {
++    const fields = buildReleaseSeed({ name: 'Story', type: 'other, Audio drama', editNote: '' });
++    expect(fields).toEqual([{ name: 'name', value: 'Story' }, { name: 'type', value: 'other' }, { name: 'type', value: 'Audio drama' }]);
++  });
++
++  it('rejects releases the editor cannot be seeded with', () => {
++    expect(() => buildReleaseSeed({ type: 'album' })).toThrowError(MusicBrainzError, 'A release name is required');
++    expect(() => buildReleaseSeed({ name: 'x', mediums: [{ format: 'CD', tracks: [] }] }))
++      .toThrowError(MusicBrainzError, 'Medium 1 needs at least one track');
++  });
++
++  it('points the release editor at the configured site', () => {
++    expect(releaseEditorUrl()).toEqual('https://musicbrainz.org/release/add');
++    expect(releaseEditorUrl('https://test.musicbrainz.org/')).toEqual('https://test.musicbrainz.org/release/add');
++  });
++});
++
++describe('MusicBrainzService', () => {
++  let service: MusicBrainzService;
++  let httpMock: HttpTestingController;
++
++  beforeEach(() => {
++    TestBed.configureTestingModule({
++      imports: [HttpClientTestingModule]
++    });
++    service = TestBed.inject(MusicBrainzService);
++    httpMock = TestBed.inject(HttpTestingController);
++  });
++
++  afterEach(() => {
++    httpMock.verify();
++  });
++
++  it('identifies itself with a User-Agent and only uses headers MusicBrainz allows for CORS', fakeAsync(() => {
++    let result;
++    service.lookup('artist', ARTIST_MBID).then(r => result = r);
++    flushMicrotasks();
++    const req = httpMock.expectOne(`${API}/artist/${ARTIST_MBID}?fmt=json`);
++    expect(req.request.method).toEqual('GET');
++    expect(req.request.headers.get('User-Agent')).toEqual(MUSICBRAINZ_USER_AGENT);
++    expect(MUSICBRAINZ_USER_AGENT).toMatch(/^KendraioApp\/\d+\.\d+\.\d+ \( https:\/\/github\.com\/kendraio\/kendraio-app \)$/);
++    expect(req.request.headers.get('Accept')).toEqual('application/json');
++    // MusicBrainz answers preflights with "Access-Control-Allow-Headers: Authorization, Content-Type, User-Agent"
++    req.request.headers.keys().forEach(name => expect(['accept', 'user-agent']).toContain(name.toLowerCase()));
++    req.flush({ id: ARTIST_MBID, name: 'Björk' });
++    flushMicrotasks();
++    expect(result).toEqual({ id: ARTIST_MBID, name: 'Björk' });
++  }));
++
++  it('can omit the User-Agent header', fakeAsync(() => {
++    service.lookup('artist', ARTIST_MBID, undefined, { sendUserAgent: false });
++    flushMicrotasks();
++    const req = httpMock.expectOne(`${API}/artist/${ARTIST_MBID}?fmt=json`);
++    expect(req.request.headers.has('User-Agent')).toBeFalse();
++    req.flush({});
++    flushMicrotasks();
++  }));
++
++  it('spaces requests at least one second apart', fakeAsync(() => {
++    service.search('artist', 'one');
++    service.search('artist', 'two');
++    service.search('artist', 'three');
++    flushMicrotasks();
++    expect(httpMock.match(() => true).map(r => r.request.urlWithParams)).toEqual([`${API}/artist?query=one&fmt=json`]);
++
++    tick(999);
++    expect(httpMock.match(() => true).length).toEqual(0);
++    tick(1);
++    expect(httpMock.match(() => true).map(r => r.request.urlWithParams)).toEqual([`${API}/artist?query=two&fmt=json`]);
++
++    tick(1000);
++    expect(httpMock.match(() => true).map(r => r.request.urlWithParams)).toEqual([`${API}/artist?query=three&fmt=json`]);
++  }));
++
++  it('never goes below one request per second against musicbrainz.org, but honours faster mirrors', () => {
++    expect(service.effectiveMinInterval({ minIntervalMs: 100 })).toEqual(1000);
++    expect(service.effectiveMinInterval({ minIntervalMs: 2500 })).toEqual(2500);
++    expect(service.effectiveMinInterval({ apiRoot: 'https://test.musicbrainz.org/ws/2', minIntervalMs: 0 })).toEqual(1000);
++    expect(service.effectiveMinInterval({ apiRoot: 'http://localhost:5000/ws/2', minIntervalMs: 100 })).toEqual(100);
++  });
++
++  it('retries throttled (503) requests with back-off', fakeAsync(() => {
++    let result;
++    service.search('artist', 'busy').then(r => result = r);
++    flushMicrotasks();
++    httpMock.expectOne(`${API}/artist?query=busy&fmt=json`).flush(null, { status: 503, statusText: 'Service Unavailable' });
++    flushMicrotasks();
++
++    tick(999); // back-off: nothing is sent before a full second has passed
++    httpMock.expectNone(() => true);
++    tick(1);
++    httpMock.expectOne(`${API}/artist?query=busy&fmt=json`).flush({ count: 0, artists: [] });
++    flushMicrotasks();
++    expect(result).toEqual({ count: 0, artists: [] });
++  }));
++
++  it('gives up after the configured number of retries', fakeAsync(() => {
++    let error;
++    service.search('artist', 'busy', {}, { maxRetries: 0 }).catch(e => error = e);
++    flushMicrotasks();
++    httpMock.expectOne(`${API}/artist?query=busy&fmt=json`).flush(null, { status: 503, statusText: 'Service Unavailable' });
++    flushMicrotasks();
++    expect(error instanceof MusicBrainzError).toBeTrue();
++    expect(error.status).toEqual(503);
++    expect(error.message).toContain('rate limiting');
++  }));
++
++  it('reports MusicBrainz error messages', fakeAsync(() => {
++    let error;
++    service.lookup('artist', ARTIST_MBID).catch(e => error = e);
++    flushMicrotasks();
++    httpMock.expectOne(`${API}/artist/${ARTIST_MBID}?fmt=json`)
++      .flush({ error: 'Not Found', help: 'For usage, please see: https://musicbrainz.org/development/mmd' },
++        { status: 404, statusText: 'Not Found' });
++    flushMicrotasks();
++    expect(error.message).toEqual('MusicBrainz request failed (HTTP 404): Not Found');
++  }));
++
++  it('rejects invalid requests without calling the API', fakeAsync(() => {
++    let error;
++    service.lookup('artist', '1234').catch(e => error = e);
++    flushMicrotasks();
++    httpMock.expectNone(() => true);
++    expect(error instanceof MusicBrainzError).toBeTrue();
++  }));
++
++  it('shares in-flight requests and caches responses', fakeAsync(() => {
++    const results = [];
++    service.lookup('artist', ARTIST_MBID).then(r => results.push(r));
++    service.lookup('artist', ARTIST_MBID).then(r => results.push(r));
++    flushMicrotasks();
++    httpMock.expectOne(`${API}/artist/${ARTIST_MBID}?fmt=json`).flush({ id: ARTIST_MBID });
++    flushMicrotasks();
++
++    service.lookup('artist', ARTIST_MBID).then(r => results.push(r));
++    flushMicrotasks();
++    httpMock.expectNone(() => true);
++    expect(results.length).toEqual(3);
++
++    service.clearCache();
++    service.lookup('artist', ARTIST_MBID, undefined, { cacheTtlMs: 0 }).then(r => results.push(r));
++    tick(1000);
++    httpMock.expectOne(`${API}/artist/${ARTIST_MBID}?fmt=json`).flush({ id: ARTIST_MBID });
++    flushMicrotasks();
++    expect(results.length).toEqual(4);
++  }));
++});
+diff --git a/src/app/services/musicbrainz.service.ts b/src/app/services/musicbrainz.service.ts
+new file mode 100644
+index 00000000..4ff637d2
+--- /dev/null
++++ b/src/app/services/musicbrainz.service.ts
+@@ -0,0 +1,622 @@
++import { Injectable } from '@angular/core';
++import { HttpClient, HttpErrorResponse, HttpHeaders } from '@angular/common/http';
++import { castArray, get, isArray, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
++import packageInfo from '../../../package.json';
++
++/**
++ * Client for the MusicBrainz web service (WS/2).
++ *
++ * MusicBrainz asks every client to:
++ *  - send a meaningful User-Agent ("Application/<version> ( contact-url )"), and
++ *  - stay at or below an average of one request per second per IP address.
++ *
++ * See https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting
++ *
++ * This service is provided in root, so every MusicBrainz block in every Flow shares
++ * one request queue. Requests are spaced at least `minIntervalMs` apart (never less
++ * than 1000ms against musicbrainz.org), identical GET requests are de-duplicated and
++ * cached for a short time, and HTTP 503/429 (MusicBrainz' throttling responses) are
++ * retried with exponential back-off.
++ */
++
++export const MUSICBRAINZ_API_ROOT = 'https://musicbrainz.org/ws/2';
++export const MUSICBRAINZ_SITE_ROOT = 'https://musicbrainz.org';
++export const MUSICBRAINZ_USER_AGENT =
++  `KendraioApp/${get(packageInfo, 'version', '0.0.0')} ( https://github.com/kendraio/kendraio-app )`;
++export const MUSICBRAINZ_MIN_INTERVAL_MS = 1000;
++export const MUSICBRAINZ_DEFAULT_EDIT_NOTE = 'Seeded from Kendraio App (https://app.kendra.io)';
++
++export type MusicBrainzOperation = 'search' | 'lookup' | 'browse';
++
++export interface MusicBrainzRequest {
++  operation: MusicBrainzOperation;
++  entity: string;
++  /** search: a Lucene query string, or an object of field/value pairs that are AND-ed together */
++  query?: string | Record<string, any>;
++  /** lookup: the MBID of the entity */
++  mbid?: string;
++  /** lookup + browse: extra data to include, e.g. ['aliases', 'url-rels'] or 'aliases+url-rels' */
++  inc?: string | string[];
++  /** browse: the entity type to browse by, e.g. 'artist' to list the releases of an artist */
++  linkedEntity?: string;
++  /** browse: the MBID of the linked entity */
++  linkedMbid?: string;
++  /** search + browse: page size (1-100) */
++  limit?: number;
++  /** search + browse: paging offset */
++  offset?: number;
++  /** release / release-group type filter, e.g. 'album' or ['album', 'ep'] */
++  type?: string | string[];
++  /** release status filter, e.g. 'official' */
++  status?: string | string[];
++  /** search: use the simplified "dismax" query parser */
++  dismax?: boolean;
++}
++
++export interface MusicBrainzClientOptions {
++  /** Web service root. Defaults to https://musicbrainz.org/ws/2 (use a mirror or https://test.musicbrainz.org/ws/2 for testing) */
++  apiRoot?: string;
++  /** Value of the User-Agent header. Defaults to MUSICBRAINZ_USER_AGENT */
++  userAgent?: string;
++  /** Set to false to not send the User-Agent header at all */
++  sendUserAgent?: boolean;
++  /** Minimum delay between two requests. Never lower than 1000ms for musicbrainz.org */
++  minIntervalMs?: number;
++  /** How many times a throttled (503/429) request is retried. Default 2 */
++  maxRetries?: number;
++  /** How long successful responses are cached. Default 5 minutes, 0 disables the cache */
++  cacheTtlMs?: number;
++}
++
++export interface MusicBrainzSeedField {
++  name: string;
++  value: string;
++}
++
++export class MusicBrainzError extends Error {
++  constructor(message: string, public readonly status?: number, public readonly url?: string) {
++    super(message);
++    this.name = 'MusicBrainzError';
++  }
++}
++
++/** Entities that can be looked up by MBID */
++export const MUSICBRAINZ_LOOKUP_ENTITIES = [
++  'area', 'artist', 'event', 'genre', 'instrument', 'label', 'place',
++  'recording', 'release', 'release-group', 'series', 'url', 'work'
++];
++
++/** Entities that the search server indexes */
++export const MUSICBRAINZ_SEARCH_ENTITIES = [
++  'annotation', 'area', 'artist', 'cdstub', 'event', 'instrument', 'label', 'place',
++  'recording', 'release', 'release-group', 'series', 'tag', 'url', 'work'
++];
++
++/** For each browsable entity, the linked entities it can be browsed by */
++export const MUSICBRAINZ_BROWSE_LINKS: Record<string, string[]> = {
++  area: ['collection'],
++  artist: ['area', 'collection', 'recording', 'release', 'release-group', 'work'],
++  event: ['area', 'artist', 'collection', 'event', 'place'],
++  genre: ['collection'],
++  instrument: ['collection'],
++  label: ['area', 'collection', 'release'],
++  place: ['area', 'collection'],
++  recording: ['artist', 'collection', 'release', 'work'],
++  release: ['area', 'artist', 'collection', 'label', 'track', 'track_artist', 'recording', 'release-group'],
++  'release-group': ['artist', 'collection', 'release'],
++  series: ['collection'],
++  work: ['artist', 'collection'],
++  url: ['resource']
++};
++
++const RELATIONSHIP_INCLUDES = [
++  'area-rels', 'artist-rels', 'event-rels', 'genre-rels', 'instrument-rels', 'label-rels', 'place-rels',
++  'recording-rels', 'release-rels', 'release-group-rels', 'series-rels', 'url-rels', 'work-rels',
++  'recording-level-rels', 'work-level-rels'
++];
++const MISC_INCLUDES = ['aliases', 'annotation', 'tags', 'ratings', 'genres'];
++
++/** Allowed inc= values for lookup and browse requests, per entity */
++export const MUSICBRAINZ_INCLUDES: Record<string, string[]> = {
++  area: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES],
++  artist: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES,
++    'recordings', 'releases', 'release-groups', 'works', 'discids', 'media', 'isrcs', 'artist-credits', 'various-artists'],
++  event: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES],
++  genre: ['aliases'],
++  instrument: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES],
++  label: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES, 'releases', 'discids', 'media', 'artist-credits'],
++  place: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES],
++  recording: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES,
++    'releases', 'release-groups', 'discids', 'media', 'isrcs', 'artist-credits'],
++  release: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES,
++    'collections', 'labels', 'recordings', 'release-groups', 'discids', 'media', 'isrcs', 'artist-credits',
++    'release-group-level-rels'],
++  'release-group': [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES, 'releases', 'discids', 'media', 'artist-credits'],
++  series: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES],
++  url: [...RELATIONSHIP_INCLUDES],
++  work: [...MISC_INCLUDES, ...RELATIONSHIP_INCLUDES]
++};
++
++/** The key holding the list of results in search and browse responses */
++const RESULT_KEYS: Record<string, string> = {
++  annotation: 'annotations',
++  area: 'areas',
++  artist: 'artists',
++  cdstub: 'cdstubs',
++  event: 'events',
++  genre: 'genres',
++  instrument: 'instruments',
++  label: 'labels',
++  place: 'places',
++  recording: 'recordings',
++  release: 'releases',
++  'release-group': 'release-groups',
++  series: 'series',
++  tag: 'tags',
++  url: 'urls',
++  work: 'works'
++};
++
++const MBID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++const RETRYABLE_STATUS = [429, 503];
++const MAX_CACHE_ENTRIES = 100;
++
++export function isMbid(value: any): boolean {
++  return isString(value) && MBID_PATTERN.test(value.trim());
++}
++
++/**
++ * Build a Lucene query from field/value pairs, e.g.
++ * { artist: 'Björk', country: 'IS' } => artist:"Björk" AND country:"IS"
++ * Array values are OR-ed: { type: ['album', 'ep'] } => (type:"album" OR type:"ep")
++ * Empty values are skipped.
++ */
++export function buildLuceneQuery(fields: Record<string, any>): string {
++  const term = (field: string, value: any) => `${field}:"${String(value).replace(/(["\\])/g, '\\$1')}"`;
++  return Object.keys(fields || {})
++    .filter(field => /^[a-z][a-z_-]*$/i.test(field))
++    .map(field => {
++      const values = castArray(fields[field])
++        .filter(value => !isNil(value) && String(value).trim() !== '')
++        .map(value => term(field, String(value).trim()));
++      if (values.length === 0) {
++        return '';
++      }
++      return values.length === 1 ? values[0] : `(${values.join(' OR ')})`;
++    })
++    .filter(clause => clause !== '')
++    .join(' AND ');
++}
++
++function toList(value: string | string[] | undefined): string[] {
++  if (isNil(value)) {
++    return [];
++  }
++  // Not split on spaces: some MusicBrainz type names contain one ("Audio drama")
++  const list = isArray(value) ? value : String(value).split(/[+|,]+/);
++  return list.map(item => String(item).trim()).filter(item => item !== '');
++}
++
++function checkPaging(name: string, value: any, min: number, max: number) {
++  if (isNil(value) || value === '') {
++    return undefined;
++  }
++  const num = Number(value);
++  if (!Number.isInteger(num) || num < min || num > max) {
++    throw new MusicBrainzError(`MusicBrainz ${name} must be a whole number between ${min} and ${max}`);
++  }
++  return num;
++}
++
++function isMusicBrainzHost(apiRoot: string) {
++  try {
++    const host = new URL(apiRoot).hostname;
++    return host === 'musicbrainz.org' || host.endsWith('.musicbrainz.org');
++  } catch {
++    return false;
++  }
++}
++
++/**
++ * Validate a request and build the WS/2 URL for it.
++ * Throws a MusicBrainzError with a readable message when the request is invalid.
++ */
++export function buildMusicBrainzUrl(request: MusicBrainzRequest, apiRoot = MUSICBRAINZ_API_ROOT): string {
++  const operation = get(request, 'operation');
++  const entity = String(get(request, 'entity', '')).trim().toLowerCase();
++  const root = String(apiRoot || MUSICBRAINZ_API_ROOT).replace(/\/+$/, '');
++  const params: Array<[string, string]> = [];
++
++  const addInc = () => {
++    const inc = toList(request.inc);
++    const allowed = MUSICBRAINZ_INCLUDES[entity] || [];
++    const unknown = inc.filter(item => !allowed.includes(item));
++    if (unknown.length > 0) {
++      throw new MusicBrainzError(`Unsupported inc value(s) for ${entity}: ${unknown.join(', ')}`);
++    }
++    if (inc.length > 0) {
++      params.push(['inc', inc.join('+')]);
++    }
++  };
++  const addFilters = () => {
++    const type = toList(request.type);
++    const status = toList(request.status);
++    if (type.length > 0) {
++      params.push(['type', type.join('|')]);
++    }
++    if (status.length > 0) {
++      params.push(['status', status.join('|')]);
++    }
++  };
++  const addPaging = () => {
++    const limit = checkPaging('limit', request.limit, 1, 100);
++    const offset = checkPaging('offset', request.offset, 0, Number.MAX_SAFE_INTEGER);
++    if (!isNil(limit)) {
++      params.push(['limit', String(limit)]);
++    }
++    if (!isNil(offset)) {
++      params.push(['offset', String(offset)]);
++    }
++  };
++
++  let path: string;
++  switch (operation) {
++    case 'search': {
++      if (!MUSICBRAINZ_SEARCH_ENTITIES.includes(entity)) {
++        throw new MusicBrainzError(`Cannot search MusicBrainz for "${entity}"`);
++      }
++      const query = isPlainObject(request.query)
++        ? buildLuceneQuery(request.query as Record<string, any>)
++        : String(isNil(request.query) ? '' : request.query).trim();
++      if (query === '') {
++        throw new MusicBrainzError('A search query is required');
++      }
++      path = `/${entity}`;
++      params.push(['query', query]);
++      addPaging();
++      if (request.dismax) {
++        params.push(['dismax', 'true']);
++      }
++      break;
++    }
++    case 'lookup': {
++      if (!MUSICBRAINZ_LOOKUP_ENTITIES.includes(entity)) {
++        throw new MusicBrainzError(`Cannot look up MusicBrainz entity "${entity}"`);
++      }
++      if (!isMbid(request.mbid)) {
++        throw new MusicBrainzError(`"${request.mbid}" is not a valid MusicBrainz identifier (MBID)`);
++      }
++      path = `/${entity}/${request.mbid.trim().toLowerCase()}`;
++      addInc();
++      addFilters();
++      break;
++    }
++    case 'browse': {
++      const linkedEntity = String(get(request, 'linkedEntity', '')).trim().toLowerCase();
++      const allowedLinks = MUSICBRAINZ_BROWSE_LINKS[entity];
++      if (!allowedLinks) {
++        throw new MusicBrainzError(`Cannot browse MusicBrainz entity "${entity}"`);
++      }
++      if (!allowedLinks.includes(linkedEntity)) {
++        throw new MusicBrainzError(
++          `Cannot browse ${entity} by "${linkedEntity}". Use one of: ${allowedLinks.join(', ')}`);
++      }
++      if (linkedEntity === 'resource') {
++        if (!isString(request.linkedMbid) || request.linkedMbid.trim() === '') {
++          throw new MusicBrainzError('A resource URL is required to browse urls');
++        }
++      } else if (!isMbid(request.linkedMbid)) {
++        throw new MusicBrainzError(`"${request.linkedMbid}" is not a valid MusicBrainz identifier (MBID)`);
++      }
++      path = `/${entity}`;
++      params.push([linkedEntity, request.linkedMbid.trim()]);
++      addInc();
++      addFilters();
++      addPaging();
++      break;
++    }
++    default:
++      throw new MusicBrainzError(`Unknown MusicBrainz operation "${operation}". Use search, lookup or browse`);
++  }
++
++  params.push(['fmt', 'json']);
++  const queryString = params
++    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
++    .join('&');
++  return `${root}${path}?${queryString}`;
++}
++
++/** Return the list of results from a search or browse response, or the response itself for lookups */
++export function extractMusicBrainzResults(entity: string, response: any) {
++  const key = RESULT_KEYS[String(entity).toLowerCase()];
++  if (key && isArray(get(response, key))) {
++    return get(response, key);
++  }
++  return response;
++}
++
++function formatLength(length: any): string | undefined {
++  if (isNil(length) || length === '') {
++    return undefined;
++  }
++  if (isNumber(length)) {
++    return String(Math.round(length));
++  }
++  return String(length).trim();
++}
++
++/**
++ * Convert a release description into the flat list of form fields understood by the
++ * MusicBrainz release editor ("release editor seeding").
++ *
++ * See https://wiki.musicbrainz.org/Development/Release_Editor_Seeding
++ *
++ * Accepted shape (all keys optional except name and at least one track per medium):
++ * {
++ *   name, releaseGroup, type: 'album' | ['album', 'live'], comment, annotation, barcode,
++ *   language, script, status, packaging,
++ *   artistCredit: 'Artist name' | [{ mbid, name, artistName, joinPhrase }],
++ *   events: [{ date: 'YYYY-MM-DD' | { year, month, day }, country }],
++ *   labels: [{ mbid, name, catalogNumber }],
++ *   mediums: [{ format, name, tracks: [{ name, number, recording, length, artistCredit }] }],
++ *   urls: [{ url, linkType }] | ['https://...'],
++ *   editNote, redirectUri
++ * }
++ */
++export function buildReleaseSeed(release: any): MusicBrainzSeedField[] {
++  if (!isPlainObject(release)) {
++    throw new MusicBrainzError('Release data must be an object');
++  }
++  const fields: MusicBrainzSeedField[] = [];
++  const add = (name: string, value: any) => {
++    if (!isNil(value) && String(value).trim() !== '') {
++      fields.push({ name, value: String(value).trim() });
++    }
++  };
++  const addArtistCredit = (prefix: string, credit: any) => {
++    const names = isString(credit) ? [{ name: credit }] : castArray(credit || []);
++    names.forEach((artist: any, index: number) => {
++      const entry = isString(artist) ? { name: artist } : (artist || {});
++      add(`${prefix}.names.${index}.mbid`, isMbid(entry.mbid) ? entry.mbid : undefined);
++      add(`${prefix}.names.${index}.name`, entry.name);
++      add(`${prefix}.names.${index}.artist.name`, entry.artistName);
++      if (!isNil(entry.joinPhrase) && entry.joinPhrase !== '') {
++        // join phrases are significant whitespace (" & "), so they are not trimmed
++        fields.push({ name: `${prefix}.names.${index}.join_phrase`, value: String(entry.joinPhrase) });
++      }
++    });
++  };
++
++  const name = isString(release.name) ? release.name.trim() : '';
++  if (name === '') {
++    throw new MusicBrainzError('A release name is required');
++  }
++  add('name', name);
++
++  if (isMbid(release.releaseGroup)) {
++    add('release_group', release.releaseGroup);
++  } else {
++    toList(release.type).forEach(type => add('type', type));
++  }
++  add('comment', release.comment);
++  add('annotation', release.annotation);
++  add('barcode', release.barcode);
++  add('language', release.language);
++  add('script', release.script);
++  add('status', release.status);
++  add('packaging', release.packaging);
++
++  addArtistCredit('artist_credit', release.artistCredit);
++
++  castArray(release.events || []).forEach((event: any, index: number) => {
++    const date = get(event, 'date');
++    let year;
++    let month;
++    let day;
++    if (isString(date)) {
++      [year, month, day] = date.split('-');
++    } else if (isPlainObject(date)) {
++      ({ year, month, day } = date);
++    }
++    add(`events.${index}.date.year`, year);
++    add(`events.${index}.date.month`, isNil(month) || month === '' ? undefined : Number(month));
++    add(`events.${index}.date.day`, isNil(day) || day === '' ? undefined : Number(day));
++    add(`events.${index}.country`, get(event, 'country'));
++  });
++
++  castArray(release.labels || []).forEach((label: any, index: number) => {
++    add(`labels.${index}.mbid`, isMbid(get(label, 'mbid')) ? label.mbid : undefined);
++    add(`labels.${index}.name`, get(label, 'name'));
++    add(`labels.${index}.catalog_number`, get(label, 'catalogNumber'));
++  });
++
++  castArray(release.mediums || []).forEach((medium: any, mediumIndex: number) => {
++    const tracks = castArray(get(medium, 'tracks', []));
++    if (tracks.length === 0) {
++      throw new MusicBrainzError(`Medium ${mediumIndex + 1} needs at least one track`);
++    }
++    add(`mediums.${mediumIndex}.format`, get(medium, 'format'));
++    add(`mediums.${mediumIndex}.name`, get(medium, 'name'));
++    tracks.forEach((track: any, trackIndex: number) => {
++      const prefix = `mediums.${mediumIndex}.track.${trackIndex}`;
++      const entry = isString(track) ? { name: track } : (track || {});
++      if (!isString(entry.name) || entry.name.trim() === '') {
++        throw new MusicBrainzError(`Track ${trackIndex + 1} on medium ${mediumIndex + 1} needs a name`);
++      }
++      add(`${prefix}.name`, entry.name);
++      add(`${prefix}.number`, entry.number);
++      add(`${prefix}.recording`, isMbid(entry.recording) ? entry.recording : undefined);
++      add(`${prefix}.length`, formatLength(entry.length));
++      if (entry.artistCredit) {
++        addArtistCredit(`${prefix}.artist_credit`, entry.artistCredit);
++      }
++    });
++  });
++
++  castArray(release.urls || []).forEach((url: any, index: number) => {
++    const entry = isString(url) ? { url } : (url || {});
++    add(`urls.${index}.url`, entry.url);
++    add(`urls.${index}.link_type`, entry.linkType);
++  });
++
++  add('edit_note', isNil(release.editNote) ? MUSICBRAINZ_DEFAULT_EDIT_NOTE : release.editNote);
++  add('redirect_uri', release.redirectUri);
++  return fields;
++}
++
++/** The URL of the release editor that seed fields are POSTed to */
++export function releaseEditorUrl(siteRoot = MUSICBRAINZ_SITE_ROOT) {
++  return `${String(siteRoot || MUSICBRAINZ_SITE_ROOT).replace(/\/+$/, '')}/release/add`;
++}
++
++interface CacheEntry {
++  expiresAt: number;
++  value: any;
++}
++
++@Injectable({
++  providedIn: 'root'
++})
++export class MusicBrainzService {
++
++  private nextSlotAt = 0;
++  private readonly cache = new Map<string, CacheEntry>();
++  private readonly inFlight = new Map<string, Promise<any>>();
++
++  constructor(private readonly http: HttpClient) {
++  }
++
++  /** Run a search, lookup or browse request against the MusicBrainz web service */
++  request(request: MusicBrainzRequest, options: MusicBrainzClientOptions = {}): Promise<any> {
++    let url: string;
++    try {
++      url = buildMusicBrainzUrl(request, options.apiRoot);
++    } catch (error) {
++      return Promise.reject(error);
++    }
++    return this.get(url, options);
++  }
++
++  search(entity: string, query: string | Record<string, any>, extra: Partial<MusicBrainzRequest> = {},
++         options: MusicBrainzClientOptions = {}) {
++    return this.request({ ...extra, operation: 'search', entity, query }, options);
++  }
++
++  lookup(entity: string, mbid: string, inc?: string | string[], options: MusicBrainzClientOptions = {}) {
++    return this.request({ operation: 'lookup', entity, mbid, inc }, options);
++  }
++
++  browse(entity: string, linkedEntity: string, linkedMbid: string, extra: Partial<MusicBrainzRequest> = {},
++         options: MusicBrainzClientOptions = {}) {
++    return this.request({ ...extra, operation: 'browse', entity, linkedEntity, linkedMbid }, options);
++  }
++
++  /** GET a WS/2 URL through the shared, rate limited queue */
++  get(url: string, options: MusicBrainzClientOptions = {}): Promise<any> {
++    const cacheTtlMs = isNil(options.cacheTtlMs) ? 5 * 60 * 1000 : Number(options.cacheTtlMs);
++    const cached = this.cache.get(url);
++    if (cached && cached.expiresAt > this.now()) {
++      return Promise.resolve(cached.value);
++    }
++    if (this.inFlight.has(url)) {
++      return this.inFlight.get(url);
++    }
++    const pending = this.fetchWithRetry(url, options, 0)
++      .then(value => {
++        if (cacheTtlMs > 0) {
++          this.remember(url, value, cacheTtlMs);
++        }
++        return value;
++      })
++      .finally(() => this.inFlight.delete(url));
++    this.inFlight.set(url, pending);
++    return pending;
++  }
++
++  /** Remove all cached responses */
++  clearCache() {
++    this.cache.clear();
++  }
++
++  /** The delay that is enforced between two requests to the given web service root */
++  effectiveMinInterval(options: MusicBrainzClientOptions = {}) {
++    const requested = isNil(options.minIntervalMs) ? MUSICBRAINZ_MIN_INTERVAL_MS : Number(options.minIntervalMs);
++    const apiRoot = options.apiRoot || MUSICBRAINZ_API_ROOT;
++    if (isMusicBrainzHost(apiRoot)) {
++      return Math.max(MUSICBRAINZ_MIN_INTERVAL_MS, requested || 0);
++    }
++    return Math.max(0, requested || 0);
++  }
++
++  headers(options: MusicBrainzClientOptions = {}) {
++    let headers = new HttpHeaders({ Accept: 'application/json' });
++    // MusicBrainz' CORS policy explicitly allows the User-Agent header. Browsers that do not
++    // let scripts set it (Chromium) drop it and send their own User-Agent plus the Origin.
++    // Do NOT add headers such as 'ngsw-bypass' here: they are not in MusicBrainz'
++    // Access-Control-Allow-Headers list, so the CORS preflight would fail.
++    if (options.sendUserAgent !== false) {
++      headers = headers.set('User-Agent', options.userAgent || MUSICBRAINZ_USER_AGENT);
++    }
++    return headers;
++  }
++
++  private async fetchWithRetry(url: string, options: MusicBrainzClientOptions, attempt: number): Promise<any> {
++    const maxRetries = isNil(options.maxRetries) ? 2 : Math.max(0, Number(options.maxRetries));
++    const minInterval = this.effectiveMinInterval(options);
++    await this.waitForSlot(minInterval);
++    try {
++      return await this.http.get(url, { headers: this.headers(options) }).toPromise();
++    } catch (error) {
++      const status = get(error, 'status');
++      if (RETRYABLE_STATUS.includes(status) && attempt < maxRetries) {
++        // Back off before asking again: 1s, 2s, 4s... on top of the normal spacing
++        await this.delay(Math.max(minInterval, MUSICBRAINZ_MIN_INTERVAL_MS) * Math.pow(2, attempt));
++        return this.fetchWithRetry(url, options, attempt + 1);
++      }
++      throw this.toError(error, url);
++    }
++  }
++
++  /** Reserve the next free request slot (FIFO) and wait until it starts */
++  private waitForSlot(minInterval: number): Promise<void> {
++    const now = this.now();
++    const startAt = Math.max(now, this.nextSlotAt);
++    this.nextSlotAt = startAt + minInterval;
++    return this.delay(startAt - now);
++  }
++
++  private delay(ms: number): Promise<void> {
++    if (ms <= 0) {
++      return Promise.resolve();
++    }
++    return new Promise(resolve => setTimeout(resolve, ms));
++  }
++
++  private now() {
++    return Date.now();
++  }
++
++  private remember(url: string, value: any, ttl: number) {
++    this.cache.delete(url);
++    this.cache.set(url, { value, expiresAt: this.now() + ttl });
++    while (this.cache.size > MAX_CACHE_ENTRIES) {
++      this.cache.delete(this.cache.keys().next().value);
++    }
++  }
++
++  private toError(error: any, url: string): MusicBrainzError {
++    if (error instanceof MusicBrainzError) {
++      return error;
++    }
++    const status = get(error, 'status');
++    const detail = get(error, 'error.error') || get(error, 'statusText') || get(error, 'message') || 'Request failed';
++    if (status === 503 || status === 429) {
++      return new MusicBrainzError(
++        `MusicBrainz is busy or rate limiting requests (HTTP ${status}). Please try again in a moment.`, status, url);
++    }
++    if (status === 0 || (error instanceof HttpErrorResponse && !status)) {
++      return new MusicBrainzError('Could not reach MusicBrainz. Check your connection and try again.', 0, url);
++    }
++    return new MusicBrainzError(`MusicBrainz request failed (HTTP ${status}): ${detail}`, status, url);
++  }
++}
+diff --git a/src/assets/adapters/index.json b/src/assets/adapters/index.json
+index c37ed2c9..6c35f5ba 100644
+--- a/src/assets/adapters/index.json
++++ b/src/assets/adapters/index.json
+@@ -10,6 +10,18 @@
+       "tags": [
+         "core"
+       ]
++    },
++    {
++      "name": "musicbrainz",
++      "version": "0.1.0",
++      "label": "MusicBrainz",
++      "description": "Search, look up and browse the MusicBrainz open music encyclopedia, and submit releases to it.",
++      "location": "musicbrainz",
++      "tags": [
++        "music",
++        "metadata",
++        "musicbrainz"
++      ]
+     }
+   ]
+ }
+diff --git a/src/assets/adapters/kendraio-adapter-repo.json b/src/assets/adapters/kendraio-adapter-repo.json
+index 6a4fe2b6..f53ccab3 100644
+--- a/src/assets/adapters/kendraio-adapter-repo.json
++++ b/src/assets/adapters/kendraio-adapter-repo.json
+@@ -1,6 +1,7 @@
+ {
+   "name": "Main Kendraio Adapter Repository",
+   "adapters": [
+-    "core"
++    "core",
++    "musicbrainz"
+   ]
+ }
+diff --git a/src/assets/adapters/musicbrainz.json b/src/assets/adapters/musicbrainz.json
+new file mode 100644
+index 00000000..dbb9d328
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz.json
+@@ -0,0 +1,1011 @@
++{
++  "name": "musicbrainz",
++  "label": "MusicBrainz",
++  "description": "Search, look up and browse the MusicBrainz open music encyclopedia, and submit releases to it.",
++  "version": "0.1.0",
++  "infoUrl": "https://musicbrainz.org",
++  "maintainer": "Kendraio",
++  "supportUrl": "https://github.com/kendraio/kendraio-app/issues",
++  "tags": [
++    "music",
++    "metadata",
++    "musicbrainz"
++  ],
++  "dashboard": {
++    "label": "MusicBrainz",
++    "workflowId": "dashboard",
++    "icon": "library_music"
++  },
++  "services": [
++    {
++      "label": "Search artists",
++      "workflowId": "searchArtists",
++      "icon": "search"
++    },
++    {
++      "label": "Search releases",
++      "workflowId": "searchReleases",
++      "icon": "album"
++    },
++    {
++      "label": "Search recordings",
++      "workflowId": "searchRecordings",
++      "icon": "audiotrack"
++    },
++    {
++      "label": "Submit a release",
++      "workflowId": "submitRelease",
++      "icon": "upload"
++    }
++  ],
++  "database": [],
++  "workflow": [
++    {
++      "title": "MusicBrainz",
++      "workflowId": "dashboard",
++      "config": "musicbrainz/dashboard.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: search artists",
++      "workflowId": "searchArtists",
++      "config": "musicbrainz/searchArtists.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: search releases",
++      "workflowId": "searchReleases",
++      "config": "musicbrainz/searchReleases.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: search recordings",
++      "workflowId": "searchRecordings",
++      "config": "musicbrainz/searchRecordings.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: submit a release",
++      "workflowId": "submitRelease",
++      "config": "musicbrainz/submitRelease.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: artist",
++      "workflowId": "artist",
++      "config": "musicbrainz/artist.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: release group",
++      "workflowId": "releaseGroup",
++      "config": "musicbrainz/releaseGroup.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: release",
++      "workflowId": "release",
++      "config": "musicbrainz/release.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    },
++    {
++      "title": "MusicBrainz: recording",
++      "workflowId": "recording",
++      "config": "musicbrainz/recording.json",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ]
++    }
++  ],
++  "forms": [],
++  "attachments": {
++    "musicbrainz/dashboard.json": {
++      "title": "MusicBrainz",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "template",
++          "template": "<h2>MusicBrainz</h2><p>Search and browse <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia, and submit your own releases to it. Requests are sent straight from your browser to MusicBrainz, one per second at most, as MusicBrainz asks.</p>"
++        },
++        {
++          "type": "link-action",
++          "label": "Search artists",
++          "adapterName": "musicbrainz",
++          "workflowId": "searchArtists"
++        },
++        {
++          "type": "link-action",
++          "label": "Search releases",
++          "adapterName": "musicbrainz",
++          "workflowId": "searchReleases"
++        },
++        {
++          "type": "link-action",
++          "label": "Search recordings",
++          "adapterName": "musicbrainz",
++          "workflowId": "searchRecordings"
++        },
++        {
++          "type": "link-action",
++          "label": "Submit a release",
++          "adapterName": "musicbrainz",
++          "workflowId": "submitRelease"
++        },
++        {
++          "type": "template",
++          "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++        }
++      ]
++    },
++    "musicbrainz/searchArtists.json": {
++      "title": "MusicBrainz: search artists",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "form",
++          "label": "Search",
++          "jsonSchema": {
++            "type": "object",
++            "required": [
++              "artist"
++            ],
++            "properties": {
++              "artist": {
++                "type": "string",
++                "title": "Artist name"
++              },
++              "country": {
++                "type": "string",
++                "title": "Country code (optional, e.g. GB)"
++              },
++              "type": {
++                "type": "string",
++                "title": "Type (optional)",
++                "enum": [
++                  "person",
++                  "group",
++                  "orchestra",
++                  "choir",
++                  "character",
++                  "other"
++                ]
++              }
++            }
++          },
++          "uiSchema": {}
++        },
++        {
++          "type": "musicbrainz",
++          "blockComment": "Each form field is a MusicBrainz search field; empty fields are ignored.",
++          "operation": "search",
++          "entity": "artist",
++          "limit": 50,
++          "resultsOnly": true,
++          "valueGetters": {
++            "query": "data"
++          }
++        },
++        {
++          "type": "grid",
++          "gridOptions": {},
++          "columnDefs": [
++            {
++              "headerName": "Name",
++              "field": "name"
++            },
++            {
++              "headerName": "Type",
++              "field": "type"
++            },
++            {
++              "headerName": "Country",
++              "field": "country"
++            },
++            {
++              "headerName": "Disambiguation",
++              "field": "disambiguation"
++            },
++            {
++              "headerName": "Score",
++              "field": "score"
++            },
++            {
++              "headerName": "",
++              "cellRenderer": "workflowRenderer",
++              "cellRendererParams": {
++                "blocks": [
++                  {
++                    "type": "link-action",
++                    "label": "Open",
++                    "adapterName": "musicbrainz",
++                    "workflowIdGetter": "join('', ['artist?mbid=', data.id])"
++                  }
++                ]
++              }
++            }
++          ]
++        }
++      ]
++    },
++    "musicbrainz/searchReleases.json": {
++      "title": "MusicBrainz: search releases",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "form",
++          "label": "Search",
++          "jsonSchema": {
++            "type": "object",
++            "required": [
++              "release"
++            ],
++            "properties": {
++              "release": {
++                "type": "string",
++                "title": "Release title"
++              },
++              "artist": {
++                "type": "string",
++                "title": "Artist (optional)"
++              },
++              "barcode": {
++                "type": "string",
++                "title": "Barcode (optional)"
++              },
++              "catno": {
++                "type": "string",
++                "title": "Catalog number (optional)"
++              }
++            }
++          },
++          "uiSchema": {}
++        },
++        {
++          "type": "musicbrainz",
++          "operation": "search",
++          "entity": "release",
++          "limit": 50,
++          "resultsOnly": true,
++          "valueGetters": {
++            "query": "data"
++          }
++        },
++        {
++          "type": "mapping",
++          "mapping": "data[].{id: id, title: title, artist: join('', \"artist-credit\"[].[name, not_null(joinphrase, '')][]), date: date, country: country, status: status, label: join(', ', \"label-info\"[?label].label.name || `[]`), score: score}"
++        },
++        {
++          "type": "grid",
++          "gridOptions": {},
++          "columnDefs": [
++            {
++              "headerName": "Title",
++              "field": "title"
++            },
++            {
++              "headerName": "Artist",
++              "field": "artist"
++            },
++            {
++              "headerName": "Date",
++              "field": "date"
++            },
++            {
++              "headerName": "Country",
++              "field": "country"
++            },
++            {
++              "headerName": "Label",
++              "field": "label"
++            },
++            {
++              "headerName": "Status",
++              "field": "status"
++            },
++            {
++              "headerName": "Score",
++              "field": "score"
++            },
++            {
++              "headerName": "",
++              "cellRenderer": "workflowRenderer",
++              "cellRendererParams": {
++                "blocks": [
++                  {
++                    "type": "link-action",
++                    "label": "Open",
++                    "adapterName": "musicbrainz",
++                    "workflowIdGetter": "join('', ['release?mbid=', data.id])"
++                  }
++                ]
++              }
++            }
++          ]
++        }
++      ]
++    },
++    "musicbrainz/searchRecordings.json": {
++      "title": "MusicBrainz: search recordings",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "form",
++          "label": "Search",
++          "jsonSchema": {
++            "type": "object",
++            "properties": {
++              "recording": {
++                "type": "string",
++                "title": "Recording (track) title"
++              },
++              "artist": {
++                "type": "string",
++                "title": "Artist (optional)"
++              },
++              "isrc": {
++                "type": "string",
++                "title": "ISRC (optional)"
++              }
++            }
++          },
++          "uiSchema": {}
++        },
++        {
++          "type": "musicbrainz",
++          "operation": "search",
++          "entity": "recording",
++          "limit": 50,
++          "resultsOnly": true,
++          "valueGetters": {
++            "query": "data"
++          }
++        },
++        {
++          "type": "mapping",
++          "mapping": "data[].{id: id, title: title, artist: join('', \"artist-credit\"[].[name, not_null(joinphrase, '')][]), duration: length && join(':', [to_string(floor(product(length, `0.0000166666667`))), padStart(to_string(numDiff(floor(product(length, `0.001`)), product(floor(product(length, `0.0000166666667`)), `60`))), `2`, '0')]) || '', firstReleased: \"first-release-date\", disambiguation: disambiguation, score: score}"
++        },
++        {
++          "type": "grid",
++          "gridOptions": {},
++          "columnDefs": [
++            {
++              "headerName": "Title",
++              "field": "title"
++            },
++            {
++              "headerName": "Artist",
++              "field": "artist"
++            },
++            {
++              "headerName": "Length",
++              "field": "duration"
++            },
++            {
++              "headerName": "First released",
++              "field": "firstReleased"
++            },
++            {
++              "headerName": "Disambiguation",
++              "field": "disambiguation"
++            },
++            {
++              "headerName": "Score",
++              "field": "score"
++            },
++            {
++              "headerName": "",
++              "cellRenderer": "workflowRenderer",
++              "cellRendererParams": {
++                "blocks": [
++                  {
++                    "type": "link-action",
++                    "label": "Open",
++                    "adapterName": "musicbrainz",
++                    "workflowIdGetter": "join('', ['recording?mbid=', data.id])"
++                  }
++                ]
++              }
++            }
++          ]
++        }
++      ]
++    },
++    "musicbrainz/submitRelease.json": {
++      "title": "MusicBrainz: submit a release",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "template",
++          "template": "<h2>Submit a release to MusicBrainz</h2><p>Fill in what you know about your release. The button below opens the MusicBrainz release editor with these details filled in, where you can review, complete and submit them. You need a <a href=\"https://musicbrainz.org/register\">MusicBrainz account</a>; if you are not logged in, MusicBrainz asks you to log in first. Please search MusicBrainz first to avoid adding a duplicate.</p>"
++        },
++        {
++          "type": "form",
++          "label": "Prepare submission",
++          "jsonSchema": {
++            "type": "object",
++            "required": [
++              "name",
++              "artist"
++            ],
++            "properties": {
++              "name": {
++                "type": "string",
++                "title": "Release title"
++              },
++              "artist": {
++                "type": "string",
++                "title": "Artist, as credited on the release"
++              },
++              "artistMbid": {
++                "type": "string",
++                "title": "Artist MBID (optional, if the artist is already in MusicBrainz)"
++              },
++              "type": {
++                "type": "string",
++                "title": "Type",
++                "enum": [
++                  "album",
++                  "single",
++                  "ep",
++                  "broadcast",
++                  "other"
++                ],
++                "default": "album"
++              },
++              "status": {
++                "type": "string",
++                "title": "Status",
++                "enum": [
++                  "official",
++                  "promotion",
++                  "bootleg",
++                  "pseudo-release"
++                ],
++                "default": "official"
++              },
++              "date": {
++                "type": "string",
++                "title": "Release date (YYYY, YYYY-MM or YYYY-MM-DD)"
++              },
++              "country": {
++                "type": "string",
++                "title": "Country code (e.g. GB, or XW for worldwide)"
++              },
++              "label": {
++                "type": "string",
++                "title": "Label"
++              },
++              "catalogNumber": {
++                "type": "string",
++                "title": "Catalog number"
++              },
++              "barcode": {
++                "type": "string",
++                "title": "Barcode"
++              },
++              "format": {
++                "type": "string",
++                "title": "Format",
++                "enum": [
++                  "Digital Media",
++                  "CD",
++                  "Vinyl",
++                  "Cassette"
++                ],
++                "default": "Digital Media"
++              },
++              "tracks": {
++                "type": "array",
++                "title": "Tracks",
++                "items": {
++                  "type": "object",
++                  "properties": {
++                    "name": {
++                      "type": "string",
++                      "title": "Title"
++                    },
++                    "length": {
++                      "type": "string",
++                      "title": "Length (m:ss)"
++                    }
++                  }
++                }
++              },
++              "url": {
++                "type": "string",
++                "title": "Link to the release (e.g. on your website or a store)"
++              }
++            }
++          },
++          "uiSchema": {}
++        },
++        {
++          "type": "mapping",
++          "blockComment": "Reshape the form into the release format the MusicBrainz block expects",
++          "mapping": "{name: data.name, type: data.type, status: data.status, barcode: data.barcode, artistCredit: [{name: data.artist, mbid: data.artistMbid}], events: [{date: data.date, country: data.country}], labels: [{name: data.label, catalogNumber: data.catalogNumber}], mediums: data.tracks && [{format: data.format, tracks: data.tracks}] || `[]`, urls: data.url && [data.url] || `[]`}"
++        },
++        {
++          "type": "musicbrainz",
++          "operation": "seed-release",
++          "label": "Open in MusicBrainz release editor",
++          "blockComment": "Use \"siteRoot\": \"https://test.musicbrainz.org\" to try this out on the MusicBrainz test server"
++        }
++      ]
++    },
++    "musicbrainz/artist.json": {
++      "title": "MusicBrainz: artist",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "multi",
++          "batches": [
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "blockComment": "Open as /musicbrainz/artist?mbid=<artist MBID>",
++                  "operation": "lookup",
++                  "entity": "artist",
++                  "inc": [
++                    "aliases",
++                    "genres",
++                    "url-rels"
++                  ],
++                  "valueGetters": {
++                    "mbid": "context.queryParams.mbid"
++                  }
++                },
++                {
++                  "type": "template",
++                  "template": "<h2>{{data.name}}</h2>{{#if data.disambiguation}}<p><em>{{data.disambiguation}}</em></p>{{/if}}<p>{{data.type}}{{#if data.country}} &middot; {{data.country}}{{/if}}{{#if data.[life-span].begin}} &middot; {{data.[life-span].begin}}{{#if data.[life-span].end}} to {{data.[life-span].end}}{{/if}}{{/if}}</p>{{#if data.genres.length}}<p>Genres: {{#each data.genres}}{{name}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}{{#if data.relations.length}}<p>Links: {{#each data.relations}}<a href=\"{{url.resource}}\">{{type}}</a>{{#unless @last}} &middot; {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"https://musicbrainz.org/artist/{{data.id}}\">View on MusicBrainz</a></p>"
++                }
++              ]
++            },
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "blockComment": "Browse: all release groups (albums, singles, EPs...) of the artist",
++                  "operation": "browse",
++                  "entity": "release-group",
++                  "linkedEntity": "artist",
++                  "limit": 100,
++                  "resultsOnly": true,
++                  "valueGetters": {
++                    "linkedMbid": "context.queryParams.mbid"
++                  }
++                },
++                {
++                  "type": "mapping",
++                  "mapping": "data[].{id: id, title: title, type: \"primary-type\", secondaryTypes: join(', ', \"secondary-types\" || `[]`), firstReleased: \"first-release-date\"}"
++                },
++                {
++                  "type": "grid",
++                  "gridOptions": {},
++                  "columnDefs": [
++                    {
++                      "headerName": "Release group",
++                      "field": "title"
++                    },
++                    {
++                      "headerName": "Type",
++                      "field": "type"
++                    },
++                    {
++                      "headerName": "Secondary types",
++                      "field": "secondaryTypes"
++                    },
++                    {
++                      "headerName": "First released",
++                      "field": "firstReleased",
++                      "sort": "asc"
++                    },
++                    {
++                      "headerName": "",
++                      "cellRenderer": "workflowRenderer",
++                      "cellRendererParams": {
++                        "blocks": [
++                          {
++                            "type": "link-action",
++                            "label": "Open",
++                            "adapterName": "musicbrainz",
++                            "workflowIdGetter": "join('', ['releaseGroup?mbid=', data.id])"
++                          }
++                        ]
++                      }
++                    }
++                  ]
++                }
++              ]
++            }
++          ]
++        },
++        {
++          "type": "template",
++          "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++        }
++      ]
++    },
++    "musicbrainz/releaseGroup.json": {
++      "title": "MusicBrainz: release group",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "multi",
++          "batches": [
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "blockComment": "Open as /musicbrainz/releaseGroup?mbid=<release group MBID>",
++                  "operation": "lookup",
++                  "entity": "release-group",
++                  "inc": [
++                    "artist-credits",
++                    "genres"
++                  ],
++                  "valueGetters": {
++                    "mbid": "context.queryParams.mbid"
++                  }
++                },
++                {
++                  "type": "template",
++                  "template": "<h2>{{data.title}}</h2><p>{{#each data.[artist-credit]}}<a href=\"/musicbrainz/artist?mbid={{artist.id}}\">{{name}}</a>{{joinphrase}}{{/each}}</p><p>{{data.[primary-type]}}{{#each data.[secondary-types]}} + {{this}}{{/each}}{{#if data.[first-release-date]}} &middot; first released {{data.[first-release-date]}}{{/if}}</p>{{#if data.genres.length}}<p>Genres: {{#each data.genres}}{{name}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"https://musicbrainz.org/release-group/{{data.id}}\">View on MusicBrainz</a></p>"
++                }
++              ]
++            },
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "blockComment": "Browse: every release (edition) in this release group",
++                  "operation": "browse",
++                  "entity": "release",
++                  "linkedEntity": "release-group",
++                  "limit": 100,
++                  "inc": [
++                    "media",
++                    "labels"
++                  ],
++                  "resultsOnly": true,
++                  "valueGetters": {
++                    "linkedMbid": "context.queryParams.mbid"
++                  }
++                },
++                {
++                  "type": "mapping",
++                  "mapping": "data[].{id: id, title: title, date: date, country: country, status: status, format: join(', ', media[?format].format || `[]`), tracks: sum(media[].\"track-count\" || `[]`), label: join(', ', \"label-info\"[?label].label.name || `[]`), catalogNumber: join(', ', \"label-info\"[?\"catalog-number\"].\"catalog-number\" || `[]`), barcode: barcode}"
++                },
++                {
++                  "type": "grid",
++                  "gridOptions": {},
++                  "columnDefs": [
++                    {
++                      "headerName": "Release",
++                      "field": "title"
++                    },
++                    {
++                      "headerName": "Date",
++                      "field": "date",
++                      "sort": "asc"
++                    },
++                    {
++                      "headerName": "Country",
++                      "field": "country"
++                    },
++                    {
++                      "headerName": "Format",
++                      "field": "format"
++                    },
++                    {
++                      "headerName": "Tracks",
++                      "field": "tracks"
++                    },
++                    {
++                      "headerName": "Label",
++                      "field": "label"
++                    },
++                    {
++                      "headerName": "Catalog #",
++                      "field": "catalogNumber"
++                    },
++                    {
++                      "headerName": "Barcode",
++                      "field": "barcode"
++                    },
++                    {
++                      "headerName": "",
++                      "cellRenderer": "workflowRenderer",
++                      "cellRendererParams": {
++                        "blocks": [
++                          {
++                            "type": "link-action",
++                            "label": "Open",
++                            "adapterName": "musicbrainz",
++                            "workflowIdGetter": "join('', ['release?mbid=', data.id])"
++                          }
++                        ]
++                      }
++                    }
++                  ]
++                }
++              ]
++            }
++          ]
++        },
++        {
++          "type": "template",
++          "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++        }
++      ]
++    },
++    "musicbrainz/release.json": {
++      "title": "MusicBrainz: release",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "multi",
++          "batches": [
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "operation": "lookup",
++                  "entity": "release",
++                  "inc": [
++                    "artist-credits",
++                    "labels",
++                    "recordings",
++                    "release-groups"
++                  ],
++                  "valueGetters": {
++                    "mbid": "context.queryParams.mbid"
++                  },
++                  "blockComment": "Open as /musicbrainz/release?mbid=<release MBID>"
++                },
++                {
++                  "type": "template",
++                  "template": "<h2>{{data.title}}</h2><p>{{#each data.[artist-credit]}}<a href=\"/musicbrainz/artist?mbid={{artist.id}}\">{{name}}</a>{{joinphrase}}{{/each}}</p><p>{{#if data.date}}{{data.date}}{{/if}}{{#if data.country}} &middot; {{data.country}}{{/if}}{{#if data.status}} &middot; {{data.status}}{{/if}}{{#if data.barcode}} &middot; barcode {{data.barcode}}{{/if}}</p>{{#if data.[label-info].length}}<p>{{#each data.[label-info]}}{{label.name}}{{#if [catalog-number]}} ({{[catalog-number]}}){{/if}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"/musicbrainz/releaseGroup?mbid={{data.[release-group].id}}\">Other editions of this release</a> &middot; <a href=\"https://musicbrainz.org/release/{{data.id}}\">View on MusicBrainz</a></p>"
++                }
++              ]
++            },
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "operation": "lookup",
++                  "entity": "release",
++                  "inc": [
++                    "artist-credits",
++                    "labels",
++                    "recordings",
++                    "release-groups"
++                  ],
++                  "valueGetters": {
++                    "mbid": "context.queryParams.mbid"
++                  },
++                  "blockComment": "Same request as above: answered from the shared in-flight request, not sent twice"
++                },
++                {
++                  "type": "mapping",
++                  "mapping": "data.media[].tracks[].{id: recording.id, number: number, title: title, duration: length && join(':', [to_string(floor(product(length, `0.0000166666667`))), padStart(to_string(numDiff(floor(product(length, `0.001`)), product(floor(product(length, `0.0000166666667`)), `60`))), `2`, '0')]) || '', artist: join('', \"artist-credit\"[].[name, not_null(joinphrase, '')][])}"
++                },
++                {
++                  "type": "grid",
++                  "gridOptions": {},
++                  "columnDefs": [
++                    {
++                      "headerName": "#",
++                      "field": "number"
++                    },
++                    {
++                      "headerName": "Title",
++                      "field": "title"
++                    },
++                    {
++                      "headerName": "Artist",
++                      "field": "artist"
++                    },
++                    {
++                      "headerName": "Length",
++                      "field": "duration"
++                    },
++                    {
++                      "headerName": "",
++                      "cellRenderer": "workflowRenderer",
++                      "cellRendererParams": {
++                        "blocks": [
++                          {
++                            "type": "link-action",
++                            "label": "Recording",
++                            "adapterName": "musicbrainz",
++                            "workflowIdGetter": "join('', ['recording?mbid=', data.id])"
++                          }
++                        ]
++                      }
++                    }
++                  ]
++                }
++              ]
++            }
++          ]
++        },
++        {
++          "type": "template",
++          "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++        }
++      ]
++    },
++    "musicbrainz/recording.json": {
++      "title": "MusicBrainz: recording",
++      "tags": [
++        "musicbrainz",
++        "music"
++      ],
++      "blocks": [
++        {
++          "type": "multi",
++          "batches": [
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "blockComment": "Open as /musicbrainz/recording?mbid=<recording MBID>",
++                  "operation": "lookup",
++                  "entity": "recording",
++                  "inc": [
++                    "artist-credits",
++                    "isrcs",
++                    "genres",
++                    "work-rels"
++                  ],
++                  "valueGetters": {
++                    "mbid": "context.queryParams.mbid"
++                  }
++                },
++                {
++                  "type": "template",
++                  "template": "<h2>{{data.title}}</h2><p>{{#each data.[artist-credit]}}<a href=\"/musicbrainz/artist?mbid={{artist.id}}\">{{name}}</a>{{joinphrase}}{{/each}}</p>{{#if data.[first-release-date]}}<p>First released {{data.[first-release-date]}}</p>{{/if}}{{#if data.isrcs.length}}<p>ISRC: {{#each data.isrcs}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}{{#if data.relations.length}}<p>Works: {{#each data.relations}}{{#if work}}{{work.title}}{{#unless @last}}, {{/unless}}{{/if}}{{/each}}</p>{{/if}}{{#if data.genres.length}}<p>Genres: {{#each data.genres}}{{name}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"https://musicbrainz.org/recording/{{data.id}}\">View on MusicBrainz</a></p>"
++                }
++              ]
++            },
++            {
++              "blocks": [
++                {
++                  "type": "init"
++                },
++                {
++                  "type": "musicbrainz",
++                  "blockComment": "Browse: releases this recording appears on",
++                  "operation": "browse",
++                  "entity": "release",
++                  "linkedEntity": "recording",
++                  "limit": 100,
++                  "resultsOnly": true,
++                  "valueGetters": {
++                    "linkedMbid": "context.queryParams.mbid"
++                  }
++                },
++                {
++                  "type": "mapping",
++                  "mapping": "data[].{id: id, title: title, date: date, country: country, status: status}"
++                },
++                {
++                  "type": "grid",
++                  "gridOptions": {},
++                  "columnDefs": [
++                    {
++                      "headerName": "Appears on",
++                      "field": "title"
++                    },
++                    {
++                      "headerName": "Date",
++                      "field": "date",
++                      "sort": "asc"
++                    },
++                    {
++                      "headerName": "Country",
++                      "field": "country"
++                    },
++                    {
++                      "headerName": "Status",
++                      "field": "status"
++                    },
++                    {
++                      "headerName": "",
++                      "cellRenderer": "workflowRenderer",
++                      "cellRendererParams": {
++                        "blocks": [
++                          {
++                            "type": "link-action",
++                            "label": "Open",
++                            "adapterName": "musicbrainz",
++                            "workflowIdGetter": "join('', ['release?mbid=', data.id])"
++                          }
++                        ]
++                      }
++                    }
++                  ]
++                }
++              ]
++            }
++          ]
++        },
++        {
++          "type": "template",
++          "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++        }
++      ]
++    }
++  }
++}
+diff --git a/src/assets/adapters/musicbrainz/artist.json b/src/assets/adapters/musicbrainz/artist.json
+new file mode 100644
+index 00000000..553a0077
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/artist.json
+@@ -0,0 +1,103 @@
++{
++  "title": "MusicBrainz: artist",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "multi",
++      "batches": [
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "blockComment": "Open as /musicbrainz/artist?mbid=<artist MBID>",
++              "operation": "lookup",
++              "entity": "artist",
++              "inc": [
++                "aliases",
++                "genres",
++                "url-rels"
++              ],
++              "valueGetters": {
++                "mbid": "context.queryParams.mbid"
++              }
++            },
++            {
++              "type": "template",
++              "template": "<h2>{{data.name}}</h2>{{#if data.disambiguation}}<p><em>{{data.disambiguation}}</em></p>{{/if}}<p>{{data.type}}{{#if data.country}} &middot; {{data.country}}{{/if}}{{#if data.[life-span].begin}} &middot; {{data.[life-span].begin}}{{#if data.[life-span].end}} to {{data.[life-span].end}}{{/if}}{{/if}}</p>{{#if data.genres.length}}<p>Genres: {{#each data.genres}}{{name}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}{{#if data.relations.length}}<p>Links: {{#each data.relations}}<a href=\"{{url.resource}}\">{{type}}</a>{{#unless @last}} &middot; {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"https://musicbrainz.org/artist/{{data.id}}\">View on MusicBrainz</a></p>"
++            }
++          ]
++        },
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "blockComment": "Browse: all release groups (albums, singles, EPs...) of the artist",
++              "operation": "browse",
++              "entity": "release-group",
++              "linkedEntity": "artist",
++              "limit": 100,
++              "resultsOnly": true,
++              "valueGetters": {
++                "linkedMbid": "context.queryParams.mbid"
++              }
++            },
++            {
++              "type": "mapping",
++              "mapping": "data[].{id: id, title: title, type: \"primary-type\", secondaryTypes: join(', ', \"secondary-types\" || `[]`), firstReleased: \"first-release-date\"}"
++            },
++            {
++              "type": "grid",
++              "gridOptions": {},
++              "columnDefs": [
++                {
++                  "headerName": "Release group",
++                  "field": "title"
++                },
++                {
++                  "headerName": "Type",
++                  "field": "type"
++                },
++                {
++                  "headerName": "Secondary types",
++                  "field": "secondaryTypes"
++                },
++                {
++                  "headerName": "First released",
++                  "field": "firstReleased",
++                  "sort": "asc"
++                },
++                {
++                  "headerName": "",
++                  "cellRenderer": "workflowRenderer",
++                  "cellRendererParams": {
++                    "blocks": [
++                      {
++                        "type": "link-action",
++                        "label": "Open",
++                        "adapterName": "musicbrainz",
++                        "workflowIdGetter": "join('', ['releaseGroup?mbid=', data.id])"
++                      }
++                    ]
++                  }
++                }
++              ]
++            }
++          ]
++        }
++      ]
++    },
++    {
++      "type": "template",
++      "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/dashboard.json b/src/assets/adapters/musicbrainz/dashboard.json
+new file mode 100644
+index 00000000..5ac624a1
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/dashboard.json
+@@ -0,0 +1,41 @@
++{
++  "title": "MusicBrainz",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "template",
++      "template": "<h2>MusicBrainz</h2><p>Search and browse <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia, and submit your own releases to it. Requests are sent straight from your browser to MusicBrainz, one per second at most, as MusicBrainz asks.</p>"
++    },
++    {
++      "type": "link-action",
++      "label": "Search artists",
++      "adapterName": "musicbrainz",
++      "workflowId": "searchArtists"
++    },
++    {
++      "type": "link-action",
++      "label": "Search releases",
++      "adapterName": "musicbrainz",
++      "workflowId": "searchReleases"
++    },
++    {
++      "type": "link-action",
++      "label": "Search recordings",
++      "adapterName": "musicbrainz",
++      "workflowId": "searchRecordings"
++    },
++    {
++      "type": "link-action",
++      "label": "Submit a release",
++      "adapterName": "musicbrainz",
++      "workflowId": "submitRelease"
++    },
++    {
++      "type": "template",
++      "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/recording.json b/src/assets/adapters/musicbrainz/recording.json
+new file mode 100644
+index 00000000..bf46d9c7
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/recording.json
+@@ -0,0 +1,104 @@
++{
++  "title": "MusicBrainz: recording",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "multi",
++      "batches": [
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "blockComment": "Open as /musicbrainz/recording?mbid=<recording MBID>",
++              "operation": "lookup",
++              "entity": "recording",
++              "inc": [
++                "artist-credits",
++                "isrcs",
++                "genres",
++                "work-rels"
++              ],
++              "valueGetters": {
++                "mbid": "context.queryParams.mbid"
++              }
++            },
++            {
++              "type": "template",
++              "template": "<h2>{{data.title}}</h2><p>{{#each data.[artist-credit]}}<a href=\"/musicbrainz/artist?mbid={{artist.id}}\">{{name}}</a>{{joinphrase}}{{/each}}</p>{{#if data.[first-release-date]}}<p>First released {{data.[first-release-date]}}</p>{{/if}}{{#if data.isrcs.length}}<p>ISRC: {{#each data.isrcs}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}{{#if data.relations.length}}<p>Works: {{#each data.relations}}{{#if work}}{{work.title}}{{#unless @last}}, {{/unless}}{{/if}}{{/each}}</p>{{/if}}{{#if data.genres.length}}<p>Genres: {{#each data.genres}}{{name}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"https://musicbrainz.org/recording/{{data.id}}\">View on MusicBrainz</a></p>"
++            }
++          ]
++        },
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "blockComment": "Browse: releases this recording appears on",
++              "operation": "browse",
++              "entity": "release",
++              "linkedEntity": "recording",
++              "limit": 100,
++              "resultsOnly": true,
++              "valueGetters": {
++                "linkedMbid": "context.queryParams.mbid"
++              }
++            },
++            {
++              "type": "mapping",
++              "mapping": "data[].{id: id, title: title, date: date, country: country, status: status}"
++            },
++            {
++              "type": "grid",
++              "gridOptions": {},
++              "columnDefs": [
++                {
++                  "headerName": "Appears on",
++                  "field": "title"
++                },
++                {
++                  "headerName": "Date",
++                  "field": "date",
++                  "sort": "asc"
++                },
++                {
++                  "headerName": "Country",
++                  "field": "country"
++                },
++                {
++                  "headerName": "Status",
++                  "field": "status"
++                },
++                {
++                  "headerName": "",
++                  "cellRenderer": "workflowRenderer",
++                  "cellRendererParams": {
++                    "blocks": [
++                      {
++                        "type": "link-action",
++                        "label": "Open",
++                        "adapterName": "musicbrainz",
++                        "workflowIdGetter": "join('', ['release?mbid=', data.id])"
++                      }
++                    ]
++                  }
++                }
++              ]
++            }
++          ]
++        }
++      ]
++    },
++    {
++      "type": "template",
++      "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/release.json b/src/assets/adapters/musicbrainz/release.json
+new file mode 100644
+index 00000000..72810c80
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/release.json
+@@ -0,0 +1,106 @@
++{
++  "title": "MusicBrainz: release",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "multi",
++      "batches": [
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "operation": "lookup",
++              "entity": "release",
++              "inc": [
++                "artist-credits",
++                "labels",
++                "recordings",
++                "release-groups"
++              ],
++              "valueGetters": {
++                "mbid": "context.queryParams.mbid"
++              },
++              "blockComment": "Open as /musicbrainz/release?mbid=<release MBID>"
++            },
++            {
++              "type": "template",
++              "template": "<h2>{{data.title}}</h2><p>{{#each data.[artist-credit]}}<a href=\"/musicbrainz/artist?mbid={{artist.id}}\">{{name}}</a>{{joinphrase}}{{/each}}</p><p>{{#if data.date}}{{data.date}}{{/if}}{{#if data.country}} &middot; {{data.country}}{{/if}}{{#if data.status}} &middot; {{data.status}}{{/if}}{{#if data.barcode}} &middot; barcode {{data.barcode}}{{/if}}</p>{{#if data.[label-info].length}}<p>{{#each data.[label-info]}}{{label.name}}{{#if [catalog-number]}} ({{[catalog-number]}}){{/if}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"/musicbrainz/releaseGroup?mbid={{data.[release-group].id}}\">Other editions of this release</a> &middot; <a href=\"https://musicbrainz.org/release/{{data.id}}\">View on MusicBrainz</a></p>"
++            }
++          ]
++        },
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "operation": "lookup",
++              "entity": "release",
++              "inc": [
++                "artist-credits",
++                "labels",
++                "recordings",
++                "release-groups"
++              ],
++              "valueGetters": {
++                "mbid": "context.queryParams.mbid"
++              },
++              "blockComment": "Same request as above: answered from the shared in-flight request, not sent twice"
++            },
++            {
++              "type": "mapping",
++              "mapping": "data.media[].tracks[].{id: recording.id, number: number, title: title, duration: length && join(':', [to_string(floor(product(length, `0.0000166666667`))), padStart(to_string(numDiff(floor(product(length, `0.001`)), product(floor(product(length, `0.0000166666667`)), `60`))), `2`, '0')]) || '', artist: join('', \"artist-credit\"[].[name, not_null(joinphrase, '')][])}"
++            },
++            {
++              "type": "grid",
++              "gridOptions": {},
++              "columnDefs": [
++                {
++                  "headerName": "#",
++                  "field": "number"
++                },
++                {
++                  "headerName": "Title",
++                  "field": "title"
++                },
++                {
++                  "headerName": "Artist",
++                  "field": "artist"
++                },
++                {
++                  "headerName": "Length",
++                  "field": "duration"
++                },
++                {
++                  "headerName": "",
++                  "cellRenderer": "workflowRenderer",
++                  "cellRendererParams": {
++                    "blocks": [
++                      {
++                        "type": "link-action",
++                        "label": "Recording",
++                        "adapterName": "musicbrainz",
++                        "workflowIdGetter": "join('', ['recording?mbid=', data.id])"
++                      }
++                    ]
++                  }
++                }
++              ]
++            }
++          ]
++        }
++      ]
++    },
++    {
++      "type": "template",
++      "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/releaseGroup.json b/src/assets/adapters/musicbrainz/releaseGroup.json
+new file mode 100644
+index 00000000..a914f293
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/releaseGroup.json
+@@ -0,0 +1,122 @@
++{
++  "title": "MusicBrainz: release group",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "multi",
++      "batches": [
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "blockComment": "Open as /musicbrainz/releaseGroup?mbid=<release group MBID>",
++              "operation": "lookup",
++              "entity": "release-group",
++              "inc": [
++                "artist-credits",
++                "genres"
++              ],
++              "valueGetters": {
++                "mbid": "context.queryParams.mbid"
++              }
++            },
++            {
++              "type": "template",
++              "template": "<h2>{{data.title}}</h2><p>{{#each data.[artist-credit]}}<a href=\"/musicbrainz/artist?mbid={{artist.id}}\">{{name}}</a>{{joinphrase}}{{/each}}</p><p>{{data.[primary-type]}}{{#each data.[secondary-types]}} + {{this}}{{/each}}{{#if data.[first-release-date]}} &middot; first released {{data.[first-release-date]}}{{/if}}</p>{{#if data.genres.length}}<p>Genres: {{#each data.genres}}{{name}}{{#unless @last}}, {{/unless}}{{/each}}</p>{{/if}}<p><a href=\"https://musicbrainz.org/release-group/{{data.id}}\">View on MusicBrainz</a></p>"
++            }
++          ]
++        },
++        {
++          "blocks": [
++            {
++              "type": "init"
++            },
++            {
++              "type": "musicbrainz",
++              "blockComment": "Browse: every release (edition) in this release group",
++              "operation": "browse",
++              "entity": "release",
++              "linkedEntity": "release-group",
++              "limit": 100,
++              "inc": [
++                "media",
++                "labels"
++              ],
++              "resultsOnly": true,
++              "valueGetters": {
++                "linkedMbid": "context.queryParams.mbid"
++              }
++            },
++            {
++              "type": "mapping",
++              "mapping": "data[].{id: id, title: title, date: date, country: country, status: status, format: join(', ', media[?format].format || `[]`), tracks: sum(media[].\"track-count\" || `[]`), label: join(', ', \"label-info\"[?label].label.name || `[]`), catalogNumber: join(', ', \"label-info\"[?\"catalog-number\"].\"catalog-number\" || `[]`), barcode: barcode}"
++            },
++            {
++              "type": "grid",
++              "gridOptions": {},
++              "columnDefs": [
++                {
++                  "headerName": "Release",
++                  "field": "title"
++                },
++                {
++                  "headerName": "Date",
++                  "field": "date",
++                  "sort": "asc"
++                },
++                {
++                  "headerName": "Country",
++                  "field": "country"
++                },
++                {
++                  "headerName": "Format",
++                  "field": "format"
++                },
++                {
++                  "headerName": "Tracks",
++                  "field": "tracks"
++                },
++                {
++                  "headerName": "Label",
++                  "field": "label"
++                },
++                {
++                  "headerName": "Catalog #",
++                  "field": "catalogNumber"
++                },
++                {
++                  "headerName": "Barcode",
++                  "field": "barcode"
++                },
++                {
++                  "headerName": "",
++                  "cellRenderer": "workflowRenderer",
++                  "cellRendererParams": {
++                    "blocks": [
++                      {
++                        "type": "link-action",
++                        "label": "Open",
++                        "adapterName": "musicbrainz",
++                        "workflowIdGetter": "join('', ['release?mbid=', data.id])"
++                      }
++                    ]
++                  }
++                }
++              ]
++            }
++          ]
++        }
++      ]
++    },
++    {
++      "type": "template",
++      "template": "<p class=\"musicbrainz-attribution\"><small>Data from <a href=\"https://musicbrainz.org\">MusicBrainz</a>, the open music encyclopedia (core data CC0, supplementary data CC BY-NC-SA 3.0).</small></p>"
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/searchArtists.json b/src/assets/adapters/musicbrainz/searchArtists.json
+new file mode 100644
+index 00000000..72a0ab54
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/searchArtists.json
+@@ -0,0 +1,93 @@
++{
++  "title": "MusicBrainz: search artists",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "form",
++      "label": "Search",
++      "jsonSchema": {
++        "type": "object",
++        "required": [
++          "artist"
++        ],
++        "properties": {
++          "artist": {
++            "type": "string",
++            "title": "Artist name"
++          },
++          "country": {
++            "type": "string",
++            "title": "Country code (optional, e.g. GB)"
++          },
++          "type": {
++            "type": "string",
++            "title": "Type (optional)",
++            "enum": [
++              "person",
++              "group",
++              "orchestra",
++              "choir",
++              "character",
++              "other"
++            ]
++          }
++        }
++      },
++      "uiSchema": {}
++    },
++    {
++      "type": "musicbrainz",
++      "blockComment": "Each form field is a MusicBrainz search field; empty fields are ignored.",
++      "operation": "search",
++      "entity": "artist",
++      "limit": 50,
++      "resultsOnly": true,
++      "valueGetters": {
++        "query": "data"
++      }
++    },
++    {
++      "type": "grid",
++      "gridOptions": {},
++      "columnDefs": [
++        {
++          "headerName": "Name",
++          "field": "name"
++        },
++        {
++          "headerName": "Type",
++          "field": "type"
++        },
++        {
++          "headerName": "Country",
++          "field": "country"
++        },
++        {
++          "headerName": "Disambiguation",
++          "field": "disambiguation"
++        },
++        {
++          "headerName": "Score",
++          "field": "score"
++        },
++        {
++          "headerName": "",
++          "cellRenderer": "workflowRenderer",
++          "cellRendererParams": {
++            "blocks": [
++              {
++                "type": "link-action",
++                "label": "Open",
++                "adapterName": "musicbrainz",
++                "workflowIdGetter": "join('', ['artist?mbid=', data.id])"
++              }
++            ]
++          }
++        }
++      ]
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/searchRecordings.json b/src/assets/adapters/musicbrainz/searchRecordings.json
+new file mode 100644
+index 00000000..238c5807
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/searchRecordings.json
+@@ -0,0 +1,89 @@
++{
++  "title": "MusicBrainz: search recordings",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "form",
++      "label": "Search",
++      "jsonSchema": {
++        "type": "object",
++        "properties": {
++          "recording": {
++            "type": "string",
++            "title": "Recording (track) title"
++          },
++          "artist": {
++            "type": "string",
++            "title": "Artist (optional)"
++          },
++          "isrc": {
++            "type": "string",
++            "title": "ISRC (optional)"
++          }
++        }
++      },
++      "uiSchema": {}
++    },
++    {
++      "type": "musicbrainz",
++      "operation": "search",
++      "entity": "recording",
++      "limit": 50,
++      "resultsOnly": true,
++      "valueGetters": {
++        "query": "data"
++      }
++    },
++    {
++      "type": "mapping",
++      "mapping": "data[].{id: id, title: title, artist: join('', \"artist-credit\"[].[name, not_null(joinphrase, '')][]), duration: length && join(':', [to_string(floor(product(length, `0.0000166666667`))), padStart(to_string(numDiff(floor(product(length, `0.001`)), product(floor(product(length, `0.0000166666667`)), `60`))), `2`, '0')]) || '', firstReleased: \"first-release-date\", disambiguation: disambiguation, score: score}"
++    },
++    {
++      "type": "grid",
++      "gridOptions": {},
++      "columnDefs": [
++        {
++          "headerName": "Title",
++          "field": "title"
++        },
++        {
++          "headerName": "Artist",
++          "field": "artist"
++        },
++        {
++          "headerName": "Length",
++          "field": "duration"
++        },
++        {
++          "headerName": "First released",
++          "field": "firstReleased"
++        },
++        {
++          "headerName": "Disambiguation",
++          "field": "disambiguation"
++        },
++        {
++          "headerName": "Score",
++          "field": "score"
++        },
++        {
++          "headerName": "",
++          "cellRenderer": "workflowRenderer",
++          "cellRendererParams": {
++            "blocks": [
++              {
++                "type": "link-action",
++                "label": "Open",
++                "adapterName": "musicbrainz",
++                "workflowIdGetter": "join('', ['recording?mbid=', data.id])"
++              }
++            ]
++          }
++        }
++      ]
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/searchReleases.json b/src/assets/adapters/musicbrainz/searchReleases.json
+new file mode 100644
+index 00000000..f37ba260
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/searchReleases.json
+@@ -0,0 +1,100 @@
++{
++  "title": "MusicBrainz: search releases",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "form",
++      "label": "Search",
++      "jsonSchema": {
++        "type": "object",
++        "required": [
++          "release"
++        ],
++        "properties": {
++          "release": {
++            "type": "string",
++            "title": "Release title"
++          },
++          "artist": {
++            "type": "string",
++            "title": "Artist (optional)"
++          },
++          "barcode": {
++            "type": "string",
++            "title": "Barcode (optional)"
++          },
++          "catno": {
++            "type": "string",
++            "title": "Catalog number (optional)"
++          }
++        }
++      },
++      "uiSchema": {}
++    },
++    {
++      "type": "musicbrainz",
++      "operation": "search",
++      "entity": "release",
++      "limit": 50,
++      "resultsOnly": true,
++      "valueGetters": {
++        "query": "data"
++      }
++    },
++    {
++      "type": "mapping",
++      "mapping": "data[].{id: id, title: title, artist: join('', \"artist-credit\"[].[name, not_null(joinphrase, '')][]), date: date, country: country, status: status, label: join(', ', \"label-info\"[?label].label.name || `[]`), score: score}"
++    },
++    {
++      "type": "grid",
++      "gridOptions": {},
++      "columnDefs": [
++        {
++          "headerName": "Title",
++          "field": "title"
++        },
++        {
++          "headerName": "Artist",
++          "field": "artist"
++        },
++        {
++          "headerName": "Date",
++          "field": "date"
++        },
++        {
++          "headerName": "Country",
++          "field": "country"
++        },
++        {
++          "headerName": "Label",
++          "field": "label"
++        },
++        {
++          "headerName": "Status",
++          "field": "status"
++        },
++        {
++          "headerName": "Score",
++          "field": "score"
++        },
++        {
++          "headerName": "",
++          "cellRenderer": "workflowRenderer",
++          "cellRendererParams": {
++            "blocks": [
++              {
++                "type": "link-action",
++                "label": "Open",
++                "adapterName": "musicbrainz",
++                "workflowIdGetter": "join('', ['release?mbid=', data.id])"
++              }
++            ]
++          }
++        }
++      ]
++    }
++  ]
++}
+diff --git a/src/assets/adapters/musicbrainz/submitRelease.json b/src/assets/adapters/musicbrainz/submitRelease.json
+new file mode 100644
+index 00000000..11ad79f8
+--- /dev/null
++++ b/src/assets/adapters/musicbrainz/submitRelease.json
+@@ -0,0 +1,125 @@
++{
++  "title": "MusicBrainz: submit a release",
++  "tags": [
++    "musicbrainz",
++    "music"
++  ],
++  "blocks": [
++    {
++      "type": "template",
++      "template": "<h2>Submit a release to MusicBrainz</h2><p>Fill in what you know about your release. The button below opens the MusicBrainz release editor with these details filled in, where you can review, complete and submit them. You need a <a href=\"https://musicbrainz.org/register\">MusicBrainz account</a>; if you are not logged in, MusicBrainz asks you to log in first. Please search MusicBrainz first to avoid adding a duplicate.</p>"
++    },
++    {
++      "type": "form",
++      "label": "Prepare submission",
++      "jsonSchema": {
++        "type": "object",
++        "required": [
++          "name",
++          "artist"
++        ],
++        "properties": {
++          "name": {
++            "type": "string",
++            "title": "Release title"
++          },
++          "artist": {
++            "type": "string",
++            "title": "Artist, as credited on the release"
++          },
++          "artistMbid": {
++            "type": "string",
++            "title": "Artist MBID (optional, if the artist is already in MusicBrainz)"
++          },
++          "type": {
++            "type": "string",
++            "title": "Type",
++            "enum": [
++              "album",
++              "single",
++              "ep",
++              "broadcast",
++              "other"
++            ],
++            "default": "album"
++          },
++          "status": {
++            "type": "string",
++            "title": "Status",
++            "enum": [
++              "official",
++              "promotion",
++              "bootleg",
++              "pseudo-release"
++            ],
++            "default": "official"
++          },
++          "date": {
++            "type": "string",
++            "title": "Release date (YYYY, YYYY-MM or YYYY-MM-DD)"
++          },
++          "country": {
++            "type": "string",
++            "title": "Country code (e.g. GB, or XW for worldwide)"
++          },
++          "label": {
++            "type": "string",
++            "title": "Label"
++          },
++          "catalogNumber": {
++            "type": "string",
++            "title": "Catalog number"
++          },
++          "barcode": {
++            "type": "string",
++            "title": "Barcode"
++          },
++          "format": {
++            "type": "string",
++            "title": "Format",
++            "enum": [
++              "Digital Media",
++              "CD",
++              "Vinyl",
++              "Cassette"
++            ],
++            "default": "Digital Media"
++          },
++          "tracks": {
++            "type": "array",
++            "title": "Tracks",
++            "items": {
++              "type": "object",
++              "properties": {
++                "name": {
++                  "type": "string",
++                  "title": "Title"
++                },
++                "length": {
++                  "type": "string",
++                  "title": "Length (m:ss)"
++                }
++              }
++            }
++          },
++          "url": {
++            "type": "string",
++            "title": "Link to the release (e.g. on your website or a store)"
++          }
++        }
++      },
++      "uiSchema": {}
++    },
++    {
++      "type": "mapping",
++      "blockComment": "Reshape the form into the release format the MusicBrainz block expects",
++      "mapping": "{name: data.name, type: data.type, status: data.status, barcode: data.barcode, artistCredit: [{name: data.artist, mbid: data.artistMbid}], events: [{date: data.date, country: data.country}], labels: [{name: data.label, catalogNumber: data.catalogNumber}], mediums: data.tracks && [{format: data.format, tracks: data.tracks}] || `[]`, urls: data.url && [data.url] || `[]`}"
++    },
++    {
++      "type": "musicbrainz",
++      "operation": "seed-release",
++      "label": "Open in MusicBrainz release editor",
++      "blockComment": "Use \"siteRoot\": \"https://test.musicbrainz.org\" to try this out on the MusicBrainz test server"
++    }
++  ]
++}
+-- 
+2.43.0
+

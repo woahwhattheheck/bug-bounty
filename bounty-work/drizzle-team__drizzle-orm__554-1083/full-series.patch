@@ -1,0 +1,1224 @@
+From fc55cb4db23a15f6c4e1ed11be15b9b9b1020dec Mon Sep 17 00:00:00 2001
+From: tokenjunkielabs <tokenjunkielabs@gmail.com>
+Date: Tue, 6 Oct 2026 00:14:49 -0400
+Subject: [PATCH 1/2] feat: add selectFromDb hook to custom types (all
+ dialects)
+
+Adds an optional selectFromDb mapper to customType params so a custom
+column can transform the SQL emitted when it is read from the database
+(SELECT field lists, RETURNING clauses, and relational query JSON
+payloads) while fromDriver/toDriver mapping stays unchanged.
+
+- Column gains an optional selectFromDb member; mapColumnSelection()
+  applies it to the column's reference SQL
+- All five dialects (pg, mysql, sqlite, singlestore, gel) wrap selected
+  custom columns and alias the expression back to the column name
+- Selections through a materialized subquery/CTE skip the hook so the
+  transform is not applied twice to already-transformed output
+- Nested relational JSON payloads wrap the column reference exactly once
+- SQLite keeps the NumericBigInt text cast inside the read expression
+- New tests cover plain/joined selects, returning clauses, subquery and
+  CTE reads, relational findMany and nested `with` payloads, and all
+  five dialect code paths
+
+Refs: drizzle-team/drizzle-orm#1083, drizzle-team/drizzle-orm#554
+---
+ drizzle-orm/src/column.ts                     |  19 ++
+ drizzle-orm/src/gel-core/columns/custom.ts    |  10 +
+ drizzle-orm/src/gel-core/dialect.ts           |  43 +++-
+ drizzle-orm/src/mysql-core/columns/custom.ts  |  15 ++
+ drizzle-orm/src/mysql-core/dialect.ts         |  43 +++-
+ drizzle-orm/src/pg-core/columns/custom.ts     |  15 ++
+ drizzle-orm/src/pg-core/dialect.ts            |  43 +++-
+ .../src/singlestore-core/columns/custom.ts    |  10 +
+ drizzle-orm/src/singlestore-core/dialect.ts   |  43 +++-
+ drizzle-orm/src/sqlite-core/columns/custom.ts |  10 +
+ drizzle-orm/src/sqlite-core/dialect.ts        |  59 +++--
+ drizzle-orm/tests/select-from-db.test.ts      | 222 ++++++++++++++++++
+ 12 files changed, 482 insertions(+), 50 deletions(-)
+ create mode 100644 drizzle-orm/tests/select-from-db.test.ts
+
+diff --git a/drizzle-orm/src/column.ts b/drizzle-orm/src/column.ts
+index 1396e3a6..875d321a 100644
+--- a/drizzle-orm/src/column.ts
++++ b/drizzle-orm/src/column.ts
+@@ -46,6 +46,23 @@ export type ColumnRuntimeConfig<TData, TRuntimeConfig extends object> = ColumnBu
+ 	TRuntimeConfig
+ >;
+ 
++/**
++ * Maps the SQL chunk produced for a column reference to the SQL that should be
++ * emitted when the column is read from the database (SELECT field lists,
++ * RETURNING clauses, and relational query JSON payloads).
++ */
++export type ColumnSelectMapper = (field: SQL) => SQL;
++
++/**
++ * Applies the column's `selectFromDb` mapper (when defined) to the SQL produced
++ * for the column reference. Returns the input SQL unchanged when the column has
++ * no mapper, so callers can distinguish a wrapped selection from a plain column
++ * reference and only emit an alias when the expression was transformed.
++ */
++export function mapColumnSelection(column: Column, columnSql: SQL): SQL {
++	return column.selectFromDb?.(columnSql) ?? columnSql;
++}
++
+ export interface Column<
+ 	T extends ColumnBaseConfig<ColumnDataType, string> = ColumnBaseConfig<ColumnDataType, string>,
+ 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+@@ -54,6 +71,7 @@ export interface Column<
+ 	TTypeConfig extends object = object,
+ > extends DriverValueMapper<T['data'], T['driverParam']>, SQLWrapper {
+ 	// SQLWrapper runtime implementation is defined in 'sql/sql.ts'
++	readonly selectFromDb?: ColumnSelectMapper | undefined;
+ }
+ /*
+ 	`Column` only accepts a full `ColumnConfig` as its generic.
+@@ -85,6 +103,7 @@ export abstract class Column<
+ 	readonly enumValues: T['enumValues'] = undefined;
+ 	readonly generated: GeneratedColumnConfig<T['data']> | undefined = undefined;
+ 	readonly generatedIdentity: GeneratedIdentityConfig | undefined = undefined;
++	readonly selectFromDb?: ColumnSelectMapper | undefined;
+ 
+ 	protected config: ColumnRuntimeConfig<T['data'], TRuntimeConfig>;
+ 
+diff --git a/drizzle-orm/src/gel-core/columns/custom.ts b/drizzle-orm/src/gel-core/columns/custom.ts
+index 08971c35..d61a565d 100644
+--- a/drizzle-orm/src/gel-core/columns/custom.ts
++++ b/drizzle-orm/src/gel-core/columns/custom.ts
+@@ -63,6 +63,7 @@ export class GelCustomColumn<T extends ColumnBaseConfig<'custom', 'GelCustomColu
+ 	private sqlName: string;
+ 	private mapTo?: (value: T['data']) => T['driverParam'];
+ 	private mapFrom?: (value: T['driverParam']) => T['data'];
++	override readonly selectFromDb?: (column: SQL) => SQL;
+ 
+ 	constructor(
+ 		table: AnyGelTable<{ name: T['tableName'] }>,
+@@ -72,6 +73,7 @@ export class GelCustomColumn<T extends ColumnBaseConfig<'custom', 'GelCustomColu
+ 		this.sqlName = config.customTypeParams.dataType(config.fieldConfig);
+ 		this.mapTo = config.customTypeParams.toDriver;
+ 		this.mapFrom = config.customTypeParams.fromDriver;
++		this.selectFromDb = config.customTypeParams.selectFromDb;
+ 	}
+ 
+ 	getSQLType(): string {
+@@ -195,6 +197,14 @@ export interface CustomTypeParams<T extends CustomTypeValues> {
+ 	 * ```
+ 	 */
+ 	fromDriver?: (value: T['driverData']) => T['data'];
++
++	/**
++	 * Optional function that transforms the SQL emitted when this column is read from the database.
++	 * Applied in `select` field lists, `returning` clauses and relational query payloads.
++	 * The transformed expression is aliased back to the column name, so `fromDriver` still
++	 * applies to the returned value.
++	 */
++	selectFromDb?: (column: SQL) => SQL;
+ }
+ 
+ /**
+diff --git a/drizzle-orm/src/gel-core/dialect.ts b/drizzle-orm/src/gel-core/dialect.ts
+index 6c154128..00f44000 100644
+--- a/drizzle-orm/src/gel-core/dialect.ts
++++ b/drizzle-orm/src/gel-core/dialect.ts
+@@ -1,6 +1,6 @@
+ import { aliasedTable, aliasedTableColumn, mapColumnsInAliasedSQLToAlias, mapColumnsInSQLToAlias } from '~/alias.ts';
+ import { CasingCache } from '~/casing.ts';
+-import { Column } from '~/column.ts';
++import { Column, mapColumnSelection } from '~/column.ts';
+ import { entityKind, is } from '~/entity.ts';
+ import { DrizzleError } from '~/errors.ts';
+ import { GelColumn, GelDecimal, GelJson, GelUUID } from '~/gel-core/columns/index.ts';
+@@ -201,7 +201,15 @@ export class GelDialect {
+ 	private buildSelection(
+ 		fields: SelectedFieldsOrdered,
+ 		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+-		{ isSingleTable = false }: { isSingleTable?: boolean } = {},
++		{ isSingleTable = false, materializedSources }: {
++			isSingleTable?: boolean;
++			/**
++			 * Aliases of sources (subqueries/CTEs) whose output columns are already materialized.
++			 * `selectFromDb` is not applied to columns referencing them — their values were
++			 * already transformed inside the subquery.
++			 */
++			materializedSources?: Set<string>;
++		} = {},
+ 	): SQL {
+ 		const columnsLen = fields.length;
+ 
+@@ -237,11 +245,14 @@ export class GelDialect {
+ 				} else if (is(field, Column)) {
+ 					// Gel throws an error when more than one similarly named columns exist within context instead of preferring the closest one
+ 					// thus forcing us to be explicit about column's source
+-					// if (isSingleTable) {
+-					// 	chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
+-					// } else {
+-					chunk.push(field);
+-					// }
++					const columnSql = field.getSQL();
++					const selectionSql = materializedSources?.has(field.table[Table.Symbol.Name])
++						? columnSql
++						: mapColumnSelection(field, columnSql);
++					chunk.push(selectionSql);
++					if (selectionSql !== columnSql) {
++						chunk.push(sql` as ${sql.identifier(this.casing.getColumnCasing(field))}`);
++					}
+ 				} else if (is(field, Subquery)) {
+ 					const entries = Object.entries(field._.selectedFields) as [string, SQL.Aliased | Column | SQL][];
+ 
+@@ -386,7 +397,21 @@ export class GelDialect {
+ 			distinctSql = distinct === true ? sql` distinct` : sql` distinct on (${sql.join(distinct.on, sql`, `)})`;
+ 		}
+ 
+-		const selection = this.buildSelection(fieldsList, { isSingleTable });
++		// Columns read through a subquery/CTE reference its materialized output —
++		// `selectFromDb` was already applied inside it and must not be re-applied here.
++		const materializedSources = new Set<string>();
++		if (is(table, Subquery)) {
++			materializedSources.add(table._.alias);
++		}
++		if (joins) {
++			for (const join of joins) {
++				if (is(join.table, Subquery)) {
++					materializedSources.add(join.table._.alias);
++				}
++			}
++		}
++
++		const selection = this.buildSelection(fieldsList, { isSingleTable, materializedSources });
+ 
+ 		const tableSql = this.buildFromTable(table);
+ 
+@@ -1351,6 +1376,8 @@ export class GelDialect {
+ 							? sql`${sql.identifier(`${tableAlias}_${tsKey}`)}.${sql.identifier('data')}`
+ 							: is(field, SQL.Aliased)
+ 							? field.sql
++							: is(field, Column)
++							? mapColumnSelection(field, field.getSQL())
+ 							: field
+ 					),
+ 					sql`, `,
+diff --git a/drizzle-orm/src/mysql-core/columns/custom.ts b/drizzle-orm/src/mysql-core/columns/custom.ts
+index 50585bec..801105ed 100644
+--- a/drizzle-orm/src/mysql-core/columns/custom.ts
++++ b/drizzle-orm/src/mysql-core/columns/custom.ts
+@@ -63,6 +63,7 @@ export class MySqlCustomColumn<T extends ColumnBaseConfig<'custom', 'MySqlCustom
+ 	private sqlName: string;
+ 	private mapTo?: (value: T['data']) => T['driverParam'];
+ 	private mapFrom?: (value: T['driverParam']) => T['data'];
++	override readonly selectFromDb?: (column: SQL) => SQL;
+ 
+ 	constructor(
+ 		table: AnyMySqlTable<{ name: T['tableName'] }>,
+@@ -72,6 +73,7 @@ export class MySqlCustomColumn<T extends ColumnBaseConfig<'custom', 'MySqlCustom
+ 		this.sqlName = config.customTypeParams.dataType(config.fieldConfig);
+ 		this.mapTo = config.customTypeParams.toDriver;
+ 		this.mapFrom = config.customTypeParams.fromDriver;
++		this.selectFromDb = config.customTypeParams.selectFromDb;
+ 	}
+ 
+ 	getSQLType(): string {
+@@ -195,6 +197,19 @@ export interface CustomTypeParams<T extends CustomTypeValues> {
+ 	 * ```
+ 	 */
+ 	fromDriver?: (value: T['driverData']) => T['data'];
++
++	/**
++	 * Optional function that transforms the SQL emitted when this column is read from the database.
++	 * Applied in `select` field lists, `returning` clauses and relational query payloads.
++	 * The transformed expression is aliased back to the column name, so `fromDriver` still
++	 * applies to the returned value.
++	 * @example
++	 * For example, a PostGIS geometry column can be converted to GeoJSON when reading:
++	 * ```
++	 * selectFromDb: (column) => sql`ST_AsGeoJSON(${column})`,
++	 * ```
++	 */
++	selectFromDb?: (column: SQL) => SQL;
+ }
+ 
+ /**
+diff --git a/drizzle-orm/src/mysql-core/dialect.ts b/drizzle-orm/src/mysql-core/dialect.ts
+index 41e1006a..70bac395 100644
+--- a/drizzle-orm/src/mysql-core/dialect.ts
++++ b/drizzle-orm/src/mysql-core/dialect.ts
+@@ -1,6 +1,6 @@
+ import { aliasedTable, aliasedTableColumn, mapColumnsInAliasedSQLToAlias, mapColumnsInSQLToAlias } from '~/alias.ts';
+ import { CasingCache } from '~/casing.ts';
+-import { Column } from '~/column.ts';
++import { Column, mapColumnSelection } from '~/column.ts';
+ import { entityKind, is } from '~/entity.ts';
+ import { DrizzleError } from '~/errors.ts';
+ import type { MigrationConfig, MigrationMeta } from '~/migrator.ts';
+@@ -214,7 +214,15 @@ export class MySqlDialect {
+ 	 */
+ 	private buildSelection(
+ 		fields: SelectedFieldsOrdered,
+-		{ isSingleTable = false }: { isSingleTable?: boolean } = {},
++		{ isSingleTable = false, materializedSources }: {
++			isSingleTable?: boolean;
++			/**
++			 * Aliases of sources (subqueries/CTEs) whose output columns are already materialized.
++			 * `selectFromDb` is not applied to columns referencing them — their values were
++			 * already transformed inside the subquery.
++			 */
++			materializedSources?: Set<string>;
++		} = {},
+ 	): SQL {
+ 		const columnsLen = fields.length;
+ 
+@@ -245,10 +253,15 @@ export class MySqlDialect {
+ 					chunk.push(sql` as ${sql.identifier(field.fieldAlias)}`);
+ 				}
+ 			} else if (is(field, Column)) {
+-				if (isSingleTable) {
+-					chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
+-				} else {
+-					chunk.push(field);
++				const columnSql = isSingleTable
++					? sql`${sql.identifier(this.casing.getColumnCasing(field))}`
++					: field.getSQL();
++				const selectionSql = materializedSources?.has(field.table[Table.Symbol.Name])
++					? columnSql
++					: mapColumnSelection(field, columnSql);
++				chunk.push(selectionSql);
++				if (selectionSql !== columnSql) {
++					chunk.push(sql` as ${sql.identifier(this.casing.getColumnCasing(field))}`);
+ 				}
+ 			} else if (is(field, Subquery)) {
+ 				const entries = Object.entries(field._.selectedFields) as [
+@@ -366,7 +379,21 @@ export class MySqlDialect {
+ 
+ 		const distinctSql = distinct ? sql` distinct` : undefined;
+ 
+-		const selection = this.buildSelection(fieldsList, { isSingleTable });
++		// Columns read through a subquery/CTE reference its materialized output —
++		// `selectFromDb` was already applied inside it and must not be re-applied here.
++		const materializedSources = new Set<string>();
++		if (is(table, Subquery)) {
++			materializedSources.add(table._.alias);
++		}
++		if (joins) {
++			for (const join of joins) {
++				if (is(join.table, Subquery)) {
++					materializedSources.add(join.table._.alias);
++				}
++			}
++		}
++
++		const selection = this.buildSelection(fieldsList, { isSingleTable, materializedSources });
+ 
+ 		const tableSql = (() => {
+ 			if (is(table, Table) && table[Table.Symbol.IsAlias]) {
+@@ -898,6 +925,8 @@ export class MySqlDialect {
+ 							? sql`${sql.identifier(`${tableAlias}_${tsKey}`)}.${sql.identifier('data')}`
+ 							: is(field, SQL.Aliased)
+ 							? field.sql
++							: is(field, Column)
++							? mapColumnSelection(field, field.getSQL())
+ 							: field
+ 					),
+ 					sql`, `,
+diff --git a/drizzle-orm/src/pg-core/columns/custom.ts b/drizzle-orm/src/pg-core/columns/custom.ts
+index f4f622ff..b1f52a12 100644
+--- a/drizzle-orm/src/pg-core/columns/custom.ts
++++ b/drizzle-orm/src/pg-core/columns/custom.ts
+@@ -63,6 +63,7 @@ export class PgCustomColumn<T extends ColumnBaseConfig<'custom', 'PgCustomColumn
+ 	private sqlName: string;
+ 	private mapTo?: (value: T['data']) => T['driverParam'];
+ 	private mapFrom?: (value: T['driverParam']) => T['data'];
++	override readonly selectFromDb?: (column: SQL) => SQL;
+ 
+ 	constructor(
+ 		table: AnyPgTable<{ name: T['tableName'] }>,
+@@ -72,6 +73,7 @@ export class PgCustomColumn<T extends ColumnBaseConfig<'custom', 'PgCustomColumn
+ 		this.sqlName = config.customTypeParams.dataType(config.fieldConfig);
+ 		this.mapTo = config.customTypeParams.toDriver;
+ 		this.mapFrom = config.customTypeParams.fromDriver;
++		this.selectFromDb = config.customTypeParams.selectFromDb;
+ 	}
+ 
+ 	getSQLType(): string {
+@@ -195,6 +197,19 @@ export interface CustomTypeParams<T extends CustomTypeValues> {
+ 	 * ```
+ 	 */
+ 	fromDriver?: (value: T['driverData']) => T['data'];
++
++	/**
++	 * Optional function that transforms the SQL emitted when this column is read from the database.
++	 * Applied in `select` field lists, `returning` clauses and relational query payloads.
++	 * The transformed expression is aliased back to the column name, so `fromDriver` still
++	 * applies to the returned value.
++	 * @example
++	 * For example, a PostGIS geometry column can be converted to GeoJSON when reading:
++	 * ```
++	 * selectFromDb: (column) => sql`ST_AsGeoJSON(${column})`,
++	 * ```
++	 */
++	selectFromDb?: (column: SQL) => SQL;
+ }
+ 
+ /**
+diff --git a/drizzle-orm/src/pg-core/dialect.ts b/drizzle-orm/src/pg-core/dialect.ts
+index bd9d6a5c..120b4736 100644
+--- a/drizzle-orm/src/pg-core/dialect.ts
++++ b/drizzle-orm/src/pg-core/dialect.ts
+@@ -1,6 +1,6 @@
+ import { aliasedTable, aliasedTableColumn, mapColumnsInAliasedSQLToAlias, mapColumnsInSQLToAlias } from '~/alias.ts';
+ import { CasingCache } from '~/casing.ts';
+-import { Column } from '~/column.ts';
++import { Column, mapColumnSelection } from '~/column.ts';
+ import { entityKind, is } from '~/entity.ts';
+ import { DrizzleError } from '~/errors.ts';
+ import type { MigrationConfig, MigrationMeta } from '~/migrator.ts';
+@@ -210,7 +210,15 @@ export class PgDialect {
+ 	 */
+ 	private buildSelection(
+ 		fields: SelectedFieldsOrdered,
+-		{ isSingleTable = false }: { isSingleTable?: boolean } = {},
++		{ isSingleTable = false, materializedSources }: {
++			isSingleTable?: boolean;
++			/**
++			 * Aliases of sources (subqueries/CTEs) whose output columns are already materialized.
++			 * `selectFromDb` is not applied to columns referencing them — their values were
++			 * already transformed inside the subquery.
++			 */
++			materializedSources?: Set<string>;
++		} = {},
+ 	): SQL {
+ 		const columnsLen = fields.length;
+ 
+@@ -242,10 +250,15 @@ export class PgDialect {
+ 						chunk.push(sql` as ${sql.identifier(field.fieldAlias)}`);
+ 					}
+ 				} else if (is(field, Column)) {
+-					if (isSingleTable) {
+-						chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
+-					} else {
+-						chunk.push(field);
++					const columnSql = isSingleTable
++						? sql`${sql.identifier(this.casing.getColumnCasing(field))}`
++						: field.getSQL();
++					const selectionSql = materializedSources?.has(field.table[Table.Symbol.Name])
++						? columnSql
++						: mapColumnSelection(field, columnSql);
++					chunk.push(selectionSql);
++					if (selectionSql !== columnSql) {
++						chunk.push(sql` as ${sql.identifier(this.casing.getColumnCasing(field))}`);
+ 					}
+ 				} else if (is(field, Subquery)) {
+ 					const entries = Object.entries(field._.selectedFields) as [string, SQL.Aliased | Column | SQL][];
+@@ -391,7 +404,21 @@ export class PgDialect {
+ 			distinctSql = distinct === true ? sql` distinct` : sql` distinct on (${sql.join(distinct.on, sql`, `)})`;
+ 		}
+ 
+-		const selection = this.buildSelection(fieldsList, { isSingleTable });
++		// Columns read through a subquery/CTE reference its materialized output —
++		// `selectFromDb` was already applied inside it and must not be re-applied here.
++		const materializedSources = new Set<string>();
++		if (is(table, Subquery)) {
++			materializedSources.add(table._.alias);
++		}
++		if (joins) {
++			for (const join of joins) {
++				if (is(join.table, Subquery)) {
++					materializedSources.add(join.table._.alias);
++				}
++			}
++		}
++
++		const selection = this.buildSelection(fieldsList, { isSingleTable, materializedSources });
+ 
+ 		const tableSql = this.buildFromTable(table);
+ 
+@@ -1360,6 +1387,8 @@ export class PgDialect {
+ 							? sql`${sql.identifier(`${tableAlias}_${tsKey}`)}.${sql.identifier('data')}`
+ 							: is(field, SQL.Aliased)
+ 							? field.sql
++							: is(field, Column)
++							? mapColumnSelection(field, field.getSQL())
+ 							: field
+ 					),
+ 					sql`, `,
+diff --git a/drizzle-orm/src/singlestore-core/columns/custom.ts b/drizzle-orm/src/singlestore-core/columns/custom.ts
+index 964e077d..ace15ed4 100644
+--- a/drizzle-orm/src/singlestore-core/columns/custom.ts
++++ b/drizzle-orm/src/singlestore-core/columns/custom.ts
+@@ -66,6 +66,7 @@ export class SingleStoreCustomColumn<T extends ColumnBaseConfig<'custom', 'Singl
+ 	private sqlName: string;
+ 	private mapTo?: (value: T['data']) => T['driverParam'];
+ 	private mapFrom?: (value: T['driverParam']) => T['data'];
++	override readonly selectFromDb?: (column: SQL) => SQL;
+ 
+ 	constructor(
+ 		table: AnySingleStoreTable<{ name: T['tableName'] }>,
+@@ -75,6 +76,7 @@ export class SingleStoreCustomColumn<T extends ColumnBaseConfig<'custom', 'Singl
+ 		this.sqlName = config.customTypeParams.dataType(config.fieldConfig);
+ 		this.mapTo = config.customTypeParams.toDriver;
+ 		this.mapFrom = config.customTypeParams.fromDriver;
++		this.selectFromDb = config.customTypeParams.selectFromDb;
+ 	}
+ 
+ 	getSQLType(): string {
+@@ -198,6 +200,14 @@ export interface CustomTypeParams<T extends CustomTypeValues> {
+ 	 * ```
+ 	 */
+ 	fromDriver?: (value: T['driverData']) => T['data'];
++
++	/**
++	 * Optional function that transforms the SQL emitted when this column is read from the database.
++	 * Applied in `select` field lists, `returning` clauses and relational query payloads.
++	 * The transformed expression is aliased back to the column name, so `fromDriver` still
++	 * applies to the returned value.
++	 */
++	selectFromDb?: (column: SQL) => SQL;
+ }
+ 
+ /**
+diff --git a/drizzle-orm/src/singlestore-core/dialect.ts b/drizzle-orm/src/singlestore-core/dialect.ts
+index 88fe959a..4e87e614 100644
+--- a/drizzle-orm/src/singlestore-core/dialect.ts
++++ b/drizzle-orm/src/singlestore-core/dialect.ts
+@@ -1,6 +1,6 @@
+ import { aliasedTable, aliasedTableColumn, mapColumnsInAliasedSQLToAlias, mapColumnsInSQLToAlias } from '~/alias.ts';
+ import { CasingCache } from '~/casing.ts';
+-import { Column } from '~/column.ts';
++import { Column, mapColumnSelection } from '~/column.ts';
+ import { entityKind, is } from '~/entity.ts';
+ import { DrizzleError } from '~/errors.ts';
+ import type { MigrationConfig, MigrationMeta } from '~/migrator.ts';
+@@ -213,7 +213,15 @@ export class SingleStoreDialect {
+ 	 */
+ 	private buildSelection(
+ 		fields: SelectedFieldsOrdered,
+-		{ isSingleTable = false }: { isSingleTable?: boolean } = {},
++		{ isSingleTable = false, materializedSources }: {
++			isSingleTable?: boolean;
++			/**
++			 * Aliases of sources (subqueries/CTEs) whose output columns are already materialized.
++			 * `selectFromDb` is not applied to columns referencing them — their values were
++			 * already transformed inside the subquery.
++			 */
++			materializedSources?: Set<string>;
++		} = {},
+ 	): SQL {
+ 		const columnsLen = fields.length;
+ 
+@@ -244,10 +252,15 @@ export class SingleStoreDialect {
+ 					chunk.push(sql` as ${sql.identifier(field.fieldAlias)}`);
+ 				}
+ 			} else if (is(field, Column)) {
+-				if (isSingleTable) {
+-					chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
+-				} else {
+-					chunk.push(field);
++				const columnSql = isSingleTable
++					? sql`${sql.identifier(this.casing.getColumnCasing(field))}`
++					: field.getSQL();
++				const selectionSql = materializedSources?.has(field.table[Table.Symbol.Name])
++					? columnSql
++					: mapColumnSelection(field, columnSql);
++				chunk.push(selectionSql);
++				if (selectionSql !== columnSql) {
++					chunk.push(sql` as ${sql.identifier(this.casing.getColumnCasing(field))}`);
+ 				}
+ 			} else if (is(field, Subquery)) {
+ 				const entries = Object.entries(field._.selectedFields) as [
+@@ -350,7 +363,21 @@ export class SingleStoreDialect {
+ 
+ 		const distinctSql = distinct ? sql` distinct` : undefined;
+ 
+-		const selection = this.buildSelection(fieldsList, { isSingleTable });
++		// Columns read through a subquery/CTE reference its materialized output —
++		// `selectFromDb` was already applied inside it and must not be re-applied here.
++		const materializedSources = new Set<string>();
++		if (is(table, Subquery)) {
++			materializedSources.add(table._.alias);
++		}
++		if (joins) {
++			for (const join of joins) {
++				if (is(join.table, Subquery)) {
++					materializedSources.add(join.table._.alias);
++				}
++			}
++		}
++
++		const selection = this.buildSelection(fieldsList, { isSingleTable, materializedSources });
+ 
+ 		const tableSql = (() => {
+ 			if (is(table, Table) && table[Table.Symbol.IsAlias]) {
+@@ -848,6 +875,8 @@ export class SingleStoreDialect {
+ 							? sql`${sql.identifier(`${tableAlias}_${tsKey}`)}.${sql.identifier('data')}`
+ 							: is(field, SQL.Aliased)
+ 							? field.sql
++							: is(field, Column)
++							? mapColumnSelection(field, field.getSQL())
+ 							: field
+ 					),
+ 					sql`, `,
+diff --git a/drizzle-orm/src/sqlite-core/columns/custom.ts b/drizzle-orm/src/sqlite-core/columns/custom.ts
+index b23d6442..020deda0 100644
+--- a/drizzle-orm/src/sqlite-core/columns/custom.ts
++++ b/drizzle-orm/src/sqlite-core/columns/custom.ts
+@@ -63,6 +63,7 @@ export class SQLiteCustomColumn<T extends ColumnBaseConfig<'custom', 'SQLiteCust
+ 	private sqlName: string;
+ 	private mapTo?: (value: T['data']) => T['driverParam'];
+ 	private mapFrom?: (value: T['driverParam']) => T['data'];
++	override readonly selectFromDb?: (column: SQL) => SQL;
+ 
+ 	constructor(
+ 		table: AnySQLiteTable<{ name: T['tableName'] }>,
+@@ -72,6 +73,7 @@ export class SQLiteCustomColumn<T extends ColumnBaseConfig<'custom', 'SQLiteCust
+ 		this.sqlName = config.customTypeParams.dataType(config.fieldConfig);
+ 		this.mapTo = config.customTypeParams.toDriver;
+ 		this.mapFrom = config.customTypeParams.fromDriver;
++		this.selectFromDb = config.customTypeParams.selectFromDb;
+ 	}
+ 
+ 	getSQLType(): string {
+@@ -195,6 +197,14 @@ export interface CustomTypeParams<T extends CustomTypeValues> {
+ 	 * ```
+ 	 */
+ 	fromDriver?: (value: T['driverData']) => T['data'];
++
++	/**
++	 * Optional function that transforms the SQL emitted when this column is read from the database.
++	 * Applied in `select` field lists, `returning` clauses and relational query payloads.
++	 * The transformed expression is aliased back to the column name, so `fromDriver` still
++	 * applies to the returned value.
++	 */
++	selectFromDb?: (column: SQL) => SQL;
+ }
+ 
+ /**
+diff --git a/drizzle-orm/src/sqlite-core/dialect.ts b/drizzle-orm/src/sqlite-core/dialect.ts
+index 1ed20858..ae5c0152 100644
+--- a/drizzle-orm/src/sqlite-core/dialect.ts
++++ b/drizzle-orm/src/sqlite-core/dialect.ts
+@@ -1,7 +1,7 @@
+ import { aliasedTable, aliasedTableColumn, mapColumnsInAliasedSQLToAlias, mapColumnsInSQLToAlias } from '~/alias.ts';
+ import { CasingCache } from '~/casing.ts';
+ import type { AnyColumn } from '~/column.ts';
+-import { Column } from '~/column.ts';
++import { Column, mapColumnSelection } from '~/column.ts';
+ import { entityKind, is } from '~/entity.ts';
+ import { DrizzleError } from '~/errors.ts';
+ import type { MigrationConfig, MigrationMeta } from '~/migrator.ts';
+@@ -177,7 +177,15 @@ export abstract class SQLiteDialect {
+ 	 */
+ 	private buildSelection(
+ 		fields: SelectedFieldsOrdered,
+-		{ isSingleTable = false }: { isSingleTable?: boolean } = {},
++		{ isSingleTable = false, materializedSources }: {
++			isSingleTable?: boolean;
++			/**
++			 * Aliases of sources (subqueries/CTEs) whose output columns are already materialized.
++			 * `selectFromDb` is not applied to columns referencing them — their values were
++			 * already transformed inside the subquery.
++			 */
++			materializedSources?: Set<string>;
++		} = {},
+ 	): SQL {
+ 		const columnsLen = fields.length;
+ 
+@@ -209,24 +217,19 @@ export abstract class SQLiteDialect {
+ 				}
+ 			} else if (is(field, Column)) {
+ 				const tableName = field.table[Table.Symbol.Name];
+-				if (field.columnType === 'SQLiteNumericBigInt') {
+-					if (isSingleTable) {
+-						chunk.push(
+-							sql`cast(${sql.identifier(this.casing.getColumnCasing(field))} as text)`,
+-						);
+-					} else {
+-						chunk.push(
+-							sql`cast(${sql.identifier(tableName)}.${sql.identifier(this.casing.getColumnCasing(field))} as text)`,
+-						);
+-					}
++				const columnSql = isSingleTable
++					? sql`${sql.identifier(this.casing.getColumnCasing(field))}`
++					: sql`${sql.identifier(tableName)}.${sql.identifier(this.casing.getColumnCasing(field))}`;
++				// NumericBigInt values are always read through a text cast — keep the cast as
++				// part of the column read so `selectFromDb` wraps the materialized value.
++				const readSql = field.columnType === 'SQLiteNumericBigInt'
++					? sql`cast(${columnSql} as text)`
++					: columnSql;
++				const selectionSql = materializedSources?.has(tableName) ? readSql : mapColumnSelection(field, readSql);
++				if (selectionSql !== readSql) {
++					chunk.push(sql`${selectionSql} as ${sql.identifier(this.casing.getColumnCasing(field))}`);
+ 				} else {
+-					if (isSingleTable) {
+-						chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
+-					} else {
+-						chunk.push(
+-							sql`${sql.identifier(tableName)}.${sql.identifier(this.casing.getColumnCasing(field))}`,
+-						);
+-					}
++					chunk.push(readSql);
+ 				}
+ 			} else if (is(field, Subquery)) {
+ 				const entries = Object.entries(field._.selectedFields) as [
+@@ -394,7 +397,21 @@ export abstract class SQLiteDialect {
+ 
+ 		const distinctSql = distinct ? sql` distinct` : undefined;
+ 
+-		const selection = this.buildSelection(fieldsList, { isSingleTable });
++		// Columns read through a subquery/CTE reference its materialized output —
++		// `selectFromDb` was already applied inside it and must not be re-applied here.
++		const materializedSources = new Set<string>();
++		if (is(table, Subquery)) {
++			materializedSources.add(table._.alias);
++		}
++		if (joins) {
++			for (const join of joins) {
++				if (is(join.table, Subquery)) {
++					materializedSources.add(join.table._.alias);
++				}
++			}
++		}
++
++		const selection = this.buildSelection(fieldsList, { isSingleTable, materializedSources });
+ 
+ 		const tableSql = this.buildFromTable(table);
+ 
+@@ -839,7 +856,7 @@ export abstract class SQLiteDialect {
+ 				sql.join(
+ 					selection.map(({ field }) =>
+ 						is(field, SQLiteColumn)
+-							? sql.identifier(this.casing.getColumnCasing(field))
++							? mapColumnSelection(field, sql`${sql.identifier(this.casing.getColumnCasing(field))}`)
+ 							: is(field, SQL.Aliased)
+ 							? field.sql
+ 							: field
+diff --git a/drizzle-orm/tests/select-from-db.test.ts b/drizzle-orm/tests/select-from-db.test.ts
+new file mode 100644
+index 00000000..3493dcde
+--- /dev/null
++++ b/drizzle-orm/tests/select-from-db.test.ts
+@@ -0,0 +1,222 @@
++import { expect, test } from 'vitest';
++import { GelDialect } from '~/gel-core/dialect.ts';
++import { customType as gelCustomType, gelTable, integer as gelInteger, text as gelText } from '~/gel-core/index.ts';
++import {
++	customType as mysqlCustomType,
++	int as mysqlInt,
++	mysqlTable,
++	serial as mysqlSerial,
++	varchar,
++} from '~/mysql-core/index.ts';
++import { drizzle as mysqlDrizzle } from '~/mysql-proxy/driver.ts';
++import { PgDialect } from '~/pg-core/index.ts';
++import { customType, integer, pgTable, serial, text } from '~/pg-core/index.ts';
++import { drizzle as pgDrizzle } from '~/pg-proxy/driver.ts';
++import { relations } from '~/relations.ts';
++import {
++	customType as ssCustomType,
++	serial as ssSerial,
++	singlestoreTable,
++	varchar as ssVarchar,
++} from '~/singlestore-core/index.ts';
++import { drizzle as singlestoreDrizzle } from '~/singlestore-proxy/driver.ts';
++import { sql } from '~/sql/sql.ts';
++import {
++	customType as sqliteCustomType,
++	integer as sqliteInteger,
++	sqliteTable,
++	text as sqliteText,
++} from '~/sqlite-core/index.ts';
++import { drizzle as sqliteDrizzle } from '~/sqlite-proxy/driver.ts';
++import { getTableColumns, orderSelectedFields } from '~/utils.ts';
++
++const customPoint = customType<{ data: { x: number; y: number }; driverData: string }>({
++	dataType: () => 'point',
++	selectFromDb: (column) => sql`ST_AsText(${column})`,
++	fromDriver: (value) => {
++		const [x, y] = value.slice(6, -1).split(' ').map(Number);
++		return { x: x!, y: y! };
++	},
++});
++
++const users = pgTable('users', {
++	id: serial('id').primaryKey(),
++	name: text('name'),
++});
++
++const places = pgTable('places', {
++	id: serial('id').primaryKey(),
++	name: text('name'),
++	ownerId: integer('owner_id').references(() => users.id),
++	geo: customPoint('geo'),
++});
++
++const placesRelations = relations(places, ({ one }) => ({
++	owner: one(users, { fields: [places.ownerId], references: [users.id] }),
++}));
++
++const usersRelations = relations(users, ({ many }) => ({
++	places: many(places),
++}));
++
++const remoteCallback = async () => ({ rows: [] }) as any;
++const db = pgDrizzle(remoteCallback, { schema: { users, places, placesRelations, usersRelations } });
++const dialect = new PgDialect();
++
++function toSQL(q: { getSQL(): ReturnType<typeof sql> }) {
++	return dialect.sqlToQuery(q.getSQL() as any).sql;
++}
++
++test('selectFromDb wraps the custom column in a plain select', () => {
++	const query = db.select().from(places);
++
++	expect(toSQL(query)).toBe('select "id", "name", "owner_id", ST_AsText("geo") as "geo" from "places"');
++});
++
++test('selectFromDb only affects the custom column in an explicit field list', () => {
++	const query = db.select({ name: places.name, geo: places.geo }).from(places);
++
++	expect(toSQL(query)).toBe('select "name", ST_AsText("geo") as "geo" from "places"');
++});
++
++test('selectFromDb qualifies the wrapped column when joining', () => {
++	const query = db.select().from(places).leftJoin(users, sql`true`);
++
++	expect(toSQL(query)).toBe(
++		'select "places"."id", "places"."name", "places"."owner_id", ST_AsText("places"."geo") as "geo", "users"."id", "users"."name" from "places" left join "users" on true',
++	);
++});
++
++test('selectFromDb applies in insert/update/delete returning clauses', () => {
++	expect(toSQL(db.insert(places).values({ name: 'a' }).returning())).toBe(
++		'insert into "places" ("id", "name", "owner_id", "geo") values (default, $1, default, default) returning "id", "name", "owner_id", ST_AsText("geo") as "geo"',
++	);
++	expect(toSQL(db.update(places).set({ name: 'a' }).returning())).toBe(
++		'update "places" set "name" = $1 returning "id", "name", "owner_id", ST_AsText("geo") as "geo"',
++	);
++	expect(toSQL(db.delete(places).returning())).toBe(
++		'delete from "places" returning "id", "name", "owner_id", ST_AsText("geo") as "geo"',
++	);
++});
++
++test('selectFromDb is not re-applied to subquery output columns', () => {
++	const sq = db.select().from(places).as('sq');
++
++	expect(toSQL(db.select().from(sq))).toBe(
++		'select "id", "name", "owner_id", "geo" from (select "id", "name", "owner_id", ST_AsText("geo") as "geo" from "places") "sq"',
++	);
++});
++
++test('selectFromDb is not re-applied to CTE output columns', () => {
++	const sq = db.$with('sq').as(db.select().from(places));
++
++	expect(toSQL(db.with(sq).select().from(sq))).toBe(
++		'with "sq" as (select "id", "name", "owner_id", ST_AsText("geo") as "geo" from "places") select "id", "name", "owner_id", "geo" from "sq"',
++	);
++});
++
++test('selectFromDb applies in relational query selections', () => {
++	const sqlText = db.query.places.findMany().toSQL().sql;
++
++	expect(sqlText).toContain('ST_AsText("geo") as "geo"');
++	expect(sqlText).toContain('"id"');
++	expect(sqlText).not.toContain('ST_AsText("id")');
++});
++
++test('selectFromDb applies inside nested relational JSON payloads', () => {
++	const sqlText = db.query.users.findMany({ with: { places: true } }).toSQL().sql;
++
++	expect(sqlText).toContain('json_build_array(');
++	expect(sqlText).toContain('ST_AsText("users_places"."geo")');
++	expect(sqlText).not.toContain('ST_AsText("users_places"."id")');
++});
++
++test('custom types without selectFromDb are selected unchanged', () => {
++	const plain = customType<{ data: string; driverData: string }>({
++		dataType: () => 'point',
++	});
++	const t = pgTable('plain_t', { id: serial('id'), v: plain('v') });
++
++	expect(toSQL(db.select().from(t))).toBe('select "id", "v" from "plain_t"');
++});
++
++test('fromDriver still decodes values for selectFromDb columns', () => {
++	expect(places.geo.mapFromDriverValue('POINT(1 2)')).toEqual({ x: 1, y: 2 });
++});
++
++test('selectFromDb applies in mysql select field lists', () => {
++	const mysqlPoint = mysqlCustomType<{ data: string; driverData: string }>({
++		dataType: () => 'point',
++		selectFromDb: (column) => sql`ST_AsText(${column})`,
++	});
++	const mysqlPlaces = mysqlTable('places', {
++		id: mysqlSerial('id').primaryKey(),
++		name: varchar('name', { length: 32 }),
++		ownerId: mysqlInt('owner_id'),
++		geo: mysqlPoint('geo'),
++	});
++	const mdb = mysqlDrizzle(remoteCallback);
++
++	expect(mdb.select().from(mysqlPlaces).toSQL().sql).toBe(
++		'select `id`, `name`, `owner_id`, ST_AsText(`geo`) as `geo` from `places`',
++	);
++});
++
++test('selectFromDb applies in sqlite select field lists', () => {
++	const sqlitePoint = sqliteCustomType<{ data: string; driverData: string }>({
++		dataType: () => 'text',
++		selectFromDb: (column) => sql`json_extract(${column}, \'$.x\')`,
++	});
++	const sqlitePlaces = sqliteTable('places', {
++		id: sqliteInteger('id').primaryKey(),
++		name: sqliteText('name'),
++		geo: sqlitePoint('geo'),
++	});
++	const sdb = sqliteDrizzle(remoteCallback);
++
++	expect(sdb.select().from(sqlitePlaces).toSQL().sql).toBe(
++		`select "id", "name", json_extract("geo", '$.x') as "geo" from "places"`,
++	);
++});
++
++test('selectFromDb applies in singlestore select field lists', () => {
++	const ssPoint = ssCustomType<{ data: string; driverData: string }>({
++		dataType: () => 'point',
++		selectFromDb: (column) => sql`ST_AsText(${column})`,
++	});
++	const ssPlaces = singlestoreTable('places', {
++		id: ssSerial('id').primaryKey(),
++		name: ssVarchar('name', { length: 32 }),
++		geo: ssPoint('geo'),
++	});
++	const ssdb = singlestoreDrizzle(remoteCallback);
++
++	expect(ssdb.select().from(ssPlaces).toSQL().sql).toBe(
++		'select `id`, `name`, ST_AsText(`geo`) as `geo` from `places`',
++	);
++});
++
++test('selectFromDb applies in gel select field lists', () => {
++	const gelPoint = gelCustomType<{ data: string; driverData: string }>({
++		dataType: () => 'point',
++		selectFromDb: (column) => sql`to_json(${column})`,
++	});
++	const gelPlaces = gelTable('places', {
++		id: gelInteger('id'),
++		name: gelText('name'),
++		geo: gelPoint('geo'),
++	});
++	const gelDialect = new GelDialect();
++
++	const query = gelDialect.buildSelectQuery({
++		table: gelPlaces,
++		fields: {},
++		fieldsFlat: orderSelectedFields(getTableColumns(gelPlaces)),
++		setOperators: [],
++	});
++
++	// Gel always qualifies column references with the source table
++	expect(gelDialect.sqlToQuery(query).sql).toBe(
++		'select "places"."id", "places"."name", to_json("places"."geo") as "geo" from "places"',
++	);
++});
+-- 
+2.43.0
+
+
+From ee3c5d2cb778ec875afeae7f2070fcf5a58f6a81 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:52:44 +0000
+Subject: [PATCH 2/2] fix: don't re-apply selectFromDb to query-built views;
+ map planetscale relational JSON (#1083, #554)
+
+Follow-up to the selectFromDb hook for custom types:
+
+- Columns of views defined with a query builder (`pgView(...).as(qb => ...)`,
+  materialized views, mysql and sqlite views) are the output of a query that
+  already applied the column's `selectFromDb` mapper. Selecting from such a
+  view wrapped the value a second time (e.g. ST_AsText(ST_AsText(geo))).
+  The view selection proxy now marks those columns as selection fields, so
+  their mapper is not applied again. Views declared with raw SQL and explicit
+  columns still apply the mapper, since they return the raw database value.
+- MySQL relational queries in PlanetScale mode (built without lateral joins)
+  now apply `selectFromDb` inside nested `json_array(...)` payloads, like the
+  default mode already does.
+- Regression tests for both cases.
+---
+ drizzle-orm/src/alias.ts                 |  8 ++-
+ drizzle-orm/src/gel-core/view.ts         |  2 +
+ drizzle-orm/src/mysql-core/dialect.ts    |  2 +-
+ drizzle-orm/src/mysql-core/view.ts       |  1 +
+ drizzle-orm/src/pg-core/view.ts          |  2 +
+ drizzle-orm/src/selection-proxy.ts       | 11 +++
+ drizzle-orm/src/singlestore-core/view.ts |  1 +
+ drizzle-orm/src/sqlite-core/view.ts      |  1 +
+ drizzle-orm/tests/select-from-db.test.ts | 92 +++++++++++++++++++++++-
+ 9 files changed, 116 insertions(+), 4 deletions(-)
+
+diff --git a/drizzle-orm/src/alias.ts b/drizzle-orm/src/alias.ts
+index 21e802a1..68189e88 100644
+--- a/drizzle-orm/src/alias.ts
++++ b/drizzle-orm/src/alias.ts
+@@ -10,13 +10,19 @@ import { ViewBaseConfig } from './view-common.ts';
+ export class ColumnAliasProxyHandler<TColumn extends Column> implements ProxyHandler<TColumn> {
+ 	static readonly [entityKind]: string = 'ColumnAliasProxyHandler';
+ 
+-	constructor(private table: Table | View) {}
++	constructor(private table: Table | View, private isSelectionField = false) {}
+ 
+ 	get(columnObj: TColumn, prop: string | symbol): any {
+ 		if (prop === 'table') {
+ 			return this.table;
+ 		}
+ 
++		// A column projected by a query-built view already holds the value produced by its
++		// `selectFromDb` mapper, so the mapper must not be applied to it a second time
++		if (prop === 'selectFromDb' && this.isSelectionField) {
++			return undefined;
++		}
++
+ 		return columnObj[prop as keyof TColumn];
+ 	}
+ }
+diff --git a/drizzle-orm/src/gel-core/view.ts b/drizzle-orm/src/gel-core/view.ts
+index 1d037386..f7c272b9 100644
+--- a/drizzle-orm/src/gel-core/view.ts
++++ b/drizzle-orm/src/gel-core/view.ts
+@@ -55,6 +55,7 @@ export class ViewBuilder<TName extends string = string> extends DefaultViewBuild
+ 			sqlBehavior: 'error',
+ 			sqlAliasedBehavior: 'alias',
+ 			replaceOriginalName: true,
++			isSelectionField: true,
+ 		});
+ 		const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+ 		return new Proxy(
+@@ -208,6 +209,7 @@ export class MaterializedViewBuilder<TName extends string = string>
+ 			sqlBehavior: 'error',
+ 			sqlAliasedBehavior: 'alias',
+ 			replaceOriginalName: true,
++			isSelectionField: true,
+ 		});
+ 		const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+ 		return new Proxy(
+diff --git a/drizzle-orm/src/mysql-core/dialect.ts b/drizzle-orm/src/mysql-core/dialect.ts
+index 70bac395..4359c0ce 100644
+--- a/drizzle-orm/src/mysql-core/dialect.ts
++++ b/drizzle-orm/src/mysql-core/dialect.ts
+@@ -1266,7 +1266,7 @@ export class MySqlDialect {
+ 				sql.join(
+ 					selection.map(({ field }) =>
+ 						is(field, MySqlColumn)
+-							? sql.identifier(this.casing.getColumnCasing(field))
++							? mapColumnSelection(field, sql`${sql.identifier(this.casing.getColumnCasing(field))}`)
+ 							: is(field, SQL.Aliased)
+ 							? field.sql
+ 							: field
+diff --git a/drizzle-orm/src/mysql-core/view.ts b/drizzle-orm/src/mysql-core/view.ts
+index 42d9b3af..fa9de2be 100644
+--- a/drizzle-orm/src/mysql-core/view.ts
++++ b/drizzle-orm/src/mysql-core/view.ts
+@@ -68,6 +68,7 @@ export class ViewBuilder<TName extends string = string> extends ViewBuilderCore<
+ 			sqlBehavior: 'error',
+ 			sqlAliasedBehavior: 'alias',
+ 			replaceOriginalName: true,
++			isSelectionField: true,
+ 		});
+ 		const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+ 		return new Proxy(
+diff --git a/drizzle-orm/src/pg-core/view.ts b/drizzle-orm/src/pg-core/view.ts
+index f8e916a3..199de632 100644
+--- a/drizzle-orm/src/pg-core/view.ts
++++ b/drizzle-orm/src/pg-core/view.ts
+@@ -55,6 +55,7 @@ export class ViewBuilder<TName extends string = string> extends DefaultViewBuild
+ 			sqlBehavior: 'error',
+ 			sqlAliasedBehavior: 'alias',
+ 			replaceOriginalName: true,
++			isSelectionField: true,
+ 		});
+ 		const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+ 		return new Proxy(
+@@ -208,6 +209,7 @@ export class MaterializedViewBuilder<TName extends string = string>
+ 			sqlBehavior: 'error',
+ 			sqlAliasedBehavior: 'alias',
+ 			replaceOriginalName: true,
++			isSelectionField: true,
+ 		});
+ 		const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+ 		return new Proxy(
+diff --git a/drizzle-orm/src/selection-proxy.ts b/drizzle-orm/src/selection-proxy.ts
+index 7cf46415..24f8ed6c 100644
+--- a/drizzle-orm/src/selection-proxy.ts
++++ b/drizzle-orm/src/selection-proxy.ts
+@@ -38,6 +38,13 @@ export class SelectionProxyHandler<T extends Subquery | Record<string, unknown>
+ 		 * @default false
+ 		 */
+ 		replaceOriginalName?: boolean;
++
++		/**
++		 * Whether the columns are the output of a query (e.g. a query-built view), meaning
++		 * their values were already read through the column's `selectFromDb` mapper
++		 * @default false
++		 */
++		isSelectionField?: boolean;
+ 	};
+ 
+ 	constructor(config: SelectionProxyHandler<T>['config']) {
+@@ -106,9 +113,13 @@ export class SelectionProxyHandler<T extends Subquery | Record<string, unknown>
+ 							value.table,
+ 							new TableAliasProxyHandler(this.config.alias, this.config.replaceOriginalName ?? false),
+ 						),
++						this.config.isSelectionField,
+ 					),
+ 				);
+ 			}
++			if (this.config.isSelectionField) {
++				return new Proxy(value, new ColumnAliasProxyHandler(value.table, true));
++			}
+ 			return value;
+ 		}
+ 
+diff --git a/drizzle-orm/src/singlestore-core/view.ts b/drizzle-orm/src/singlestore-core/view.ts
+index 58f11142..9ebdfe26 100644
+--- a/drizzle-orm/src/singlestore-core/view.ts
++++ b/drizzle-orm/src/singlestore-core/view.ts
+@@ -77,6 +77,7 @@ export class ViewBuilder<TName extends string = string> extends ViewBuilderCore<
+ 			sqlBehavior: 'error',
+ 			sqlAliasedBehavior: 'alias',
+ 			replaceOriginalName: true,
++			isSelectionField: true,
+ 		});
+ 		const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+ 		return new Proxy(
+diff --git a/drizzle-orm/src/sqlite-core/view.ts b/drizzle-orm/src/sqlite-core/view.ts
+index 1caf211c..842262f1 100644
+--- a/drizzle-orm/src/sqlite-core/view.ts
++++ b/drizzle-orm/src/sqlite-core/view.ts
+@@ -48,6 +48,7 @@ export class ViewBuilder<TName extends string = string> extends ViewBuilderCore<
+ 			sqlBehavior: 'error',
+ 			sqlAliasedBehavior: 'alias',
+ 			replaceOriginalName: true,
++			isSelectionField: true,
+ 		});
+ 		// const aliasedSelectedFields = new Proxy(qb.getSelectedFields(), selectionProxy);
+ 		const aliasedSelectedFields = qb.getSelectedFields();
+diff --git a/drizzle-orm/tests/select-from-db.test.ts b/drizzle-orm/tests/select-from-db.test.ts
+index 3493dcde..6c9439b1 100644
+--- a/drizzle-orm/tests/select-from-db.test.ts
++++ b/drizzle-orm/tests/select-from-db.test.ts
+@@ -5,14 +5,17 @@ import {
+ 	customType as mysqlCustomType,
+ 	int as mysqlInt,
+ 	mysqlTable,
++	mysqlView,
+ 	serial as mysqlSerial,
+ 	varchar,
+ } from '~/mysql-core/index.ts';
++import { MySqlDatabase, MySqlDialect } from '~/mysql-core/index.ts';
+ import { drizzle as mysqlDrizzle } from '~/mysql-proxy/driver.ts';
++import { MySqlRemoteSession } from '~/mysql-proxy/session.ts';
+ import { PgDialect } from '~/pg-core/index.ts';
+-import { customType, integer, pgTable, serial, text } from '~/pg-core/index.ts';
++import { customType, integer, pgMaterializedView, pgTable, pgView, serial, text } from '~/pg-core/index.ts';
+ import { drizzle as pgDrizzle } from '~/pg-proxy/driver.ts';
+-import { relations } from '~/relations.ts';
++import { createTableRelationsHelpers, extractTablesRelationalConfig, relations } from '~/relations.ts';
+ import {
+ 	customType as ssCustomType,
+ 	serial as ssSerial,
+@@ -25,6 +28,7 @@ import {
+ 	customType as sqliteCustomType,
+ 	integer as sqliteInteger,
+ 	sqliteTable,
++	sqliteView,
+ 	text as sqliteText,
+ } from '~/sqlite-core/index.ts';
+ import { drizzle as sqliteDrizzle } from '~/sqlite-proxy/driver.ts';
+@@ -220,3 +224,87 @@ test('selectFromDb applies in gel select field lists', () => {
+ 		'select "places"."id", "places"."name", to_json("places"."geo") as "geo" from "places"',
+ 	);
+ });
++
++test('selectFromDb is not re-applied to columns of a query-built view', () => {
++	// The view's own query already applies selectFromDb, so its output column holds the transformed value
++	const placesView = pgView('places_view').as((qb) => qb.select().from(places));
++
++	expect(toSQL(db.select().from(placesView))).toBe('select "id", "name", "owner_id", "geo" from "places_view"');
++	expect(toSQL(db.select({ geo: placesView.geo }).from(placesView))).toBe('select "geo" from "places_view"');
++	expect(toSQL(db.select().from(places).leftJoin(placesView, sql`true`))).toBe(
++		'select "places"."id", "places"."name", "places"."owner_id", ST_AsText("places"."geo") as "geo", "places_view"."id", "places_view"."name", "places_view"."owner_id", "places_view"."geo" from "places" left join "places_view" on true',
++	);
++
++	const materialized = pgMaterializedView('places_mv').as((qb) => qb.select().from(places));
++	expect(toSQL(db.select().from(materialized))).toBe('select "id", "name", "owner_id", "geo" from "places_mv"');
++});
++
++test('selectFromDb still applies to columns of a view declared with raw SQL', () => {
++	// A view defined with explicit columns and raw SQL returns the raw database value
++	const rawView = pgView('places_raw', { id: integer('id'), geo: customPoint('geo') }).as(
++		sql`select "id", "geo" from "places"`,
++	);
++
++	expect(toSQL(db.select().from(rawView))).toBe('select "id", ST_AsText("geo") as "geo" from "places_raw"');
++	expect(toSQL(db.select({ geo: rawView.geo }).from(rawView))).toBe(
++		'select ST_AsText("geo") as "geo" from "places_raw"',
++	);
++});
++
++test('selectFromDb is not re-applied to query-built views in mysql and sqlite', () => {
++	const mysqlPoint = mysqlCustomType<{ data: string; driverData: string }>({
++		dataType: () => 'point',
++		selectFromDb: (column) => sql`ST_AsText(${column})`,
++	});
++	const mysqlPlaces = mysqlTable('places', { id: mysqlSerial('id').primaryKey(), geo: mysqlPoint('geo') });
++	const mysqlPlacesView = mysqlView('places_view').as((qb) => qb.select().from(mysqlPlaces));
++	expect(mysqlDrizzle(remoteCallback).select().from(mysqlPlacesView).toSQL().sql).toBe(
++		'select `id`, `geo` from `places_view`',
++	);
++
++	const sqlitePoint = sqliteCustomType<{ data: string; driverData: string }>({
++		dataType: () => 'blob',
++		selectFromDb: (column) => sql`AsText(${column})`,
++	});
++	const sqlitePlaces = sqliteTable('places', { id: sqliteInteger('id').primaryKey(), geo: sqlitePoint('geo') });
++	const sqlitePlacesView = sqliteView('places_view').as((qb) => qb.select().from(sqlitePlaces));
++	expect(sqliteDrizzle(remoteCallback).select().from(sqlitePlacesView).toSQL().sql).toBe(
++		'select "id", "geo" from "places_view"',
++	);
++});
++
++test('selectFromDb applies inside nested relational JSON payloads in mysql planetscale mode', () => {
++	const mysqlPoint = mysqlCustomType<{ data: string; driverData: string }>({
++		dataType: () => 'point',
++		selectFromDb: (column) => sql`ST_AsText(${column})`,
++	});
++	const mUsers = mysqlTable('users', { id: mysqlSerial('id').primaryKey(), name: varchar('name', { length: 32 }) });
++	const mPlaces = mysqlTable('places', {
++		id: mysqlSerial('id').primaryKey(),
++		ownerId: mysqlInt('owner_id'),
++		geo: mysqlPoint('geo'),
++	});
++	const fullSchema = {
++		mUsers,
++		mPlaces,
++		mUsersRelations: relations(mUsers, ({ many }) => ({ places: many(mPlaces) })),
++		mPlacesRelations: relations(mPlaces, ({ one }) => ({
++			owner: one(mUsers, { fields: [mPlaces.ownerId], references: [mUsers.id] }),
++		})),
++	};
++	// PlanetScale mode builds relational queries without lateral joins (as the planetscale-serverless driver does)
++	const tablesConfig = extractTablesRelationalConfig(fullSchema, createTableRelationsHelpers);
++	const schema = { fullSchema, schema: tablesConfig.tables, tableNamesMap: tablesConfig.tableNamesMap };
++	const mysqlDialect = new MySqlDialect();
++	const session = new MySqlRemoteSession(remoteCallback, mysqlDialect, schema, {});
++	const pdb = new MySqlDatabase(mysqlDialect, session, schema as any, 'planetscale') as MySqlDatabase<
++		any,
++		any,
++		typeof fullSchema
++	>;
++
++	const sqlText = pdb.query.mUsers.findMany({ with: { places: true } }).toSQL().sql;
++
++	expect(sqlText).not.toContain('lateral');
++	expect(sqlText).toContain('json_array(`id`, `owner_id`, ST_AsText(`geo`))');
++});
+-- 
+2.43.0
+

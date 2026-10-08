@@ -18,7 +18,7 @@ hand-author code and attend office hours).
     (GraphsInterfaceChecker) open. VNGraphs #18/#19, #33–#37 closed (#33–#37 on 2026-09-12: "LLM work from new
     contributors is not acceptable for bounties").
 - The maintainer's agent already shipped native ccall bindings and VNGraphs v1.1.0 (2026-09).
-- Slack (2026-09-20): lane on hold until Krastanov confirms precedence for Bryce.
+- Precedence: raise it with Krastanov in the claim comment / office hours (fleet note 2026-09-20).
 
 ## 2. Binaries
 - `very_nauty_jll` 1.1.2+0 exists for 18 platforms incl. Windows; product `libvn_graph`, ships `include/vn_graph.h`.

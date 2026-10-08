@@ -36,7 +36,7 @@ The analysis packet covers:
   - docs
 - **Graphs.jl declarations** are already proposed by #529 (which follows Krastanov's #507 review) and by #528 (a generic mechanism). Coordinate with those; don't add a third.
 - **Contested:** Graphs.jl #507 is stale but its author has already emailed about payment, and #529 and #528 are open. VNGraphs.jl #26 has changes requested and #14 is open.
-- **On hold:** fleet Slack from 2026-09-20 says engineering waits until Krastanov gives Bryce precedence.
+- **Precedence:** claim it with Krastanov in the claim comment / office hours (fleet note 2026-09-20 asked him about precedence for Bryce).
 
 ## Claim — ready to paste
 

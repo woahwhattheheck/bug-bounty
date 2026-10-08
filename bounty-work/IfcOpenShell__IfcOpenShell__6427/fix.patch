@@ -1,0 +1,1083 @@
+From fe2577c8010a750be893917082c301f0a402b5d1 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:32:02 +0000
+Subject: [PATCH] Type multiline text annotations in the viewport
+
+Text annotations can now be typed directly in the viewport with the
+new Type Text In Viewport operator (Alt+T in the annotation tool, or
+the button in the Text panel). Enter starts a new line, Tab inserts a
+tab and Ctrl+B / Ctrl+I toggle markdown bold and italic on the word
+at the caret. Ctrl+Enter or a left click saves, Esc cancels.
+
+Printed text now keeps what was typed: each line of a literal is
+parsed on its own, so blank lines, indentation, tabs, repeated spaces
+and lines starting with "1." or "#" are no longer dropped or merged,
+and a literal after a multiline one no longer overlaps it. The
+viewport preview handles tabs and the \n escape the same way.
+
+Fixes #6427
+
+Generated with the assistance of an AI coding tool.
+---
+ .../bonsai/bim/module/drawing/__init__.py     |   1 +
+ .../bonsai/bim/module/drawing/decoration.py   |  13 +-
+ .../bonsai/bim/module/drawing/operator.py     | 107 +++++-
+ .../bonsai/bim/module/drawing/svgwriter.py    | 151 ++++++---
+ .../bonsai/bim/module/drawing/text_editing.py | 318 ++++++++++++++++++
+ src/bonsai/bonsai/bim/module/drawing/ui.py    |   3 +
+ .../bonsai/bim/module/drawing/workspace.py    |   6 +
+ .../bim/module/drawing/test_text_editing.py   | 289 ++++++++++++++++
+ 8 files changed, 828 insertions(+), 60 deletions(-)
+ create mode 100644 src/bonsai/bonsai/bim/module/drawing/text_editing.py
+ create mode 100644 src/bonsai/test/bim/module/drawing/test_text_editing.py
+
+diff --git a/src/bonsai/bonsai/bim/module/drawing/__init__.py b/src/bonsai/bonsai/bim/module/drawing/__init__.py
+index 1bca9eab4..28e9636cd 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/__init__.py
++++ b/src/bonsai/bonsai/bim/module/drawing/__init__.py
+@@ -64,6 +64,7 @@ classes = (
+     operator.EditElementFilter,
+     operator.EditSheet,
+     operator.EditText,
++    operator.EditTextInViewport,
+     operator.EditTextPopup,
+     operator.EnableAddAnnotationType,
+     operator.EnableEditingAssignedProduct,
+diff --git a/src/bonsai/bonsai/bim/module/drawing/decoration.py b/src/bonsai/bonsai/bim/module/drawing/decoration.py
+index a8079f494..2269eca9e 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/decoration.py
++++ b/src/bonsai/bonsai/bim/module/drawing/decoration.py
+@@ -40,6 +40,7 @@ from gpu_extras.batch import batch_for_shader
+ from mathutils import Matrix, Vector
+ 
+ import bonsai.bim.module.drawing.helper as helper
++import bonsai.bim.module.drawing.text_editing as text_editing
+ import bonsai.tool as tool
+ from bonsai.bim.module.drawing.data import DecoratorData, DrawingsData
+ from bonsai.bim.module.drawing.helper import format_distance
+@@ -611,19 +612,19 @@ class BaseDecorator:
+ 
+         line_i = 0
+         font_size_mm = text_data["FontSize"] * text_scale
+-        for literal_data in literals_data:
++        for literal_index, literal_data in enumerate(literals_data):
+             box_alignment = literal_data["BoxAlignment"]
+-            text = literal_data["CurrentValue"]
++            text = text_editing.ViewportTextEdit.get_displayed_text(
++                obj.name, literal_index, literal_data["CurrentValue"]
++            )
+ 
+             if newline_at != 0:
+                 text = helper.add_newline_between_words(text, newline_at)
+ 
+-            multiple_lines = text.split("\n")
+-
+-            for line in multiple_lines:
++            for line in text_editing.split_text_lines(text):
+                 self.draw_label(
+                     context,
+-                    line,
++                    text_editing.expand_tabs(line),
+                     pos,
+                     text_dir,
+                     gap=0,
+diff --git a/src/bonsai/bonsai/bim/module/drawing/operator.py b/src/bonsai/bonsai/bim/module/drawing/operator.py
+index ee956035a..45298555c 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/operator.py
++++ b/src/bonsai/bonsai/bim/module/drawing/operator.py
+@@ -63,6 +63,7 @@ import bonsai.bim.handler
+ import bonsai.bim.import_ifc
+ import bonsai.bim.module.drawing.sheeter as sheeter
+ import bonsai.bim.module.drawing.svgwriter as svgwriter
++import bonsai.bim.module.drawing.text_editing as text_editing
+ import bonsai.core.drawing as core
+ import bonsai.core.geometry
+ import bonsai.tool as tool
+@@ -74,7 +75,7 @@ from bonsai.bim.module.drawing.prop import (
+     RasterStyleProperty,
+ )
+ from bonsai.bim.module.drawing.ui import get_current_product_for_element_values
+-from bonsai.bim.prop import StrProperty
++from bonsai.bim.prop import Attribute, StrProperty
+ 
+ if TYPE_CHECKING:
+     from bpy.stub_internal import rna_enums
+@@ -3471,6 +3472,110 @@ class DisableEditingText(bpy.types.Operator, tool.Ifc.Operator):
+         tool.Blender.update_viewport()
+ 
+ 
++class EditTextInViewport(bpy.types.Operator):
++    bl_idname = "bim.edit_text_in_viewport"
++    bl_label = "Type Text In Viewport"
++    bl_description = (
++        "Type directly into the text annotation in the viewport.\n"
++        "Enter starts a new line, Tab inserts a tab, Ctrl+B / Ctrl+I toggle bold / italic.\n"
++        "Ctrl+Enter or left click to finish, Esc or right click to cancel"
++    )
++    literal_prop_id: bpy.props.IntProperty(name="Literal Index", default=0)
++
++    @classmethod
++    def poll(cls, context):
++        if text_editing.ViewportTextEdit.is_active() or not (obj := context.active_object):
++            return False
++        element = tool.Ifc.get_entity(obj)
++        return bool(element) and tool.Drawing.is_annotation_object_type(element, ["TEXT", "TEXT_LEADER"])
++
++    def invoke(self, context, event):
++        obj = context.active_object
++        assert obj
++        props = tool.Drawing.get_text_props(obj)
++        self.was_editing = props.is_editing
++        if not self.was_editing:
++            bpy.ops.bim.enable_editing_text()
++        if not 0 <= self.literal_prop_id < len(props.literals):
++            self.report({"ERROR"}, "The text annotation has no literal to type into.")
++            if not self.was_editing:
++                bpy.ops.bim.disable_editing_text()
++            return {"CANCELLED"}
++
++        self.obj_name = obj.name
++        self.original_value = self.get_literal_attribute(obj).string_value
++        # Show the older \n escapes as the line breaks they print as.
++        self.buffer = text_editing.TextEditBuffer(self.original_value.replace("\\n", "\n"))
++        text_editing.ViewportTextEdit.start(obj.name, self.literal_prop_id, self.buffer)
++        self.sync(context)
++        context.window_manager.modal_handler_add(self)
++        return {"RUNNING_MODAL"}
++
++    def modal(self, context, event):
++        obj = bpy.data.objects.get(self.obj_name)
++        props = tool.Drawing.get_text_props(obj) if obj else None
++        if not props or not props.is_editing or self.literal_prop_id >= len(props.literals):
++            # The text was deleted or its editing was finished from the properties panel.
++            self.finish(context)
++            return {"CANCELLED"}
++
++        if event.type in text_editing.PASS_THROUGH_EVENTS or event.type.startswith("NDOF_"):
++            return {"PASS_THROUGH"}
++        if event.value != "PRESS" and event.type != "TEXTINPUT":
++            return {"RUNNING_MODAL"}
++
++        result = text_editing.handle_key(
++            self.buffer,
++            event.type,
++            event.unicode,
++            ctrl=event.ctrl or event.oskey,
++            alt=event.alt,
++            clipboard=context.window_manager.clipboard if event.type == "V" else "",
++        )
++        if result == "CONFIRM":
++            self.finish(context)
++            if not self.was_editing:
++                with context.temp_override(active_object=obj):
++                    bpy.ops.bim.edit_text()
++            return {"FINISHED"}
++        elif result == "CANCEL":
++            self.get_literal_attribute(obj).string_value = self.original_value
++            self.finish(context)
++            if not self.was_editing:
++                with context.temp_override(active_object=obj):
++                    bpy.ops.bim.disable_editing_text()
++            return {"CANCELLED"}
++        elif result == "PASS_THROUGH":
++            return {"PASS_THROUGH"}
++        self.sync(context)
++        return {"RUNNING_MODAL"}
++
++    def get_literal_attribute(self, obj: bpy.types.Object) -> Attribute:
++        props = tool.Drawing.get_text_props(obj)
++        return props.literals[self.literal_prop_id].attributes["Literal"]
++
++    def sync(self, context: bpy.types.Context) -> None:
++        obj = bpy.data.objects[self.obj_name]
++        self.get_literal_attribute(obj).string_value = self.buffer.text
++        row, column = self.buffer.get_row_column()
++        context.workspace.status_text_set(
++            f"Typing text: line {row + 1}, column {column + 1}    "
++            "Enter: New Line    Tab: Tab    Ctrl+B / Ctrl+I: Bold / Italic    "
++            "Ctrl+Enter / LMB: Finish    Esc / RMB: Cancel"
++        )
++        tool.Blender.update_all_viewports(context)
++
++    def cancel(self, context):
++        # Blender stops the operator, for example when another file is opened.
++        self.finish(context)
++
++    def finish(self, context: bpy.types.Context) -> None:
++        text_editing.ViewportTextEdit.stop()
++        if context.workspace:
++            context.workspace.status_text_set(None)
++        tool.Blender.update_all_viewports(context)
++
++
+ class AddTextLiteral(bpy.types.Operator):
+     bl_idname = "bim.add_text_literal"
+     bl_label = "Add Text Literal"
+diff --git a/src/bonsai/bonsai/bim/module/drawing/svgwriter.py b/src/bonsai/bonsai/bim/module/drawing/svgwriter.py
+index bfe3a8c92..a587b120f 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/svgwriter.py
++++ b/src/bonsai/bonsai/bim/module/drawing/svgwriter.py
+@@ -39,6 +39,7 @@ from markdown_it import MarkdownIt
+ from mathutils import Vector, geometry
+ 
+ import bonsai.bim.module.drawing.helper as helper
++import bonsai.bim.module.drawing.text_editing as text_editing
+ import bonsai.tool as tool
+ from bonsai.bim.module.drawing.data import DecoratorData, DrawingsData
+ 
+@@ -196,6 +197,37 @@ def parse_markdown_it(text: str) -> list[dict[str, Union[str, None]]]:
+     return segments
+ 
+ 
++def parse_markdown_lines(lines: list[str]) -> list[dict[str, Union[str, None]]]:
++    """Parse the printed lines of a text literal into the segments of `parse_markdown_it`.
++
++    Each line is parsed on its own, so blank lines, numbered lines and lines starting with
++    characters such as # stay as typed. Only bullet points and inline formatting are
++    interpreted. Tabs, indentation and repeated spaces are kept.
++    """
++    segments = []
++    for i, line in enumerate(lines):
++        if i:
++            segments.append({"text": None, "url": None, "break": True, "bold": False, "italic": False})
++        indent, body = text_editing.split_indent(line)
++        if indent:
++            indent_text = text_editing.NBSP * indent
++            segments.append({"text": indent_text, "url": None, "break": False, "bold": False, "italic": False})
++        for segment in parse_markdown_it(text_editing.escape_block_markdown(body)):
++            if segment["break"] and segment["text"] == "\u2022 ":
++                # The bullet point is already on a line of its own.
++                segment = segment | {"break": False}
++            segments.append(segment)
++    return segments
++
++
++def is_plain_text(segments: list[dict[str, Union[str, None]]], lines: list[str]) -> bool:
++    """Whether parsed lines print exactly as typed, without formatting, links or bullet points."""
++    if any(s["url"] or s["bold"] or s["italic"] for s in segments):
++        return False
++    printed = "".join("\n" if s["break"] else (s["text"] or "") for s in segments)
++    return printed == "\n".join(text_editing.preserve_whitespace(line) for line in lines)
++
++
+ class SvgWriter:
+     metadata: list[str]
+     # Resources in MULTI_PATH_RESOURCES are stored as a list of paths, other resources as a single path.
+@@ -1039,77 +1071,90 @@ class SvgWriter:
+             text = tool.Drawing.replace_text_literal_variables(text_literal.Literal, product or element)
+             if newline_at:
+                 text = helper.add_newline_between_words(text, newline_at)
+-            text_segments = parse_markdown_it(text)
++            text_lines = text_editing.split_text_lines(text)
++            text_segments = parse_markdown_lines(text_lines)
+ 
+-            if len(text_segments) == 1 and text_segments[0]["url"] is None and not text_segments[0].get("break", False):
++            if is_plain_text(text_segments, text_lines):
+                 text_tags = self.create_text_tag(
+                     text,
+                     text_position_svg,
+                     angle,
+                     text_literal.BoxAlignment,
+                     classes_str,
++                    text_format=text_editing.preserve_whitespace,
+                     fill_bg=fill_bg,
+                     line_number_start=line_number,
+-                    newline_at=newline_at,
+                 )
+                 for tag in text_tags:
+                     self.svg.add(tag)
+-                line_number += len(text_tags)
++                line_number += len(text_lines)
+             else:
+-                base_text_attrs = SvgWriter.get_box_alignment_parameters(text_literal.BoxAlignment)
+-                text_position_svg_str = ", ".join(map(str, text_position_svg))
+-                text_transform = f"translate({text_position_svg_str}) rotate({angle})"
+-
+-                text_tag = self.svg.text("", transform=text_transform, class_=classes_str, **base_text_attrs)
+-
+-                line_idx = 0
+-                new_line = True
+-                bullet_next = False
+-                for idx, segment in enumerate(text_segments):
+-                    if segment.get("break", False):
+-                        if segment.get("text") == "\u2022 ":
+-                            bullet_next = True
+-                        line_idx += 1
+-                        new_line = True
+-                        continue
+-                    if segment["text"] is None:
+-                        continue
+-                    text_content = segment["text"]
+-                    if bullet_next:
+-                        text_content = "\u2022 " + (text_content or "")
+-                        bullet_next = False
+-
+-                    if new_line:
+-                        dy, x, y = f"{line_idx}em", 0, 0
+-                        new_line = False
+-                    else:
+-                        dy, x, y = None, None, None
+-
+-                    tspan = self.svg.tspan(text_content, class_=classes_str)
+-                    if segment.get("bold", False):
+-                        tspan.attribs["font-weight"] = "bold"
+-                    if segment.get("italic", False):
+-                        tspan.attribs["font-style"] = "italic"
+-                    if dy is not None:
+-                        tspan.attribs["dy"] = dy
+-                    if x is not None:
+-                        tspan.attribs["x"] = x
+-                    if y is not None:
+-                        tspan.attribs["y"] = y
+-
+-                    if segment["url"]:
+-                        link_element = self.svg.a(href=segment["url"], target="_blank")
+-                        link_element.add(tspan)
+-                        text_tag.add(link_element)
+-                    else:
+-                        text_tag.add(tspan)
+-
++                text_tag, line_count = self.create_markdown_text_tag(
++                    text_segments,
++                    text_position_svg,
++                    angle,
++                    text_literal.BoxAlignment,
++                    classes_str,
++                    line_number_start=line_number,
++                )
+                 if fill_bg:
+                     fill_bg_tag = self.add_fill_bg(text_tag)
+                     self.svg.add(fill_bg_tag)
+ 
+                 self.svg.add(text_tag)
+-                line_number += 1
++                line_number += line_count
++
++    def create_markdown_text_tag(
++        self,
++        text_segments: list[dict[str, Union[str, None]]],
++        text_position: Vector,
++        angle: float,
++        box_alignment: str,
++        class_str: str,
++        line_number_start: int = 0,
++    ) -> tuple[svgwrite.text.Text, int]:
++        """Return the text tag for segments from `parse_markdown_lines` and its number of lines."""
++        base_text_attrs = SvgWriter.get_box_alignment_parameters(box_alignment)
++        text_position_svg_str = ", ".join(map(str, text_position))
++        text_transform = f"translate({text_position_svg_str}) rotate({angle})"
++
++        text_tag = self.svg.text("", transform=text_transform, class_=class_str, **base_text_attrs)
++
++        line_idx = 0
++        new_line = True
++        for segment in text_segments:
++            if segment.get("break", False):
++                line_idx += 1
++                new_line = True
++                continue
++            if not segment["text"]:
++                continue
++
++            if new_line:
++                dy, x, y = f"{line_number_start + line_idx}em", 0, 0
++                new_line = False
++            else:
++                dy, x, y = None, None, None
++
++            tspan = self.svg.tspan(segment["text"], class_=class_str)
++            if segment.get("bold", False):
++                tspan.attribs["font-weight"] = "bold"
++            if segment.get("italic", False):
++                tspan.attribs["font-style"] = "italic"
++            if dy is not None:
++                tspan.attribs["dy"] = dy
++            if x is not None:
++                tspan.attribs["x"] = x
++            if y is not None:
++                tspan.attribs["y"] = y
++
++            if segment["url"]:
++                link_element = self.svg.a(href=segment["url"], target="_blank")
++                link_element.add(tspan)
++                text_tag.add(link_element)
++            else:
++                text_tag.add(tspan)
++        return text_tag, line_idx + 1
+ 
+     def draw_empty_annotation(self, obj: bpy.types.Object, classes: list[str]) -> None:
+         x_offset = self.raw_width / 2
+diff --git a/src/bonsai/bonsai/bim/module/drawing/text_editing.py b/src/bonsai/bonsai/bim/module/drawing/text_editing.py
+new file mode 100644
+index 000000000..27fb375ca
+--- /dev/null
++++ b/src/bonsai/bonsai/bim/module/drawing/text_editing.py
+@@ -0,0 +1,318 @@
++# Bonsai - OpenBIM Blender Add-on
++# Copyright (C) 2026 woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
++#
++# This file is part of Bonsai.
++#
++# Bonsai is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Bonsai is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
++#
++# This file was generated with the assistance of an AI coding tool.
++
++"""Typing text annotations directly in the viewport, see #6427.
++
++Everything here is plain Python so it can be tested without Blender: the caret based
++edit buffer, the mapping from key presses to edits, and the helpers that keep line
++breaks, tabs and indentation intact when a literal is printed.
++"""
++
++import re
++from typing import Literal, Optional
++
++TAB_SIZE = 4
++NBSP = "\u00a0"
++CARET = "|"
++
++KeyResult = Literal["CONTINUE", "CONFIRM", "CANCEL", "PASS_THROUGH"]
++
++# Events that keep navigating the viewport while a literal is being typed.
++PASS_THROUGH_EVENTS = {
++    "MIDDLEMOUSE",
++    "WHEELUPMOUSE",
++    "WHEELDOWNMOUSE",
++    "WHEELINMOUSE",
++    "WHEELOUTMOUSE",
++    "MOUSEMOVE",
++    "INBETWEEN_MOUSEMOVE",
++    "TRACKPADPAN",
++    "TRACKPADZOOM",
++    "MOUSEROTATE",
++    "MOUSESMARTZOOM",
++    "TIMER",
++    "TIMER_REPORT",
++    "WINDOW_DEACTIVATE",
++}
++
++
++def split_text_lines(text: str) -> list[str]:
++    """Split a literal into printed lines.
++
++    Both real line breaks and the older ``\\n`` escape sequence start a new line.
++    """
++    return text.replace("\\n", "\n").split("\n")
++
++
++def expand_tabs(line: str) -> str:
++    return line.expandtabs(TAB_SIZE)
++
++
++def split_indent(line: str) -> tuple[int, str]:
++    """Return the indentation width of a printed line and the rest of it.
++
++    Tabs are expanded and trailing spaces dropped. Runs of spaces inside the rest
++    become non-breaking spaces, as SVG would otherwise collapse them into one.
++    """
++    line = expand_tabs(line).rstrip(" ")
++    body = line.lstrip(" ")
++    return len(line) - len(body), re.sub(r" {2,}", lambda m: NBSP * len(m.group()), body)
++
++
++def preserve_whitespace(line: str) -> str:
++    """Keep the tabs, indentation and repeated spaces of a line when it is printed to SVG."""
++    indent, body = split_indent(line)
++    return NBSP * indent + body
++
++
++# Block level markdown that would otherwise eat the characters a user typed at the start
++# of a line: headings, quotes, numbered lists, horizontal rules and code fences.
++BLOCK_MARKDOWN = re.compile(r"^(#{1,6}(?=\s|$)|>|\d{1,9}(?=[.)](?:\s|$))|(?:[-*_]\s*){3,}$|`{3,}|~{3,})")
++
++
++def escape_block_markdown(line: str) -> str:
++    """Keep a line as written, only bullet points and inline formatting are interpreted."""
++    match = BLOCK_MARKDOWN.match(line)
++    if not match:
++        return line
++    if match.group(0)[0].isdigit():
++        number = match.group(0)
++        return number + "\\" + line[len(number) :]
++    return "\\" + line
++
++
++class TextEditBuffer:
++    """A literal being typed, with a caret given as an index into the text."""
++
++    def __init__(self, text: str = "", caret: Optional[int] = None):
++        self.text = text
++        self.caret = len(text) if caret is None else max(0, min(caret, len(text)))
++
++    def get_row_column(self) -> tuple[int, int]:
++        before = self.text[: self.caret]
++        row = before.count("\n")
++        return row, len(before) - (before.rfind("\n") + 1)
++
++    def get_line_start(self, position: Optional[int] = None) -> int:
++        position = self.caret if position is None else position
++        return self.text.rfind("\n", 0, position) + 1
++
++    def get_line_end(self, position: Optional[int] = None) -> int:
++        position = self.caret if position is None else position
++        end = self.text.find("\n", position)
++        return len(self.text) if end == -1 else end
++
++    def insert(self, value: str) -> None:
++        value = value.replace("\r\n", "\n").replace("\r", "\n")
++        self.text = self.text[: self.caret] + value + self.text[self.caret :]
++        self.caret += len(value)
++
++    def backspace(self, word: bool = False) -> None:
++        start = self.find_word_start() if word else max(0, self.caret - 1)
++        self.text = self.text[:start] + self.text[self.caret :]
++        self.caret = start
++
++    def delete(self, word: bool = False) -> None:
++        end = self.find_word_end() if word else min(len(self.text), self.caret + 1)
++        self.text = self.text[: self.caret] + self.text[end:]
++
++    def move_left(self, word: bool = False) -> None:
++        self.caret = self.find_word_start() if word else max(0, self.caret - 1)
++
++    def move_right(self, word: bool = False) -> None:
++        self.caret = self.find_word_end() if word else min(len(self.text), self.caret + 1)
++
++    def move_home(self, document: bool = False) -> None:
++        self.caret = 0 if document else self.get_line_start()
++
++    def move_end(self, document: bool = False) -> None:
++        self.caret = len(self.text) if document else self.get_line_end()
++
++    def move_up(self) -> None:
++        line_start = self.get_line_start()
++        if line_start == 0:
++            self.caret = 0
++            return
++        column = self.caret - line_start
++        previous_start = self.get_line_start(line_start - 1)
++        self.caret = min(previous_start + column, line_start - 1)
++
++    def move_down(self) -> None:
++        line_end = self.get_line_end()
++        if line_end == len(self.text):
++            self.caret = line_end
++            return
++        column = self.caret - self.get_line_start()
++        next_start = line_end + 1
++        self.caret = min(next_start + column, self.get_line_end(next_start))
++
++    def find_word_start(self) -> int:
++        i = self.caret
++        while i > 0 and self.text[i - 1].isspace():
++            i -= 1
++        while i > 0 and not self.text[i - 1].isspace():
++            i -= 1
++        return i
++
++    def find_word_end(self) -> int:
++        i = self.caret
++        while i < len(self.text) and self.text[i].isspace():
++            i += 1
++        while i < len(self.text) and not self.text[i].isspace():
++            i += 1
++        return i
++
++    def toggle_bold(self) -> None:
++        self.toggle_emphasis(2)
++
++    def toggle_italic(self) -> None:
++        self.toggle_emphasis(1)
++
++    def toggle_emphasis(self, weight: int) -> None:
++        """Toggle markdown bold (weight 2) or italic (weight 1) on the word at the caret.
++
++        Without a word at the caret, an empty pair of markers is inserted to type into.
++        """
++        if not (word := self.find_emphasis_word()):
++            markers = "*" * weight
++            self.insert(markers + markers)
++            self.caret -= weight
++            return
++        start, end = word
++        before = len(self.text[:start]) - len(self.text[:start].rstrip("*"))
++        after = len(self.text[end:]) - len(self.text[end:].lstrip("*"))
++        current = min(before, after, 3)
++        # Bold uses two asterisks, italic one and both together three.
++        has_weight = current in ((2, 3) if weight == 2 else (1, 3))
++        new = current - weight if has_weight else current + weight
++        markers = "*" * new
++        self.text = self.text[: start - current] + markers + self.text[start:end] + markers + self.text[end + current :]
++        self.caret = start - current + len(markers) + (end - start) + len(markers)
++
++    def find_emphasis_word(self) -> Optional[tuple[int, int]]:
++        def is_word_character(character: str) -> bool:
++            return not character.isspace() and character != "*"
++
++        text = self.text
++        i = self.caret
++        while i > 0 and text[i - 1] == "*":
++            i -= 1
++        if i > 0 and is_word_character(text[i - 1]):
++            end = i
++            start = end
++            while start > 0 and is_word_character(text[start - 1]):
++                start -= 1
++            while end < len(text) and is_word_character(text[end]):
++                end += 1
++            return start, end
++        j = self.caret
++        while j < len(text) and text[j] == "*":
++            j += 1
++        if j < len(text) and is_word_character(text[j]):
++            start = end = j
++            while end < len(text) and is_word_character(text[end]):
++                end += 1
++            return start, end
++        return None
++
++    def get_text_with_caret(self) -> str:
++        return self.text[: self.caret] + CARET + self.text[self.caret :]
++
++
++def handle_key(
++    buffer: TextEditBuffer,
++    key: str,
++    unicode: str = "",
++    ctrl: bool = False,
++    alt: bool = False,
++    clipboard: str = "",
++) -> KeyResult:
++    """Apply one key press to the buffer and say whether typing goes on."""
++    if key in PASS_THROUGH_EVENTS or key.startswith("NDOF_"):
++        return "PASS_THROUGH"
++    if key in {"ESC", "RIGHTMOUSE"}:
++        return "CANCEL"
++    if key == "LEFTMOUSE":
++        return "CONFIRM"
++    if key in {"RET", "NUMPAD_ENTER"}:
++        if ctrl:
++            return "CONFIRM"
++        buffer.insert("\n")
++    elif key == "TAB":
++        buffer.insert("\t")
++    elif key == "BACK_SPACE":
++        buffer.backspace(word=ctrl)
++    elif key == "DEL":
++        buffer.delete(word=ctrl)
++    elif key == "LEFT_ARROW":
++        buffer.move_left(word=ctrl)
++    elif key == "RIGHT_ARROW":
++        buffer.move_right(word=ctrl)
++    elif key == "UP_ARROW":
++        buffer.move_up()
++    elif key == "DOWN_ARROW":
++        buffer.move_down()
++    elif key == "HOME":
++        buffer.move_home(document=ctrl)
++    elif key == "END":
++        buffer.move_end(document=ctrl)
++    elif ctrl and not alt and key == "B":
++        buffer.toggle_bold()
++    elif ctrl and not alt and key == "I":
++        buffer.toggle_italic()
++    elif ctrl and not alt and key == "V":
++        buffer.insert(clipboard)
++    elif unicode and unicode.isprintable() and (alt or not ctrl):
++        # AltGr is reported as Ctrl+Alt and types characters such as @ on many layouts.
++        buffer.insert(unicode)
++    return "CONTINUE"
++
++
++class ViewportTextEdit:
++    """The literal currently being typed in the viewport, so the decorator can draw a caret."""
++
++    obj_name: Optional[str] = None
++    literal_index: int = 0
++    buffer: Optional[TextEditBuffer] = None
++
++    @classmethod
++    def start(cls, obj_name: str, literal_index: int, buffer: TextEditBuffer) -> None:
++        cls.obj_name = obj_name
++        cls.literal_index = literal_index
++        cls.buffer = buffer
++
++    @classmethod
++    def stop(cls) -> None:
++        cls.obj_name = None
++        cls.literal_index = 0
++        cls.buffer = None
++
++    @classmethod
++    def is_active(cls) -> bool:
++        return cls.buffer is not None
++
++    @classmethod
++    def get_displayed_text(cls, obj_name: str, literal_index: int, text: str) -> str:
++        """Return the literal text to draw, with a caret if it is the one being typed."""
++        if cls.buffer is None or cls.obj_name != obj_name or cls.literal_index != literal_index:
++            return text
++        if cls.buffer.text != text:
++            return text
++        return cls.buffer.get_text_with_caret()
+diff --git a/src/bonsai/bonsai/bim/module/drawing/ui.py b/src/bonsai/bonsai/bim/module/drawing/ui.py
+index 42cb73723..87919074d 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/ui.py
++++ b/src/bonsai/bonsai/bim/module/drawing/ui.py
+@@ -698,6 +698,8 @@ class BIM_PT_text(Panel):
+             if len(literal_props.attributes):
+                 row = box.row(align=True)
+                 bonsai.bim.helper.draw_attribute(literal_props.attributes[0], row, enable_search=True)
++                if not popup_mode:
++                    row.operator("bim.edit_text_in_viewport", icon="FONT_DATA", text="").literal_prop_id = i
+                 if i > 0:
+                     row.operator("bim.order_text_literal_up", icon="TRIA_UP", text="").literal_prop_id = i
+                 if i < len(props.literals) - 1:
+@@ -817,6 +819,7 @@ class BIM_PT_text(Panel):
+ 
+         row = self.layout.row()
+         row.operator("bim.enable_editing_text", icon="GREASEPENCIL")
++        row.operator("bim.edit_text_in_viewport", icon="FONT_DATA")
+ 
+         row = self.layout.row(align=True)
+         row.label(text="FontSize")
+diff --git a/src/bonsai/bonsai/bim/module/drawing/workspace.py b/src/bonsai/bonsai/bim/module/drawing/workspace.py
+index 69532e6df..6650c262d 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/workspace.py
++++ b/src/bonsai/bonsai/bim/module/drawing/workspace.py
+@@ -132,6 +132,7 @@ class AnnotationTool(WorkSpaceTool):
+         ("bim.annotation_hotkey", {"type": "D", "value": "PRESS", "alt": True}, {"properties": [("hotkey", "A_D")]}),
+         ("bim.annotation_hotkey", {"type": "E", "value": "PRESS", "alt": True}, {"properties": [("hotkey", "A_E")]}),
+         ("bim.annotation_hotkey", {"type": "O", "value": "PRESS", "alt": True}, {"properties": [("hotkey", "A_O")]}),
++        ("bim.annotation_hotkey", {"type": "T", "value": "PRESS", "alt": True}, {"properties": [("hotkey", "A_T")]}),
+     )
+ 
+     def draw_settings(context, layout, ws_tool):
+@@ -225,6 +226,7 @@ class AnnotationToolUI:
+     def draw_edit_object_interface(cls, context):
+         if DecoratorData.get_text_data(bpy.context.active_object):
+             add_layout_hotkey_operator(cls.layout, "Edit Text", "S_E", "")
++            add_layout_hotkey_operator(cls.layout, "Type Text", "A_T", "Type directly into the text in the viewport")
+         if bpy.ops.bim.copy_annotation_to_drawing.poll():
+             row = cls.layout.row(align=True)
+             row.operator("bim.copy_annotation_to_drawing", icon="PASTEDOWN", text="Copy To Drawing")
+@@ -344,6 +346,10 @@ class Hotkey(bpy.types.Operator, tool.Ifc.Operator):
+         if DecoratorData.get_text_data(bpy.context.active_object):
+             bpy.ops.bim.edit_text_popup()
+ 
++    def hotkey_A_T(self):
++        if bpy.ops.bim.edit_text_in_viewport.poll():
++            bpy.ops.bim.edit_text_in_viewport("INVOKE_DEFAULT")
++
+     def hotkey_S_G(self):
+         for obj in bpy.context.selected_objects:
+             element = tool.Ifc.get_entity(obj)
+diff --git a/src/bonsai/test/bim/module/drawing/test_text_editing.py b/src/bonsai/test/bim/module/drawing/test_text_editing.py
+new file mode 100644
+index 000000000..9def2ac8d
+--- /dev/null
++++ b/src/bonsai/test/bim/module/drawing/test_text_editing.py
+@@ -0,0 +1,289 @@
++# Bonsai - OpenBIM Blender Add-on
++# Copyright (C) 2026 woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
++#
++# This file is part of Bonsai.
++#
++# Bonsai is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Bonsai is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
++#
++# This file was generated with the assistance of an AI coding tool.
++
++import glob
++import re
++
++import bpy
++import ifcopenshell
++import pytest
++import svgwrite
++from mathutils import Vector
++
++import bonsai.tool as tool
++from bonsai.bim.module.drawing import text_editing
++from bonsai.bim.module.drawing.svgwriter import SvgWriter, is_plain_text, parse_markdown_lines
++from bonsai.bim.module.drawing.text_editing import NBSP, TextEditBuffer, ViewportTextEdit, handle_key
++from test.bim.bootstrap import NewIfc
++
++pytestmark = pytest.mark.drawing
++
++
++def type_keys(buffer: TextEditBuffer, *keys: str) -> None:
++    for key in keys:
++        if len(key) == 1:
++            handle_key(buffer, key.upper(), key)
++        else:
++            handle_key(buffer, key)
++
++
++class TestTextEditBuffer:
++    def test_typing_enter_and_tab(self):
++        buffer = TextEditBuffer("")
++        type_keys(buffer, "a", "RET", "TAB", "b")
++        assert buffer.text == "a\n\tb"
++        assert buffer.get_row_column() == (1, 2)
++
++    def test_ctrl_enter_confirms_without_a_new_line(self):
++        buffer = TextEditBuffer("a")
++        assert handle_key(buffer, "RET", ctrl=True) == "CONFIRM"
++        assert handle_key(buffer, "NUMPAD_ENTER", ctrl=True) == "CONFIRM"
++        assert handle_key(buffer, "LEFTMOUSE") == "CONFIRM"
++        assert buffer.text == "a"
++
++    def test_escape_cancels(self):
++        assert handle_key(TextEditBuffer("a"), "ESC") == "CANCEL"
++        assert handle_key(TextEditBuffer("a"), "RIGHTMOUSE") == "CANCEL"
++
++    def test_viewport_navigation_passes_through(self):
++        buffer = TextEditBuffer("a")
++        for key in ("MIDDLEMOUSE", "WHEELUPMOUSE", "MOUSEMOVE", "TRACKPADPAN", "NDOF_MOTION"):
++            assert handle_key(buffer, key) == "PASS_THROUGH"
++        assert buffer.text == "a"
++
++    def test_ctrl_shortcuts_do_not_type(self):
++        buffer = TextEditBuffer("a")
++        assert handle_key(buffer, "S", "s", ctrl=True) == "CONTINUE"
++        assert buffer.text == "a"
++
++    def test_altgr_characters_are_typed(self):
++        buffer = TextEditBuffer("a")
++        handle_key(buffer, "Q", "@", ctrl=True, alt=True)
++        assert buffer.text == "a@"
++
++    def test_backspace_and_delete(self):
++        buffer = TextEditBuffer("ab\ncd", caret=3)
++        handle_key(buffer, "BACK_SPACE")
++        assert (buffer.text, buffer.caret) == ("abcd", 2)
++        handle_key(buffer, "DEL")
++        assert (buffer.text, buffer.caret) == ("abd", 2)
++        buffer = TextEditBuffer("one two  ")
++        handle_key(buffer, "BACK_SPACE", ctrl=True)
++        assert buffer.text == "one "
++        buffer = TextEditBuffer("one two", caret=0)
++        handle_key(buffer, "DEL", ctrl=True)
++        assert buffer.text == " two"
++
++    def test_caret_movement(self):
++        buffer = TextEditBuffer("first\nab\nthird", caret=4)
++        handle_key(buffer, "DOWN_ARROW")
++        assert buffer.get_row_column() == (1, 2)
++        handle_key(buffer, "DOWN_ARROW")
++        assert buffer.get_row_column() == (2, 2)
++        handle_key(buffer, "UP_ARROW")
++        handle_key(buffer, "UP_ARROW")
++        assert buffer.get_row_column() == (0, 2)
++        handle_key(buffer, "UP_ARROW")
++        assert buffer.caret == 0
++        handle_key(buffer, "END")
++        assert buffer.caret == 5
++        handle_key(buffer, "END", ctrl=True)
++        assert buffer.caret == len(buffer.text)
++        handle_key(buffer, "HOME")
++        assert buffer.get_row_column() == (2, 0)
++        handle_key(buffer, "HOME", ctrl=True)
++        assert buffer.caret == 0
++        handle_key(buffer, "RIGHT_ARROW", ctrl=True)
++        assert buffer.caret == 5
++        handle_key(buffer, "LEFT_ARROW")
++        assert buffer.caret == 4
++        handle_key(buffer, "LEFT_ARROW", ctrl=True)
++        assert buffer.caret == 0
++
++    def test_paste_normalises_line_breaks(self):
++        buffer = TextEditBuffer("")
++        handle_key(buffer, "V", ctrl=True, clipboard="a\r\nb\rc")
++        assert buffer.text == "a\nb\nc"
++
++    @pytest.mark.parametrize(
++        "text, caret, key, expected",
++        (
++            ("make it bold", 7, "B", "make **it** bold"),
++            ("make it bold", 5, "B", "make **it** bold"),
++            ("make **it** bold", 11, "B", "make it bold"),
++            ("make **it** bold", 7, "I", "make ***it*** bold"),
++            ("make ***it*** bold", 8, "B", "make *it* bold"),
++            ("make *it* bold", 6, "I", "make it bold"),
++            ("", 0, "B", "****"),
++            ("a ", 2, "I", "a **"),
++        ),
++    )
++    def test_toggle_emphasis(self, text, caret, key, expected):
++        buffer = TextEditBuffer(text, caret=caret)
++        handle_key(buffer, key, ctrl=True)
++        assert buffer.text == expected
++
++    def test_emphasis_on_empty_place_puts_caret_between_markers(self):
++        buffer = TextEditBuffer("a ")
++        handle_key(buffer, "B", ctrl=True)
++        type_keys(buffer, "x")
++        assert buffer.text == "a **x**"
++
++    def test_caret_moves_after_emphasised_word(self):
++        buffer = TextEditBuffer("word", caret=2)
++        handle_key(buffer, "B", ctrl=True)
++        type_keys(buffer, "!")
++        assert buffer.text == "**word**!"
++
++
++class TestWhitespace:
++    def test_split_text_lines_accepts_escaped_and_real_line_breaks(self):
++        assert text_editing.split_text_lines("a\\nb\nc") == ["a", "b", "c"]
++
++    def test_split_indent(self):
++        assert text_editing.split_indent("\tx  y   ") == (4, f"x{NBSP * 2}y")
++        assert text_editing.split_indent("ab\tc") == (0, "ab  c".replace("  ", NBSP * 2))
++
++    def test_preserve_whitespace(self):
++        assert text_editing.preserve_whitespace("  a b") == f"{NBSP * 2}a b"
++        assert text_editing.preserve_whitespace("plain text") == "plain text"
++
++
++class TestParseMarkdownLines:
++    def get_lines(self, text: str) -> list[str]:
++        lines = [""]
++        for segment in parse_markdown_lines(text_editing.split_text_lines(text)):
++            if segment["break"]:
++                lines.append("")
++            else:
++                lines[-1] += segment["text"]
++        return lines
++
++    def test_blank_lines_are_kept(self):
++        assert self.get_lines("A\n\nB") == ["A", "", "B"]
++
++    def test_indented_lines_are_kept(self):
++        assert self.get_lines("A\n\tB\n    C") == ["A", f"{NBSP * 4}B", f"{NBSP * 4}C"]
++
++    def test_lines_are_printed_as_typed(self):
++        text = "# 1\n1. First\n2) Second\n> quoted\n---\n```"
++        assert self.get_lines(text) == ["# 1", "1. First", "2) Second", "> quoted", "---", "```"]
++
++    def test_bullet_points(self):
++        assert self.get_lines("Notes:\n- a\n  - b") == ["Notes:", "\u2022 a", f"{NBSP * 2}\u2022 b"]
++
++    def test_inline_formatting_and_escaped_line_breaks(self):
++        segments = parse_markdown_lines(text_editing.split_text_lines("**bold**\\nnext"))
++        bold = [s["text"] for s in segments if s["bold"]]
++        assert bold == ["bold"]
++        assert self.get_lines("**bold**\\nnext") == ["bold", "next"]
++
++    def test_is_plain_text(self):
++        def is_plain(text):
++            lines = text_editing.split_text_lines(text)
++            return is_plain_text(parse_markdown_lines(lines), lines)
++
++        assert is_plain("plain")
++        assert is_plain("two\\nlines")
++        assert is_plain("tab\tand  spaces")
++        assert is_plain("# not a heading")
++        assert not is_plain("**bold**")
++        assert not is_plain("- bullet")
++        assert not is_plain("[link](https://ifcopenshell.org)")
++
++
++class TestSvgText:
++    @pytest.fixture
++    def writer(self) -> SvgWriter:
++        writer = SvgWriter.__new__(SvgWriter)
++        writer.svg = svgwrite.Drawing(debug=False)
++        return writer
++
++    def test_plain_text_keeps_tabs_and_indentation(self, writer):
++        (text_tag,) = writer.create_text_tag("a\tb\n  c", Vector((0, 0)), text_format=text_editing.preserve_whitespace)
++        assert [t.text for t in text_tag.elements] == [f"a{NBSP * 3}b", f"{NBSP * 2}c"]
++
++    def test_markdown_text_continues_after_previous_literal_lines(self, writer):
++        lines = text_editing.split_text_lines("**A**\n\nB")
++        text_tag, line_count = writer.create_markdown_text_tag(
++            parse_markdown_lines(lines), Vector((0, 0)), 0, "bottom-left", "", line_number_start=2
++        )
++        assert line_count == 3
++        tspans = [t for t in text_tag.elements if t.text]
++        assert [(t.text, t.attribs.get("dy"), t.attribs.get("font-weight")) for t in tspans] == [
++            ("A", "2em", "bold"),
++            ("B", "4em", None),
++        ]
++
++
++class TestViewportTextEdit:
++    def teardown_method(self):
++        ViewportTextEdit.stop()
++
++    def test_caret_is_drawn_only_on_the_edited_literal(self):
++        buffer = TextEditBuffer("ab", caret=1)
++        ViewportTextEdit.start("Text", 1, buffer)
++        assert ViewportTextEdit.is_active()
++        assert ViewportTextEdit.get_displayed_text("Text", 1, "ab") == "a|b"
++        assert ViewportTextEdit.get_displayed_text("Text", 0, "ab") == "ab"
++        assert ViewportTextEdit.get_displayed_text("Other", 1, "ab") == "ab"
++        ViewportTextEdit.stop()
++        assert not ViewportTextEdit.is_active()
++        assert ViewportTextEdit.get_displayed_text("Text", 1, "ab") == "ab"
++
++
++class TestPrintMultilineText(NewIfc):
++    def test_run(self):
++        literal = "First line\n\tIndented\n\n**Bold** end\n1. kept"
++        tool.Project.save_test_project()
++        bpy.ops.bim.load_drawings()
++        bpy.ops.bim.add_drawing()
++        ifc_file = tool.Ifc.get()
++        drawing = next(a for a in ifc_file.by_type("IfcAnnotation") if a.ObjectType == "DRAWING")
++        bpy.ops.bim.activate_drawing(drawing=drawing.id())
++        bpy.ops.bim.add_annotation()
++        obj = bpy.data.objects["IfcAnnotation/TEXT"]
++        bpy.context.view_layer.objects.active = obj
++        assert bpy.ops.bim.edit_text_in_viewport.poll()
++
++        bpy.ops.bim.enable_editing_text()
++        props = tool.Drawing.get_text_props(obj)
++        props.literals[0].attributes["Literal"].string_value = literal
++        bpy.ops.bim.add_text_literal()
++        props.literals[1].attributes["Literal"].string_value = "Second literal"
++        bpy.ops.bim.edit_text()
++
++        path = tool.Project.TEMP_PROJECT_PATH.parent / "multiline_text.ifc"
++        ifc_file.write(str(path))
++        assert literal in [l.Literal for l in ifcopenshell.open(str(path)).by_type("IfcTextLiteral")]
++
++        bpy.ops.bim.create_drawing()
++        (svg_path,) = glob.glob(str(tool.Project.TEMP_PROJECT_PATH.parent / "drawings" / "*.svg"))
++        with open(svg_path, encoding="utf-8") as f:
++            svg = f.read()
++        tspans = re.findall(r'<tspan[^>]*?dy="(\d+)em"[^>]*>(.*?)</tspan>', svg)
++        assert tspans == [
++            ("0", "First line"),
++            ("1", NBSP * 4),
++            ("3", "Bold"),
++            ("4", "1. kept"),
++            ("5", "Second literal"),
++        ]
++        assert "Indented</tspan>" in svg
+-- 
+2.43.0
+

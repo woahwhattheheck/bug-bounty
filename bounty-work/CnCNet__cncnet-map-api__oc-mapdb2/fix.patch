@@ -1,0 +1,1552 @@
+From b41eb412555e9cb9f4f6969ae72441171ce0486d Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 06:04:13 +0000
+Subject: [PATCH] feat: Map browser sorting, filters, downloads, and map
+ editing
+
+MapDB 2.0 map gallery backend features from the "New Map Database & Browser"
+project:
+
+- Count downloads. `CncMap.download_count` (all time) plus per-day
+  `CncMapDownloadStat` rows, incremented with F() expressions so concurrent
+  downloads are all counted. No downloader data is stored.
+- `GET /maps/<id>/download/` (optionally `?version=N`) for the new UI and
+  client integration. The MapDB 1.0 route `/<game>/<sha1>.zip` now counts
+  downloads too, and returns 404 for banned maps.
+- `/maps/search/` sorting: `popular`, `trending` (downloads within
+  MAP_TRENDING_WINDOW_DAYS, default 7), `newest` (new default), `updated`
+  (newest file version), plus name/size fields. Fixes a 500 when ordering by
+  the old `cnc_map_file__*` fields, which don't exist on CncMap.
+- `/maps/search/` filters: `author`, `cnc_user_id`, `category_slug`,
+  `min/max_width`, `min/max_height` (newest file version), and
+  `created_after/before`.
+- `PATCH /maps/<id>/` works now (it raised NotImplementedError). Authors can
+  edit name, description, categories, published and incomplete_upload; staff
+  can also curate with `is_reviewed`. Staff edits of other users' maps are
+  recorded in moderated_by / moderator_notes.
+- `manage.py purge_temporary_maps --days N [--dry-run]` removes old,
+  unused, anonymous lobby uploads and their files. Keeps banned maps and
+  maps that other maps credit as their parent.
+- Docs in docs/map_browser.md.
+---
+ docs/map_browser.md                           |  84 ++++++
+ kirovy/management/__init__.py                 |   0
+ kirovy/management/commands/__init__.py        |   0
+ .../commands/purge_temporary_maps.py          |  97 ++++++
+ ...ncmap_download_count_cncmapdownloadstat.py |  59 ++++
+ kirovy/models/__init__.py                     |   2 +-
+ kirovy/models/cnc_map.py                      |  72 ++++-
+ kirovy/models/moderabile.py                   |  21 ++
+ kirovy/serializers/cnc_map_serializers.py     |  65 +++-
+ kirovy/settings/_base.py                      |   6 +
+ kirovy/urls.py                                |   1 +
+ kirovy/views/cnc_map_views.py                 | 277 ++++++++++++++++--
+ .../test_purge_temporary_maps.py              |  73 +++++
+ tests/test_views/test_map_browser.py          | 216 ++++++++++++++
+ tests/test_views/test_map_download.py         | 141 +++++++++
+ tests/test_views/test_map_edit.py             | 116 ++++++++
+ 16 files changed, 1204 insertions(+), 26 deletions(-)
+ create mode 100644 docs/map_browser.md
+ create mode 100644 kirovy/management/__init__.py
+ create mode 100644 kirovy/management/commands/__init__.py
+ create mode 100644 kirovy/management/commands/purge_temporary_maps.py
+ create mode 100644 kirovy/migrations/0022_cncmap_download_count_cncmapdownloadstat.py
+ create mode 100644 tests/test_commands/test_purge_temporary_maps.py
+ create mode 100644 tests/test_views/test_map_browser.py
+ create mode 100644 tests/test_views/test_map_download.py
+ create mode 100644 tests/test_views/test_map_edit.py
+
+diff --git a/docs/map_browser.md b/docs/map_browser.md
+new file mode 100644
+index 0000000..cb14ead
+--- /dev/null
++++ b/docs/map_browser.md
+@@ -0,0 +1,84 @@
++# Map browser API
++
++Endpoints the map browser UI, and CnCNet clients, use to list, sort, filter, download, and moderate maps.
++
++## Listing and searching maps
++
++`GET /maps/search/`
++
++Results are paginated with `limit` and `offset` (default 30, max 200).
++
++### Sorting
++
++Use `?ordering=`. It takes the aliases below, or field names from `MapListView.ordering_fields`.
++Prefix a field name with `-` for descending order, and separate several fields with commas.
++
++| Alias      | What it does                                                                          |
++|------------|---------------------------------------------------------------------------------------|
++| `newest`   | Newest maps first. This is the default when `ordering` isn't set.                     |
++| `popular`  | Most downloads of all time first.                                                     |
++| `trending` | Most downloads in the last `MAP_TRENDING_WINDOW_DAYS` days (default 7) first.         |
++| `updated`  | Maps with the most recently uploaded file version first.                              |
++
++Field names: `map_name`, `created`, `modified`, `download_count`, `trending_download_count`,
++`latest_file_created`, `latest_file_width`, `latest_file_height`, `id`.
++
++The API ignores unknown fields instead of returning an error. It always adds `id` as a tie-breaker so that pages
++stay stable.
++
++### Filters
++
++| Param                                                  | Example                                     | Notes                                                  |
++|--------------------------------------------------------|---------------------------------------------|--------------------------------------------------------|
++| `search`                                               | `?search=gold`                              | Map name, or the start of the description.             |
++| `game_slug` / `cnc_game`                               | `?game_slug=yr`                             |                                                        |
++| `categories` / `category_slug`                         | `?category_slug=standard&category_slug=koth` | Game modes. Matches maps with **any** of them.         |
++| `author`                                               | `?author=Kane`                              | CnCNet username, case-insensitive.                     |
++| `cnc_user_id`                                          | `?cnc_user_id=<uuid>`                       |                                                        |
++| `min_width`, `max_width`, `min_height`, `max_height`   | `?min_width=100`                            | Uses the newest file version. Excludes legacy uploads. |
++| `created_after`, `created_before`                      | `?created_after=2026-01-01T00:00:00Z`       | ISO 8601.                                              |
++| `is_reviewed`                                          | `?is_reviewed=true`                         | Staff-curated maps.                                    |
++| `include_edits`                                        | `?include_edits=true`                       | Include edits of other maps.                           |
++
++Each result includes `download_count` and `cnc_user_name`, alongside the existing map fields.
++
++## Downloading maps
++
++- `GET /maps/<map_id>/download/` downloads the newest version of the map file.
++- `GET /maps/<map_id>/download/?version=2` downloads a specific version.
++- `GET /<game_slug>/<sha1>.zip` is the MapDB 1.0 compatible download for legacy clients. It's unchanged, except that
++  it now returns `404` for banned maps.
++
++Both download routes count the download. Counting updates `CncMap.download_count` (all time, for `popular`) and
++`CncMapDownloadStat`, which keeps one row per map per day (for `trending`). Counters are incremented with `F()`
++expressions, so concurrent downloads don't overwrite each other, and nothing about the downloader is stored.
++
++## Editing and moderation
++
++`PATCH /maps/<map_id>/` edits a map. Map authors can edit their own maps unless the map is banned.
++Staff can edit any map.
++
++- Editable fields are `map_name`, `description`, `category_ids`, `is_published`, and `incomplete_upload`.
++- Only staff can set `is_reviewed`, which is used for curated map lists.
++- Staff hide a map by setting `is_published` to false, or by banning it with `POST /admin/ban/`.
++- When staff edit someone else's map, the map's `moderated_by` and `moderator_notes` are updated.
++- Staff delete maps with `DELETE /maps/delete/<map_id>/`.
++
++## Cleaning up temporary lobby uploads
++
++Maps that CnCNet clients share in lobbies are uploaded anonymously and flagged `is_temporary`. To remove the ones
++that are no longer used:
++
++```shell
++python manage.py purge_temporary_maps --days 90 --dry-run
++python manage.py purge_temporary_maps --days 90
++```
++
++The command only deletes a map if all of these are true:
++
++- It was uploaded more than `--days` days ago.
++- It hasn't been downloaded in that window.
++- It isn't banned. Banned maps are kept so their hashes keep blocking re-uploads.
++- No other map lists it as its parent.
++
++The command also deletes the map's files from storage. Nothing schedules it, so it only runs when someone runs it.
+diff --git a/kirovy/management/__init__.py b/kirovy/management/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/kirovy/management/commands/__init__.py b/kirovy/management/commands/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/kirovy/management/commands/purge_temporary_maps.py b/kirovy/management/commands/purge_temporary_maps.py
+new file mode 100644
+index 0000000..0fd0520
+--- /dev/null
++++ b/kirovy/management/commands/purge_temporary_maps.py
+@@ -0,0 +1,97 @@
++"""Delete temporary maps that were shared through CnCNet client lobbies and are no longer being used.
++
++Maps uploaded by the CnCNet client (anonymous lobby shares) are flagged with
++:attr:`kirovy.models.cnc_map.CncMap.is_temporary`. MapDB 2.0 doesn't need to keep them forever;
++map authors who want a permanent copy upload their map with a CnCNet account.
++
++Usage::
++
++    python manage.py purge_temporary_maps --days 90 --dry-run
++    python manage.py purge_temporary_maps --days 90
++
++A temporary map is purged when **all** of these are true:
++
++- It was uploaded more than ``--days`` days ago.
++- It hasn't been downloaded within the last ``--days`` days (so maps still being played survive).
++- It isn't banned. Banned maps are kept so that their hashes keep blocking re-uploads.
++- It isn't a legacy map, and no other map lists it as its parent (so edits keep their credit).
++"""
++
++import datetime
++
++from django.core.management.base import BaseCommand, CommandError
++from django.db import transaction
++from django.db.models import Exists, OuterRef, QuerySet
++from django.utils import timezone
++
++from kirovy import logging
++from kirovy.models import CncMap
++
++_LOGGER = logging.get_logger(__name__)
++
++
++def get_purgeable_temporary_maps(days: int, now: datetime.datetime | None = None) -> QuerySet[CncMap]:
++    """Get the temporary maps that are old enough, and unused enough, to delete.
++
++    :param days:
++        Maps must be older than this, and not downloaded within this many days.
++    :param now:
++        Override the current time for tests.
++    :return:
++        The maps that can be purged.
++    """
++    now = now or timezone.now()
++    cutoff = now - datetime.timedelta(days=days)
++    child_maps = CncMap.objects.filter(parent_id=OuterRef("pk"))
++    return (
++        CncMap.objects.filter(is_temporary=True, is_legacy=False, is_banned=False, created__lt=cutoff)
++        .exclude(download_stats__date__gte=cutoff.date())
++        .exclude(Exists(child_maps))
++    )
++
++
++def purge_map(cnc_map: CncMap) -> None:
++    """Delete a map, its files, and its images, including the files on disk."""
++    with transaction.atomic():
++        stored_files = [*cnc_map.cncmapfile_set.all(), *cnc_map.cncmapimagefile_set.all()]
++        cnc_map.delete()
++        # Only remove files from storage once the database rows are gone.
++        transaction.on_commit(lambda: [f.file.delete(save=False) for f in stored_files if f.file])
++
++
++class Command(BaseCommand):
++    help = "Delete temporary (CnCNet client lobby) map uploads that are old and haven't been downloaded recently."
++
++    def add_arguments(self, parser) -> None:
++        parser.add_argument(
++            "--days",
++            type=int,
++            required=True,
++            help="Purge temporary maps uploaded more than this many days ago that weren't downloaded in this window.",
++        )
++        parser.add_argument(
++            "--dry-run",
++            action="store_true",
++            help="Only print how many maps would be purged.",
++        )
++
++    def handle(self, *args, days: int, dry_run: bool, **options) -> None:
++        if days < 1:
++            raise CommandError("--days must be at least 1")
++
++        purgeable = get_purgeable_temporary_maps(days)
++        count = purgeable.count()
++        if dry_run:
++            self.stdout.write(f"{count} temporary maps would be purged.")
++            return
++
++        purged = 0
++        # Grab the IDs up front so that we aren't deleting rows out from under an open cursor.
++        for map_id in list(purgeable.values_list("id", flat=True)):
++            cnc_map = CncMap.objects.filter(id=map_id).first()
++            if cnc_map:
++                purge_map(cnc_map)
++                purged += 1
++
++        _LOGGER.info("purged_temporary_maps", purged=purged, days=days)
++        self.stdout.write(f"Purged {purged} temporary maps.")
+diff --git a/kirovy/migrations/0022_cncmap_download_count_cncmapdownloadstat.py b/kirovy/migrations/0022_cncmap_download_count_cncmapdownloadstat.py
+new file mode 100644
+index 0000000..bea36c0
+--- /dev/null
++++ b/kirovy/migrations/0022_cncmap_download_count_cncmapdownloadstat.py
+@@ -0,0 +1,59 @@
++# Generated by Django 4.2.30 on 2026-10-08 05:58
++
++from django.conf import settings
++from django.db import migrations, models
++import django.db.models.deletion
++import uuid
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ("kirovy", "0021_remove_cncmapfile_kirovy_cncm_cnc_map_a1e8af_idx_and_more"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="cncmap",
++            name="download_count",
++            field=models.PositiveIntegerField(
++                db_index=True,
++                default=0,
++                help_text="Total number of times any file for this map has been downloaded. Used for 'popular' sorting.",
++            ),
++        ),
++        migrations.CreateModel(
++            name="CncMapDownloadStat",
++            fields=[
++                (
++                    "id",
++                    models.UUIDField(
++                        db_index=True, default=uuid.uuid4, editable=False, primary_key=True, serialize=False
++                    ),
++                ),
++                ("created", models.DateTimeField(auto_now_add=True, null=True)),
++                ("modified", models.DateTimeField(auto_now=True, null=True)),
++                ("date", models.DateField()),
++                ("download_count", models.PositiveIntegerField(default=0)),
++                (
++                    "cnc_map",
++                    models.ForeignKey(
++                        on_delete=django.db.models.deletion.CASCADE, related_name="download_stats", to="kirovy.cncmap"
++                    ),
++                ),
++                (
++                    "last_modified_by",
++                    models.ForeignKey(
++                        null=True,
++                        on_delete=django.db.models.deletion.SET_NULL,
++                        related_name="modified_%(class)s_set",
++                        to=settings.AUTH_USER_MODEL,
++                    ),
++                ),
++            ],
++        ),
++        migrations.AddConstraint(
++            model_name="cncmapdownloadstat",
++            constraint=models.UniqueConstraint(fields=("cnc_map", "date"), name="unique_map_download_date"),
++        ),
++    ]
+diff --git a/kirovy/models/__init__.py b/kirovy/models/__init__.py
+index afdeaed..1fb06f5 100644
+--- a/kirovy/models/__init__.py
++++ b/kirovy/models/__init__.py
+@@ -3,7 +3,7 @@ import typing
+ from django.db.models import Model
+ 
+ from .cnc_game import CncGame, CncFileExtension
+-from .cnc_map import CncMap, CncMapFile, MapCategory
++from .cnc_map import CncMap, CncMapFile, MapCategory, CncMapDownloadStat
+ from .cnc_user import CncUser
+ from .file_base import CncNetFileBaseModel
+ from .map_preview import MapPreview
+diff --git a/kirovy/models/cnc_map.py b/kirovy/models/cnc_map.py
+index f9a065d..a79a8ee 100644
+--- a/kirovy/models/cnc_map.py
++++ b/kirovy/models/cnc_map.py
+@@ -1,9 +1,10 @@
++import datetime
+ import pathlib
+ from uuid import UUID
+ 
+ from django.conf import settings
+-from django.db import models
+-from django.utils import text as text_utils
++from django.db import models, transaction, IntegrityError
++from django.utils import text as text_utils, timezone
+ 
+ from kirovy.models import file_base
+ from kirovy.models import cnc_game as game_models, cnc_user
+@@ -115,6 +116,35 @@ class CncMap(GameScopedUserOwnedModel, Moderabile):
+     This should never be set for maps uploaded via the web UI.
+     """
+ 
++    download_count = models.PositiveIntegerField(
++        default=0,
++        db_index=True,
++        help_text="Total number of times any file for this map has been downloaded. Used for 'popular' sorting.",
++    )
++    """:attr:
++        All-time download counter. Only ever modified via :meth:`~kirovy.models.cnc_map.CncMap.record_download`,
++        which uses ``F()`` expressions so that concurrent downloads don't clobber each other.
++
++        Per-day counts, used for "trending" sorting, live in :class:`~kirovy.models.cnc_map.CncMapDownloadStat`.
++    """
++
++    def record_download(self, download_date: datetime.date | None = None) -> None:
++        """Count a download of this map.
++
++        Increments the all-time :attr:`~kirovy.models.cnc_map.CncMap.download_count` and the per-day
++        :class:`~kirovy.models.cnc_map.CncMapDownloadStat` row for ``download_date``.
++
++        Both counters are updated with ``F()`` expressions so that concurrent downloads are all counted.
++        ``self.download_count`` is **not** refreshed; call ``refresh_from_db`` if you need the new value.
++
++        :param download_date:
++            The day to count the download for. Defaults to today in UTC.
++        """
++        download_date = download_date or timezone.now().date()
++        with transaction.atomic():
++            CncMap.objects.filter(id=self.id).update(download_count=models.F("download_count") + 1)
++            CncMapDownloadStat.increment(self.id, download_date)
++
+     def next_version_number(self) -> int:
+         """Generate the next version to use for a map file.
+ 
+@@ -154,6 +184,44 @@ class CncMap(GameScopedUserOwnedModel, Moderabile):
+             raise exceptions.BanException("legacy-maps-cannot-be-banned")
+ 
+ 
++class CncMapDownloadStat(CncNetBaseModel):
++    """Per-day download counts for a map.
++
++    We store one row per map per day, rather than one row per download, so that the table stays small
++    and we don't need to store anything about the person downloading the map.
++
++    Used to sort maps by "trending", i.e. the most downloads within the last
++    :attr:`~kirovy.settings._base.MAP_TRENDING_WINDOW_DAYS` days.
++    """
++
++    cnc_map = models.ForeignKey(CncMap, on_delete=models.CASCADE, null=False, related_name="download_stats")
++    date = models.DateField(null=False)
++    download_count = models.PositiveIntegerField(default=0)
++
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=["cnc_map", "date"], name="unique_map_download_date"),
++        ]
++
++    @classmethod
++    def increment(cls, cnc_map_id: UUID, download_date: datetime.date) -> None:
++        """Add one download to the row for ``cnc_map_id`` on ``download_date``, creating the row if needed.
++
++        Safe to call concurrently. If two requests race to create the row for the day, the loser of the race
++        falls back to incrementing the row the winner created.
++        """
++        row_filter = cls.objects.filter(cnc_map_id=cnc_map_id, date=download_date)
++        if row_filter.update(download_count=models.F("download_count") + 1):
++            return
++
++        try:
++            with transaction.atomic():
++                cls.objects.create(cnc_map_id=cnc_map_id, date=download_date, download_count=1)
++        except IntegrityError:
++            # Another request created the row between our update and our create.
++            row_filter.update(download_count=models.F("download_count") + 1)
++
++
+ class CncMapFileManager(models.Manager["CncMapFile"]):
+     def find_legacy_map_by_sha1(self, sha1: str, game_id: UUID) -> t.Union["CncMapFile", None]:
+         return (
+diff --git a/kirovy/models/moderabile.py b/kirovy/models/moderabile.py
+index b648274..35a65dc 100644
+--- a/kirovy/models/moderabile.py
++++ b/kirovy/models/moderabile.py
+@@ -106,6 +106,27 @@ class Moderabile(models.Model):
+             update_fields=["moderated_by", "is_banned", "ban_reason", "ban_date", "ban_expires", "moderator_notes"]
+         )
+ 
++    def record_moderator_action(self, moderated_by: "CncUser", action: str, note: str) -> None:
++        """Record a moderation action that isn't a ban, e.g. a moderator editing someone else's map.
++
++        Sets :attr:`~kirovy.models.moderabile.Moderabile.moderated_by` and appends a line to the moderator notes.
++
++        :param moderated_by:
++            The moderator who performed the action.
++        :param action:
++            Short name for the action, e.g. "Edited".
++        :param note:
++            Details about the action.
++        :return:
++            Nothing. The instance will be updated.
++        """
++        self.moderated_by = moderated_by
++        moderator_note = self._moderator_note_line(
++            action, datetime.datetime.now(datetime.timezone.utc), note, moderated_by
++        )
++        self.moderator_notes = (self.moderator_notes or "") + moderator_note
++        self.save(update_fields=["moderated_by", "moderator_notes"])
++
+     @staticmethod
+     def _moderator_note_line(
+         action: str, action_date: datetime.datetime, action_reason: str, moderated_by: "CncUser"
+diff --git a/kirovy/serializers/cnc_map_serializers.py b/kirovy/serializers/cnc_map_serializers.py
+index 1e58bcf..4f71e4d 100644
+--- a/kirovy/serializers/cnc_map_serializers.py
++++ b/kirovy/serializers/cnc_map_serializers.py
+@@ -1,6 +1,8 @@
+ from kirovy.exceptions.view_exceptions import KirovyValidationError
++from kirovy.request import KirovyRequest
+ from kirovy.serializers import KirovySerializer, CncNetUserOwnedModelSerializer
+ from rest_framework import serializers
++from rest_framework.exceptions import PermissionDenied
+ from kirovy import typing as t
+ from kirovy.models import cnc_map, CncGame, MapCategory, CncFileExtension, CncUser
+ 
+@@ -203,10 +205,15 @@ class CncMapBaseSerializer(CncNetUserOwnedModelSerializer):
+     )
+     category_ids = serializers.PrimaryKeyRelatedField(
+         source="categories",
++        queryset=MapCategory.objects.all(),
+         pk_field=serializers.UUIDField(),
+         many=True,
+-        read_only=True,  # Set it manually.
++        required=False,
+     )
++    """attr: The categories (game modes) for the map.
++
++    Set from the map file's game modes on upload. Map authors and staff can change them with ``PATCH``.
++    """
+     is_published = serializers.BooleanField(
+         default=False,
+     )
+@@ -214,8 +221,10 @@ class CncMapBaseSerializer(CncNetUserOwnedModelSerializer):
+     # This field is only set via client uploads.
+     is_temporary = serializers.BooleanField(read_only=True)
+ 
+-    # These fields are only available for admins to set.
+-    is_reviewed = serializers.BooleanField(read_only=True)
++    is_reviewed = serializers.BooleanField(required=False)
++    """attr: Staff-curated flag. Only staff can set this, see :attr:`CncMapBaseSerializer.STAFF_ONLY_FIELDS`."""
++
++    # Banning goes through ``/admin/ban/`` so that moderator notes are kept.
+     is_banned = serializers.BooleanField(read_only=True)
+ 
+     # Legacy maps will be added via the legacy serializer.
+@@ -246,11 +255,40 @@ class CncMapBaseSerializer(CncNetUserOwnedModelSerializer):
+     game_slug = serializers.SerializerMethodField()
+     created_date = serializers.DateTimeField("%Y-%m-%d", source="created", read_only=True)
+ 
++    download_count = serializers.IntegerField(read_only=True)
++    """attr: All-time download count. Maintained by :meth:`kirovy.models.cnc_map.CncMap.record_download`."""
++
++    cnc_user_name = serializers.CharField(source="cnc_user.username", read_only=True, allow_null=True)
++    """attr: The CnCNet username of the map author, so the map browser can show and filter by author."""
++
++    STAFF_ONLY_FIELDS: t.ClassVar[set[str]] = {"is_reviewed"}
++    """attr: Writable fields that only staff (moderators, admins, gods) may set."""
++
+     class Meta:
+         model = cnc_map.CncMap
+         # We return the ID instead of the whole object.
+         exclude = ["cnc_game", "categories", "parent", "cnc_map_files"]
+         fields = "__all__"
++        editable_fields: set[str] = {
++            "map_name",
++            "description",
++            "is_published",
++            "incomplete_upload",
++            "categories",
++            "is_reviewed",
++        }
++        """attr: The fields that can be changed via ``PATCH`` after a map has been created.
++
++        These are the model attribute names, e.g. ``categories`` rather than ``category_ids``.
++        """
++
++    def validate(self, attrs: t.DictStrAny) -> t.DictStrAny:
++        attrs = super().validate(attrs)
++        request: KirovyRequest | None = self.context.get("request")
++        is_staff = bool(request and request.user.is_authenticated and request.user.is_staff)
++        if not is_staff and (attempted := self.STAFF_ONLY_FIELDS.intersection(attrs.keys())):
++            raise PermissionDenied(f"Only staff can set: {', '.join(sorted(attempted))}")
++        return attrs
+ 
+     def get_latest_map_file_hash(self, obj: cnc_map.CncMap) -> t.Optional[str]:
+         if latest := obj.cncmapfile_set.order_by("-version").first():
+@@ -261,6 +299,27 @@ class CncMapBaseSerializer(CncNetUserOwnedModelSerializer):
+         return obj.cnc_game.slug
+ 
+     def create(self, validated_data: t.DictStrAny) -> cnc_map.CncMap:
++        categories = validated_data.pop("categories", None)
+         cnc_map_instance = cnc_map.CncMap(**validated_data)
+         cnc_map_instance.save()
++        if categories is not None:
++            cnc_map_instance.categories.set(categories)
+         return cnc_map_instance
++
++    def update(self, instance: cnc_map.CncMap, validated_data: t.DictStrAny) -> cnc_map.CncMap:
++        """Update a map. Only :attr:`CncMapBaseSerializer.Meta.editable_fields` can get here.
++
++        Saves with ``update_fields`` so that we never overwrite counters, like ``download_count``,
++        with the stale values on ``instance``.
++        """
++        categories = validated_data.pop("categories", None)
++        for attr, value in validated_data.items():
++            setattr(instance, attr, value)
++
++        update_fields = [*validated_data.keys(), "modified"]
++        instance.save(update_fields=update_fields)
++
++        if categories is not None:
++            instance.categories.set(categories)
++
++        return instance
+diff --git a/kirovy/settings/_base.py b/kirovy/settings/_base.py
+index fccedf1..c8dc0a0 100644
+--- a/kirovy/settings/_base.py
++++ b/kirovy/settings/_base.py
+@@ -193,6 +193,12 @@ CNC_MAP_IMAGE_DIRECTORY = "map_images"
+     Example: ``/data/cncnet_silo/yr/map_images/
+ """
+ 
++MAP_TRENDING_WINDOW_DAYS = get_env_var("MAP_TRENDING_WINDOW_DAYS", 7, value_type=int)
++"""attr: How many days of downloads count towards a map's "trending" score in the map browser.
++
++See :class:`kirovy.models.cnc_map.CncMapDownloadStat`.
++"""
++
+ 
+ ### --------------- SERVING FILES ---------------
+ ### This section of settings has to do with serving files
+diff --git a/kirovy/urls.py b/kirovy/urls.py
+index 1563224..e62897a 100644
+--- a/kirovy/urls.py
++++ b/kirovy/urls.py
+@@ -115,6 +115,7 @@ map_patterns = [
+     path("upload/", map_upload_views.MapFileUploadView.as_view()),
+     path("client/upload/", map_upload_views.CncnetClientMapUploadView.as_view()),
+     path("<uuid:pk>/", cnc_map_views.MapRetrieveUpdateView.as_view()),
++    path("<uuid:pk>/download/", cnc_map_views.MapDownloadView.as_view()),
+     path("delete/<uuid:pk>/", cnc_map_views.MapDeleteView.as_view()),
+     path("search/", cnc_map_views.MapListView.as_view()),
+     path("img/", map_image_views.MapImageFileUploadView.as_view()),
+diff --git a/kirovy/views/cnc_map_views.py b/kirovy/views/cnc_map_views.py
+index b3efdc2..e928696 100644
+--- a/kirovy/views/cnc_map_views.py
++++ b/kirovy/views/cnc_map_views.py
+@@ -1,22 +1,27 @@
++import datetime
+ import pathlib
+ from uuid import UUID
+ 
+-from django.db.models import Q, QuerySet
++from django.conf import settings
++from django.db.models import Q, QuerySet, OuterRef, Subquery, Sum, Value, IntegerField
++from django.db.models.functions import Coalesce
+ from django.http import FileResponse
++from django.utils import timezone
+ from rest_framework import status
+-from rest_framework.exceptions import PermissionDenied
++from rest_framework.exceptions import PermissionDenied, NotFound
+ from rest_framework.filters import SearchFilter, OrderingFilter
+ from django_filters import rest_framework as filters
+ from rest_framework.permissions import AllowAny
+ from rest_framework.renderers import TemplateHTMLRenderer
+ 
+-from kirovy import permissions
++from kirovy import permissions, typing as t
+ from kirovy.models import (
+     MapCategory,
+     CncGame,
+     CncMap,
+     CncMapFile,
+ )
++from kirovy.models.cnc_map import CncMapDownloadStat
+ from kirovy.objects import ui_objects
+ from kirovy.request import KirovyRequest
+ from kirovy.response import KirovyResponse
+@@ -29,6 +34,93 @@ from kirovy.views.base_views import KirovyApiView
+ _LOGGER = get_logger(__name__)
+ 
+ 
++def get_maps_visible_to_request(request: KirovyRequest) -> QuerySet[CncMap]:
++    """Get the maps that the requesting user is allowed to view or download.
++
++    Who can view what:
++
++        -   Staff: can view everything
++        -   Anyone: Can view published, legacy, or temporary (cncnet client uploaded) maps.
++            Banned maps will be excluded.
++        -   Registered Users: Can view their own maps even if the map is banned.
++
++    :param request:
++        The current request.
++    :return:
++        The maps that the user is allowed to see.
++    """
++    if request.user.is_staff:
++        # Staff users can see everything.
++        return CncMap.objects.filter()
++
++    # Anyone can view legacy maps, temporary maps (cncnet client uploads) and published maps that aren't banned.
++    queryset: QuerySet[CncMap] = CncMap.objects.filter(
++        Q(Q(is_published=True) | Q(is_legacy=True) | Q(is_temporary=True)) & Q(is_banned=False)
++    )
++
++    if request.user.is_authenticated:
++        # Users can view their own maps in addition to the normal set.
++        # User can view their own maps even if the map was banned.
++        return queryset | CncMap.objects.filter(cnc_user_id=request.user.id)
++
++    return queryset
++
++
++def annotate_latest_map_file(queryset: QuerySet[CncMap]) -> QuerySet[CncMap]:
++    """Annotate maps with info from their newest map file version.
++
++    Adds ``latest_file_created``, ``latest_file_width``, and ``latest_file_height``.
++    Uses subqueries, rather than joins, so that maps with many versions don't show up multiple times
++    and don't skew the other aggregates.
++
++    Safe to call more than once on the same queryset.
++    """
++    if "latest_file_created" in queryset.query.annotations:
++        return queryset
++
++    latest_file = CncMapFile.objects.filter(cnc_map_id=OuterRef("pk")).order_by("-version")
++    return queryset.annotate(
++        latest_file_created=Subquery(latest_file.values("created")[:1]),
++        latest_file_width=Subquery(latest_file.values("width")[:1]),
++        latest_file_height=Subquery(latest_file.values("height")[:1]),
++    )
++
++
++def annotate_trending_download_count(
++    queryset: QuerySet[CncMap], window_days: int | None = None, today: datetime.date | None = None
++) -> QuerySet[CncMap]:
++    """Annotate maps with ``trending_download_count``, the downloads within the trending window.
++
++    Safe to call more than once on the same queryset.
++
++    :param queryset:
++        The maps to annotate.
++    :param window_days:
++        How many days, including today, count toward the trending score.
++        Defaults to :attr:`~kirovy.settings._base.MAP_TRENDING_WINDOW_DAYS`.
++    :param today:
++        Override "today" for tests. Defaults to today in UTC.
++    """
++    if "trending_download_count" in queryset.query.annotations:
++        return queryset
++
++    window_days = window_days or settings.MAP_TRENDING_WINDOW_DAYS
++    today = today or timezone.now().date()
++    window_start = today - datetime.timedelta(days=window_days - 1)
++    downloads_in_window = (
++        CncMapDownloadStat.objects.filter(cnc_map_id=OuterRef("pk"), date__gte=window_start)
++        .order_by()
++        .values("cnc_map_id")
++        .annotate(total=Sum("download_count"))
++        .values("total")
++    )
++    return queryset.annotate(
++        trending_download_count=Coalesce(
++            Subquery(downloads_in_window, output_field=IntegerField()), Value(0), output_field=IntegerField()
++        )
++    )
++
++
+ class MapCategoryListCreateView(base_views.KirovyListCreateView):
+     """Endpoint to list available map categories, or create a new category."""
+ 
+@@ -59,10 +151,50 @@ class MapListFilters(filters.FilterSet):
+     )
+     game_slug = filters.CharFilter(field_name="cnc_game__slug")
+ 
++    category_slug = filters.ModelMultipleChoiceFilter(
++        field_name="categories__slug", to_field_name="slug", queryset=MapCategory.objects.all()
++    )
++    """attr: Filter by category (game mode) slug, e.g. ``?category_slug=standard&category_slug=koth``.
++
++    Matches maps that have **any** of the given categories, the same as ``categories``.
++    """
++
++    cnc_user_id = filters.UUIDFilter(field_name="cnc_user_id")
++    """attr: Only show maps uploaded by this Kirovy user."""
++
++    author = filters.CharFilter(field_name="cnc_user__username", lookup_expr="iexact")
++    """attr: Only show maps uploaded by the CnCNet user with this username. Case-insensitive."""
++
++    min_width = filters.NumberFilter(method="filter_latest_file_size")
++    max_width = filters.NumberFilter(method="filter_latest_file_size")
++    min_height = filters.NumberFilter(method="filter_latest_file_size")
++    max_height = filters.NumberFilter(method="filter_latest_file_size")
++    """attr: Map size filters, in cells. Checked against the newest version of the map file.
++
++    Maps uploaded by legacy clients don't have their size parsed, so they are excluded by any size filter.
++    """
++
++    created_after = filters.IsoDateTimeFilter(field_name="created", lookup_expr="gte")
++    created_before = filters.IsoDateTimeFilter(field_name="created", lookup_expr="lte")
++
++    _SIZE_FILTER_LOOKUPS: t.ClassVar[t.Dict[str, str]] = {
++        "min_width": "latest_file_width__gte",
++        "max_width": "latest_file_width__lte",
++        "min_height": "latest_file_height__gte",
++        "max_height": "latest_file_height__lte",
++    }
++
+     class Meta:
+         model = CncMap
+         fields = ["is_legacy", "is_reviewed", "parent", "categories"]
+ 
++    def filter_latest_file_size(self, queryset: QuerySet[CncMap], name: str, value: int) -> QuerySet[CncMap]:
++        """Filter maps by the width / height of their newest map file."""
++        if value is None:
++            return queryset
++        queryset = annotate_latest_map_file(queryset)
++        return queryset.filter(**{self._SIZE_FILTER_LOOKUPS[name]: value})
++
+     def filter_include_map_edits(self, queryset: QuerySet[CncMap], name: str, value: bool) -> QuerySet[CncMap]:
+         """We will exclude maps that are edits of other maps by default.
+ 
+@@ -121,9 +253,66 @@ class MapListFilters(filters.FilterSet):
+     #     return queryset | CncMap.objects.filter(cnc_game__parent_game__in=)
+ 
+ 
++class MapOrderingFilter(OrderingFilter):
++    """Ordering for the map browser.
++
++    Supports the regular DRF syntax, e.g. ``?ordering=-download_count,map_name``, plus some
++    aliases for the map browser's sort dropdown:
++
++    - ``popular``: most downloads of all time.
++    - ``trending``: most downloads within :attr:`~kirovy.settings._base.MAP_TRENDING_WINDOW_DAYS`.
++    - ``newest``: newest maps first.
++    - ``updated``: maps with the most recently uploaded file version first.
++
++    The annotations needed for the computed orderings are only added when they're requested,
++    and ``id`` is always appended as a tie-breaker so that pagination is stable.
++    """
++
++    ORDERING_ALIASES: t.ClassVar[t.Dict[str, t.List[str]]] = {
++        "popular": ["-download_count", "-created"],
++        "trending": ["-trending_download_count", "-download_count", "-created"],
++        "newest": ["-created"],
++        "updated": ["-latest_file_created", "-created"],
++    }
++
++    _LATEST_FILE_FIELDS: t.ClassVar[t.Set[str]] = {"latest_file_created", "latest_file_width", "latest_file_height"}
++
++    def get_ordering(self, request, queryset, view) -> t.List[str] | None:
++        params = request.query_params.get(self.ordering_param)
++        if params:
++            fields: t.List[str] = []
++            for param in params.split(","):
++                param = param.strip()
++                fields.extend(self.ORDERING_ALIASES.get(param, [param]))
++            ordering = self.remove_invalid_fields(queryset, fields, view, request)
++            if ordering:
++                return ordering
++
++        return self.get_default_ordering(view)
++
++    def filter_queryset(self, request, queryset: QuerySet[CncMap], view) -> QuerySet[CncMap]:
++        ordering = self.get_ordering(request, queryset, view)
++        if not ordering:
++            return queryset
++
++        ordered_names = {term.lstrip("-") for term in ordering}
++        if ordered_names & self._LATEST_FILE_FIELDS:
++            queryset = annotate_latest_map_file(queryset)
++        if "trending_download_count" in ordered_names:
++            queryset = annotate_trending_download_count(queryset)
++
++        if "id" not in ordered_names:
++            ordering = [*ordering, "id"]
++
++        return queryset.order_by(*ordering)
++
++
+ class MapListView(base_views.KirovyListCreateView):
+     """
+     The view for maps.
++
++    Filtering is defined in :class:`~kirovy.views.cnc_map_views.MapListFilters`,
++    sorting is defined in :class:`~kirovy.views.cnc_map_views.MapOrderingFilter`.
+     """
+ 
+     http_method_names = ["get"]
+@@ -164,7 +353,7 @@ class MapListView(base_views.KirovyListCreateView):
+     filter_backends = [
+         filters.DjangoFilterBackend,  # filter first to reduce the count of rows that we full text search on.
+         SearchFilter,
+-        OrderingFilter,
++        MapOrderingFilter,
+     ]
+     filterset_class = MapListFilters
+ 
+@@ -186,15 +375,25 @@ class MapListView(base_views.KirovyListCreateView):
+ 
+     ordering_fields = [
+         "map_name",
+-        "cnc_map_file__created",  # For finding maps with new file versions.
+-        "cnc_map_file__width",
+-        "cnc_map_file__height",
++        "created",
++        "modified",
++        "download_count",  # "popular"
++        "trending_download_count",  # "trending", annotated by MapOrderingFilter.
++        "latest_file_created",  # For finding maps with new file versions. Annotated by MapOrderingFilter.
++        "latest_file_width",
++        "latest_file_height",
++        "id",
+     ]
+     """
+     attr: The fields we will sort ordering by.
+     `Docs <https://www.django-rest-framework.org/api-guide/filtering/#orderingfilter>`_
++
++    Aliases like ``?ordering=trending`` are defined in :attr:`MapOrderingFilter.ORDERING_ALIASES`.
+     """
+ 
++    ordering = ["-created"]
++    """attr: Newest maps first if the UI doesn't specify an ordering."""
++
+     serializer_class = cnc_map_serializers.CncMapBaseSerializer
+ 
+ 
+@@ -215,26 +414,61 @@ class MapRetrieveUpdateView(base_views.KirovyRetrieveUpdateView):
+                 any modification attempts.
+ 
+         Editing permissions are controlled via :class:`kirovy.permissions.CanEdit`.
++        The fields that can be edited are controlled by
++        :attr:`kirovy.serializers.cnc_map_serializers.CncMapBaseSerializer.Meta.editable_fields`.
+ 
+         View permissions are controlled via :class:`kirovy.permissions.ReadOnly`.
+ 
+         :return:
+         """
+-        if self.request.user.is_staff:
+-            # Staff users can see everything.
+-            return CncMap.objects.filter()
++        return get_maps_visible_to_request(self.request)
+ 
+-        # Anyone can view legacy maps, temporary maps (cncnet client uploads) and published maps that aren't banned.
+-        queryset: QuerySet[CncMap] = CncMap.objects.filter(
+-            Q(Q(is_published=True) | Q(is_legacy=True) | Q(is_temporary=True)) & Q(is_banned=False)
+-        )
++    def perform_update(self, serializer: cnc_map_serializers.CncMapBaseSerializer) -> None:
++        """Save the edit and keep a moderation trail when staff edit someone else's map."""
++        user = self.request.user
++        cnc_map: CncMap = serializer.instance
++        is_moderator_edit = user.is_staff and cnc_map.cnc_user_id != user.id
++        changed_fields = sorted(serializer.validated_data.keys())
+ 
+-        if self.request.user.is_authenticated:
+-            # Users can view their own maps in addition to the normal set.
+-            # User can view their own maps even if the map was banned.
+-            return queryset | CncMap.objects.filter(cnc_user_id=self.request.user.id)
++        serializer.save(last_modified_by=user)
+ 
+-        return queryset
++        if is_moderator_edit:
++            cnc_map.record_moderator_action(user, "Edited", f"fields: {', '.join(changed_fields)}")
++
++
++class MapDownloadView(KirovyApiView):
++    """Download a map file and count the download for the map browser's popular / trending sorting.
++
++    ``GET /maps/<map_id>/download/`` returns the newest version of the map file.
++    ``GET /maps/<map_id>/download/?version=2`` returns a specific version.
++
++    Visibility follows the map detail endpoint: banned maps are only downloadable by their owner and staff.
++    """
++
++    permission_classes = [AllowAny]
++
++    def get(self, request: KirovyRequest, pk: UUID, format=None) -> FileResponse:
++        cnc_map: CncMap | None = get_maps_visible_to_request(request).filter(id=pk).first()
++        if not cnc_map:
++            raise NotFound("map-not-found")
++
++        map_files = CncMapFile.objects.filter(cnc_map_id=cnc_map.id)
++        version = request.query_params.get("version")
++        if version:
++            if not version.isdigit():
++                raise NotFound("map-version-not-found")
++            map_file = map_files.filter(version=int(version)).first()
++        else:
++            map_file = map_files.order_by("-version").first()
++
++        if not map_file:
++            raise NotFound("map-version-not-found")
++
++        cnc_map.record_download()
++
++        return FileResponse(
++            map_file.file.open("rb"), as_attachment=True, filename=pathlib.Path(map_file.file.name).name
++        )
+ 
+ 
+ class MapDeleteView(base_views.KirovyDestroyView):
+@@ -266,9 +500,12 @@ class BackwardsCompatibleMapView(KirovyApiView):
+         sha1_hash = pathlib.Path(sha1_hash_filename).stem
+         _LOGGER.debug("Attempted backwards compatible download", av={"sha1": sha1_hash, "game": str(game_id)})
+         map_file = CncMapFile.objects.find_legacy_map_by_sha1(sha1_hash, game_id)
+-        if not map_file:
++        if not map_file or map_file.cnc_map.is_banned:
++            # Banned maps (e.g. cheat maps shared in lobbies) must not be served to legacy clients either.
+             return KirovyResponse(status=status.HTTP_404_NOT_FOUND)
+ 
++        map_file.cnc_map.record_download()
++
+         return FileResponse(map_file.file.open("rb"), as_attachment=True, filename=f"{map_file.hash_sha1}.zip")
+ 
+ 
+diff --git a/tests/test_commands/test_purge_temporary_maps.py b/tests/test_commands/test_purge_temporary_maps.py
+new file mode 100644
+index 0000000..a42a5fa
+--- /dev/null
++++ b/tests/test_commands/test_purge_temporary_maps.py
+@@ -0,0 +1,73 @@
++"""Tests for ``manage.py purge_temporary_maps``."""
++
++import datetime
++import io
++
++import pytest
++from django.core.management import call_command, CommandError
++from django.utils import timezone
++
++from kirovy.models import CncMap, CncMapFile
++
++
++def _age(cnc_map: CncMap, days: int) -> None:
++    CncMap.objects.filter(id=cnc_map.id).update(created=timezone.now() - datetime.timedelta(days=days))
++
++
++@pytest.fixture
++def temporary_maps(create_cnc_map, file_map_desert, file_map_valid, file_map_unfair):
++    """Temporary maps covering every purge rule. Only ``stale`` should be purged with ``--days 30``."""
++    stale = create_cnc_map("Stale Lobby Map", is_temporary=True, is_published=False, file=file_map_desert)
++    recent = create_cnc_map("Recent Lobby Map", is_temporary=True, is_published=False)
++    still_played = create_cnc_map("Still Played", is_temporary=True, is_published=False, file=file_map_valid)
++    banned = create_cnc_map("Banned Cheat Map", is_temporary=True, is_banned=True, file=file_map_unfair)
++    has_edit = create_cnc_map("Edited By Someone", is_temporary=True, is_published=False)
++    edit = create_cnc_map("The Edit")
++    CncMap.objects.filter(id=edit.id).update(parent=has_edit)
++    permanent = create_cnc_map("Account Upload", is_temporary=False)
++
++    for old_map in [stale, still_played, banned, has_edit, permanent]:
++        _age(old_map, 90)
++    _age(recent, 5)
++    still_played.record_download(timezone.now().date() - datetime.timedelta(days=2))
++
++    return {
++        "stale": stale,
++        "recent": recent,
++        "still_played": still_played,
++        "banned": banned,
++        "has_edit": has_edit,
++        "permanent": permanent,
++    }
++
++
++def test_purge_temporary_maps__dry_run(temporary_maps):
++    out = io.StringIO()
++
++    call_command("purge_temporary_maps", "--days", "30", "--dry-run", stdout=out)
++
++    assert "1 temporary maps would be purged." in out.getvalue()
++    assert CncMap.objects.filter(id=temporary_maps["stale"].id).exists()
++
++
++def test_purge_temporary_maps(temporary_maps, django_capture_on_commit_callbacks):
++    stale = temporary_maps["stale"]
++    stale_file: CncMapFile = stale.cncmapfile_set.get()
++    storage, file_name = stale_file.file.storage, stale_file.file.name
++    assert storage.exists(file_name)
++    out = io.StringIO()
++
++    with django_capture_on_commit_callbacks(execute=True):
++        call_command("purge_temporary_maps", "--days", "30", stdout=out)
++
++    assert "Purged 1 temporary maps." in out.getvalue()
++    assert not CncMap.objects.filter(id=stale.id).exists()
++    assert not CncMapFile.objects.filter(id=stale_file.id).exists()
++    assert not storage.exists(file_name), "The map file should be removed from disk too."
++    for kept in ["recent", "still_played", "banned", "has_edit", "permanent"]:
++        assert CncMap.objects.filter(id=temporary_maps[kept].id).exists(), kept
++
++
++def test_purge_temporary_maps__days_must_be_positive(db):
++    with pytest.raises(CommandError):
++        call_command("purge_temporary_maps", "--days", "0")
+diff --git a/tests/test_views/test_map_browser.py b/tests/test_views/test_map_browser.py
+new file mode 100644
+index 0000000..d992079
+--- /dev/null
++++ b/tests/test_views/test_map_browser.py
+@@ -0,0 +1,216 @@
++"""Tests for the map browser's sorting and filtering on ``/maps/search/``."""
++
++import datetime
++from urllib.parse import urlencode
++
++import pytest
++from django.utils import timezone
++from rest_framework import status
++
++from kirovy.models import CncMap
++from kirovy.objects.ui_objects import ListResponseData
++from kirovy.response import KirovyResponse
++
++BASE_URL = "/maps/search/"
++
++
++def _search(client, **params) -> KirovyResponse[ListResponseData]:
++    query = urlencode(params, doseq=True)
++    response: KirovyResponse[ListResponseData] = client.get(f"{BASE_URL}?{query}")
++    assert response.status_code == status.HTTP_200_OK, response.data
++    return response
++
++
++def _result_ids(response: KirovyResponse[ListResponseData]) -> list[str]:
++    return [result["id"] for result in response.data["results"]]
++
++
++def _record_downloads(cnc_map: CncMap, count: int, days_ago: int = 0) -> None:
++    download_date = timezone.now().date() - datetime.timedelta(days=days_ago)
++    for _ in range(count):
++        cnc_map.record_download(download_date)
++
++
++def _set_created(cnc_map: CncMap, days_ago: int) -> None:
++    CncMap.objects.filter(id=cnc_map.id).update(created=timezone.now() - datetime.timedelta(days=days_ago))
++
++
++def test_search_ordering__popular(create_cnc_map, client_anonymous):
++    """``popular`` sorts by all-time downloads, regardless of when they happened."""
++    unpopular = create_cnc_map("Unpopular")
++    old_favorite = create_cnc_map("Old Favorite")
++    new_hotness = create_cnc_map("New Hotness")
++    _record_downloads(old_favorite, 5, days_ago=60)
++    _record_downloads(new_hotness, 3)
++
++    response = _search(client_anonymous, ordering="popular")
++
++    assert _result_ids(response) == [str(old_favorite.id), str(new_hotness.id), str(unpopular.id)]
++    assert response.data["results"][0]["download_count"] == 5
++
++
++def test_search_ordering__trending(create_cnc_map, client_anonymous, settings):
++    """``trending`` only counts downloads inside the trending window."""
++    settings.MAP_TRENDING_WINDOW_DAYS = 7
++    old_favorite = create_cnc_map("Old Favorite")
++    new_hotness = create_cnc_map("New Hotness")
++    edge_of_window = create_cnc_map("Edge Of Window")
++    _record_downloads(old_favorite, 10, days_ago=8)  # Just outside the window.
++    _record_downloads(old_favorite, 1, days_ago=0)
++    _record_downloads(new_hotness, 3, days_ago=1)
++    _record_downloads(edge_of_window, 2, days_ago=6)  # Last day inside the window.
++
++    response = _search(client_anonymous, ordering="trending")
++
++    assert _result_ids(response) == [str(new_hotness.id), str(edge_of_window.id), str(old_favorite.id)]
++
++
++def test_search_ordering__newest_is_default(create_cnc_map, client_anonymous):
++    oldest = create_cnc_map("Oldest")
++    newest = create_cnc_map("Newest")
++    middle = create_cnc_map("Middle")
++    _set_created(oldest, 30)
++    _set_created(middle, 10)
++    _set_created(newest, 1)
++
++    expected = [str(newest.id), str(middle.id), str(oldest.id)]
++    assert _result_ids(_search(client_anonymous)) == expected
++    assert _result_ids(_search(client_anonymous, ordering="newest")) == expected
++    assert _result_ids(_search(client_anonymous, ordering="created")) == list(reversed(expected))
++
++
++def test_search_ordering__updated(
++    create_cnc_map, create_cnc_map_file, client_anonymous, file_map_desert, file_map_valid
++):
++    """``updated`` sorts by the newest uploaded file version, not by when the map was created."""
++    updated_recently = create_cnc_map("Updated Recently", file=file_map_desert)
++    created_recently = create_cnc_map("Created Recently", file=file_map_valid)
++    _set_created(updated_recently, 30)
++    # Upload a new version of the older map, after the newer map's only version.
++    file_map_valid.seek(0)
++    create_cnc_map_file(file_map_valid, updated_recently)
++
++    response = _search(client_anonymous, ordering="updated")
++
++    assert _result_ids(response) == [str(updated_recently.id), str(created_recently.id)]
++
++
++def test_search_ordering__map_name_and_size(
++    create_cnc_map, client_anonymous, file_map_desert, file_map_valid, file_map_unfair
++):
++    desert = create_cnc_map("Bravo Desert", file=file_map_desert)  # 116 x 62
++    valid = create_cnc_map("Alpha Valid", file=file_map_valid)  # 73 x 69
++    unfair = create_cnc_map("Charlie Unfair", file=file_map_unfair)  # 75 x 74
++
++    assert _result_ids(_search(client_anonymous, ordering="map_name")) == [
++        str(valid.id),
++        str(desert.id),
++        str(unfair.id),
++    ]
++    assert _result_ids(_search(client_anonymous, ordering="-latest_file_width")) == [
++        str(desert.id),
++        str(unfair.id),
++        str(valid.id),
++    ]
++    assert _result_ids(_search(client_anonymous, ordering="latest_file_height")) == [
++        str(desert.id),
++        str(valid.id),
++        str(unfair.id),
++    ]
++
++
++@pytest.mark.parametrize("ordering", ["cnc_map_file__width", "ip_address", "-popular", "is_banned"])
++def test_search_ordering__invalid_fields_fall_back_to_default(create_cnc_map, client_anonymous, ordering):
++    """Unknown or non-whitelisted ordering fields are ignored instead of causing a server error."""
++    older = create_cnc_map("Older")
++    newer = create_cnc_map("Newer")
++    _set_created(older, 5)
++
++    response = _search(client_anonymous, ordering=ordering)
++
++    assert _result_ids(response) == [str(newer.id), str(older.id)]
++
++
++def test_search_filter__author(create_cnc_map, create_kirovy_user, client_anonymous):
++    kane = create_kirovy_user(username="Kane")
++    seth = create_kirovy_user(username="Seth")
++    kane_map = create_cnc_map("Temple Prime", user_id=kane.id)
++    create_cnc_map("Seth's Hideout", user_id=seth.id)
++
++    by_name = _search(client_anonymous, author="kane")
++    by_id = _search(client_anonymous, cnc_user_id=str(kane.id))
++
++    assert _result_ids(by_name) == [str(kane_map.id)]
++    assert by_name.data["results"][0]["cnc_user_name"] == "Kane"
++    assert _result_ids(by_id) == [str(kane_map.id)]
++
++
++def test_search_filter__category_slug(create_cnc_map, create_cnc_map_category, client_anonymous):
++    standard = create_cnc_map_category("Standard")
++    koth = create_cnc_map_category("King of the Hill")
++    naval = create_cnc_map_category("Naval")
++    standard_map = create_cnc_map("Standard Map", map_categories=[standard])
++    both_map = create_cnc_map("Both Map", map_categories=[standard, koth])
++    create_cnc_map("Naval Map", map_categories=[naval])
++
++    response = _search(client_anonymous, category_slug=[standard.slug, koth.slug])
++
++    assert sorted(_result_ids(response)) == sorted([str(standard_map.id), str(both_map.id)])
++
++
++def test_search_filter__size_uses_latest_version(
++    create_cnc_map, create_cnc_map_file, client_anonymous, file_map_desert, file_map_valid, file_map_unfair
++):
++    """Size filters check the newest map file, so a map that shrank in v2 isn't returned as "large"."""
++    large = create_cnc_map("Large", file=file_map_desert)  # 116 x 62
++    shrunk = create_cnc_map("Shrunk", file=file_map_unfair)  # v1: 75 x 74
++    create_cnc_map_file(file_map_valid, shrunk)  # v2: 73 x 69
++    create_cnc_map("No File")  # Size unknown, excluded by any size filter.
++
++    assert _result_ids(_search(client_anonymous, min_width=100)) == [str(large.id)]
++    assert _result_ids(_search(client_anonymous, max_width=80)) == [str(shrunk.id)]
++    assert _result_ids(_search(client_anonymous, min_height=70)) == []
++    assert _result_ids(_search(client_anonymous, min_height=60, max_height=65)) == [str(large.id)]
++
++
++def test_search_filter__created_range(create_cnc_map, client_anonymous):
++    old_map = create_cnc_map("Old Map")
++    new_map = create_cnc_map("New Map")
++    _set_created(old_map, 40)
++    cutoff = (timezone.now() - datetime.timedelta(days=20)).isoformat()
++
++    assert _result_ids(_search(client_anonymous, created_after=cutoff)) == [str(new_map.id)]
++    assert _result_ids(_search(client_anonymous, created_before=cutoff)) == [str(old_map.id)]
++
++
++def test_search_filter__curated(create_cnc_map, client_anonymous):
++    """Staff-reviewed maps can be listed on their own, e.g. for a curated map list."""
++    curated = create_cnc_map("Curated", is_reviewed=True)
++    create_cnc_map("Not Curated")
++
++    assert _result_ids(_search(client_anonymous, is_reviewed=True)) == [str(curated.id)]
++
++
++def test_search_combined_filters_and_trending_pagination(create_cnc_map, create_cnc_map_category, client_anonymous):
++    """Filters, search, trending annotations, and pagination work together without duplicate rows."""
++    standard = create_cnc_map_category("Standard")
++    koth = create_cnc_map_category("King of the Hill")
++    maps = [create_cnc_map(f"Arena {i}", map_categories=[standard, koth]) for i in range(5)]
++    for downloads, cnc_map in enumerate(maps):
++        _record_downloads(cnc_map, downloads)
++
++    first_page = _search(
++        client_anonymous, search="arena", category_slug=[standard.slug, koth.slug], ordering="trending", limit=2
++    )
++    second_page = _search(
++        client_anonymous,
++        search="arena",
++        category_slug=[standard.slug, koth.slug],
++        ordering="trending",
++        limit=2,
++        offset=2,
++    )
++
++    assert _result_ids(first_page) == [str(maps[4].id), str(maps[3].id)]
++    assert _result_ids(second_page) == [str(maps[2].id), str(maps[1].id)]
++    assert first_page.data["pagination_metadata"]["remaining_count"] == 5
+diff --git a/tests/test_views/test_map_download.py b/tests/test_views/test_map_download.py
+new file mode 100644
+index 0000000..69e1ddd
+--- /dev/null
++++ b/tests/test_views/test_map_download.py
+@@ -0,0 +1,141 @@
++"""Tests for map downloads and download counting."""
++
++import datetime
++import hashlib
++
++import pytest
++from django.http import FileResponse
++from django.utils import timezone
++from rest_framework import status
++
++from kirovy.models import CncGame, CncMap
++from kirovy.models.cnc_map import CncMapDownloadStat
++
++
++def _download_url(cnc_map: CncMap) -> str:
++    return f"/maps/{cnc_map.id}/download/"
++
++
++def test_record_download__counts_total_and_per_day(cnc_map):
++    today = timezone.now().date()
++    yesterday = today - datetime.timedelta(days=1)
++
++    cnc_map.record_download(yesterday)
++    cnc_map.record_download(today)
++    cnc_map.record_download(today)
++
++    cnc_map.refresh_from_db()
++    assert cnc_map.download_count == 3
++    daily = dict(CncMapDownloadStat.objects.filter(cnc_map=cnc_map).values_list("date", "download_count"))
++    assert daily == {yesterday: 1, today: 2}
++
++
++def test_record_download__stale_instance_save_does_not_reset_count(cnc_map, client_user):
++    """Editing a map must not overwrite the download counter with the stale value on the instance."""
++    stale_instance = CncMap.objects.get(id=cnc_map.id)
++    cnc_map.record_download()
++    cnc_map.record_download()
++
++    response = client_user.patch(f"/maps/{stale_instance.id}/", data={"description": "Edited after downloads."})
++
++    assert response.status_code == status.HTTP_200_OK
++    stale_instance.refresh_from_db()
++    assert stale_instance.download_count == 2
++
++
++def test_map_download__latest_version(
++    create_cnc_map, create_cnc_map_file, client_anonymous, file_map_desert, file_map_valid
++):
++    cnc_map = create_cnc_map(file=file_map_desert)
++    latest = create_cnc_map_file(file_map_valid, cnc_map)
++    assert latest.version == 2
++
++    response: FileResponse = client_anonymous.get(_download_url(cnc_map))
++
++    assert response.status_code == status.HTTP_200_OK
++    assert hashlib.sha1(response.getvalue()).hexdigest() == latest.hash_sha1
++    assert latest.name in response.headers["Content-Disposition"]
++    cnc_map.refresh_from_db()
++    assert cnc_map.download_count == 1
++
++
++def test_map_download__specific_version(
++    create_cnc_map, create_cnc_map_file, client_anonymous, file_map_desert, file_map_valid
++):
++    cnc_map = create_cnc_map(file=file_map_desert)
++    create_cnc_map_file(file_map_valid, cnc_map)
++    first = cnc_map.cncmapfile_set.get(version=1)
++
++    response: FileResponse = client_anonymous.get(_download_url(cnc_map) + "?version=1")
++
++    assert response.status_code == status.HTTP_200_OK
++    assert hashlib.sha1(response.getvalue()).hexdigest() == first.hash_sha1
++
++
++@pytest.mark.parametrize("version", ["3", "abc", "-1"])
++def test_map_download__missing_version(create_cnc_map, client_anonymous, file_map_desert, version):
++    cnc_map = create_cnc_map(file=file_map_desert)
++
++    response = client_anonymous.get(_download_url(cnc_map) + f"?version={version}")
++
++    assert response.status_code == status.HTTP_404_NOT_FOUND
++    cnc_map.refresh_from_db()
++    assert cnc_map.download_count == 0
++
++
++def test_map_download__no_files(create_cnc_map, client_anonymous):
++    cnc_map = create_cnc_map()
++
++    response = client_anonymous.get(_download_url(cnc_map))
++
++    assert response.status_code == status.HTTP_404_NOT_FOUND
++
++
++def test_map_download__visibility(create_cnc_map, create_client, create_kirovy_user, client_moderator, file_map_desert):
++    """Banned and unpublished maps can only be downloaded by their owner, or staff."""
++    owner = create_kirovy_user(username="Owner")
++    stranger_client = create_client(create_kirovy_user(username="Stranger"))
++    owner_client = create_client(owner)
++    banned = create_cnc_map("Banned", user_id=owner.id, is_banned=True, file=file_map_desert)
++    file_map_desert.seek(0)
++
++    assert stranger_client.get(_download_url(banned)).status_code == status.HTTP_404_NOT_FOUND
++    assert owner_client.get(_download_url(banned)).status_code == status.HTTP_200_OK
++    assert client_moderator.get(_download_url(banned)).status_code == status.HTTP_200_OK
++
++
++def test_map_download__unpublished_hidden_from_anonymous(create_cnc_map, client_anonymous, file_map_desert):
++    draft = create_cnc_map("Draft", is_published=False, file=file_map_desert)
++
++    assert client_anonymous.get(_download_url(draft)).status_code == status.HTTP_404_NOT_FOUND
++
++
++def test_map_download__backwards_compatible_counts_downloads(
++    create_cnc_map, create_cnc_map_file, file_map_desert, client_anonymous
++):
++    """Downloads from legacy clients count toward popularity too."""
++    game = CncGame.objects.get(slug__iexact="yr")
++    cnc_map = create_cnc_map(is_temporary=True, cnc_game=game, is_mapdb1_compatible=True)
++    map_file = create_cnc_map_file(file_map_desert, cnc_map, zip_for_legacy=True)
++
++    response: FileResponse = client_anonymous.get(f"/yr/{map_file.hash_sha1}.zip")
++
++    assert response.status_code == status.HTTP_200_OK
++    cnc_map.refresh_from_db()
++    assert cnc_map.download_count == 1
++    assert CncMapDownloadStat.objects.get(cnc_map=cnc_map).download_count == 1
++
++
++def test_map_download__backwards_compatible_banned_map(
++    create_cnc_map, create_cnc_map_file, file_map_unfair, client_anonymous
++):
++    """Legacy clients must not be able to download a map after a moderator bans it."""
++    game = CncGame.objects.get(slug__iexact="yr")
++    cnc_map = create_cnc_map(is_temporary=True, cnc_game=game, is_mapdb1_compatible=True, is_banned=True)
++    map_file = create_cnc_map_file(file_map_unfair, cnc_map, zip_for_legacy=True)
++
++    response = client_anonymous.get(f"/yr/{map_file.hash_sha1}.zip")
++
++    assert response.status_code == status.HTTP_404_NOT_FOUND
++    cnc_map.refresh_from_db()
++    assert cnc_map.download_count == 0
+diff --git a/tests/test_views/test_map_edit.py b/tests/test_views/test_map_edit.py
+new file mode 100644
+index 0000000..4e2965f
+--- /dev/null
++++ b/tests/test_views/test_map_edit.py
+@@ -0,0 +1,116 @@
++"""Tests for editing and moderating maps via ``PATCH /maps/<id>/``."""
++
++from rest_framework import status
++
++from kirovy.constants import api_codes
++from kirovy.models import CncMap
++
++
++def _url(cnc_map: CncMap) -> str:
++    return f"/maps/{cnc_map.id}/"
++
++
++def test_map_edit__owner_happy_path(create_cnc_map, create_cnc_map_category, client_user):
++    """Map authors can finish an upload: name, description, categories, and publishing."""
++    cnc_map = create_cnc_map(user_id=client_user.kirovy_user.id, is_published=False)
++    CncMap.objects.filter(id=cnc_map.id).update(incomplete_upload=True)
++    koth = create_cnc_map_category("King of the Hill")
++
++    response = client_user.patch(
++        _url(cnc_map),
++        data={
++            "map_name": "Streets Of Gold 3",
++            "description": "Now with more gold, and fewer streets.",
++            "category_ids": [str(koth.id)],
++            "is_published": True,
++            "incomplete_upload": False,
++        },
++    )
++
++    assert response.status_code == status.HTTP_200_OK, response.data
++    cnc_map.refresh_from_db()
++    assert cnc_map.map_name == "Streets Of Gold 3"
++    assert cnc_map.description == "Now with more gold, and fewer streets."
++    assert list(cnc_map.categories.all()) == [koth]
++    assert cnc_map.is_published
++    assert not cnc_map.incomplete_upload
++    assert cnc_map.last_modified_by_id == client_user.kirovy_user.id
++    assert cnc_map.moderated_by_id is None, "Owners editing their own maps is not a moderation action."
++    assert response.data["category_ids"] == [str(koth.id)]
++
++
++def test_map_edit__other_users_map(create_cnc_map, create_kirovy_user, client_user):
++    cnc_map = create_cnc_map(user_id=create_kirovy_user(username="Someone Else").id)
++
++    response = client_user.patch(_url(cnc_map), data={"map_name": "Stolen"})
++
++    assert response.status_code == status.HTTP_403_FORBIDDEN
++    cnc_map.refresh_from_db()
++    assert cnc_map.map_name != "Stolen"
++
++
++def test_map_edit__anonymous(cnc_map, client_anonymous):
++    response = client_anonymous.patch(_url(cnc_map), data={"map_name": "Vandalized"})
++
++    assert response.status_code in {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN}
++    cnc_map.refresh_from_db()
++    assert cnc_map.map_name != "Vandalized"
++
++
++def test_map_edit__banned_map(create_cnc_map, client_user):
++    """Owners can't edit their maps after a ban. Don't let people destroy evidence."""
++    cnc_map = create_cnc_map(user_id=client_user.kirovy_user.id, is_banned=True)
++
++    response = client_user.patch(_url(cnc_map), data={"description": "Nothing to see here, honest."})
++
++    assert response.status_code == status.HTTP_403_FORBIDDEN
++
++
++def test_map_edit__uneditable_fields(create_cnc_map, create_kirovy_user, client_user):
++    cnc_map = create_cnc_map(user_id=client_user.kirovy_user.id)
++    other_user = create_kirovy_user(username="Other")
++
++    response = client_user.patch(_url(cnc_map), data={"cnc_user_id": str(other_user.id), "map_name": "Mine Now"})
++
++    assert response.status_code == status.HTTP_400_BAD_REQUEST
++    assert response.data["code"] == api_codes.GenericApiCodes.CANNOT_UPDATE_FIELD
++    assert response.data["additional"]["attempted"] == ["cnc_user"]
++    cnc_map.refresh_from_db()
++    assert cnc_map.cnc_user_id == client_user.kirovy_user.id
++    assert cnc_map.map_name != "Mine Now"
++
++
++def test_map_edit__is_reviewed_is_staff_only(create_cnc_map, client_user):
++    cnc_map = create_cnc_map(user_id=client_user.kirovy_user.id)
++
++    response = client_user.patch(_url(cnc_map), data={"is_reviewed": True})
++
++    assert response.status_code == status.HTTP_403_FORBIDDEN
++    cnc_map.refresh_from_db()
++    assert not cnc_map.is_reviewed
++
++
++def test_map_edit__moderator_curates_and_hides(create_cnc_map, user, client_moderator, moderator):
++    """Moderators can edit, curate, and hide (unpublish) other users' maps, and it's logged."""
++    cnc_map = create_cnc_map(user_id=user.id, is_published=True)
++
++    response = client_moderator.patch(
++        _url(cnc_map), data={"is_reviewed": True, "is_published": False, "map_name": "Cleaned Up Name"}
++    )
++
++    assert response.status_code == status.HTTP_200_OK, response.data
++    cnc_map.refresh_from_db()
++    assert cnc_map.is_reviewed
++    assert not cnc_map.is_published
++    assert cnc_map.map_name == "Cleaned Up Name"
++    assert cnc_map.cnc_user_id == user.id, "Moderator edits must not change the owner."
++    assert cnc_map.moderated_by_id == moderator.id
++    assert "Edited" in cnc_map.moderator_notes
++    assert "is_published, is_reviewed, map_name" in cnc_map.moderator_notes
++    assert moderator.username in cnc_map.moderator_notes
++
++
++def test_map_edit__put_not_allowed(cnc_map, client_user):
++    response = client_user.put(_url(cnc_map), data={"map_name": "Whole New Map"})
++
++    assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED
+-- 
+2.43.0
+

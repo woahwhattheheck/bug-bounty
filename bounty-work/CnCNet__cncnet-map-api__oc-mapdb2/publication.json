@@ -1,0 +1,114 @@
+{
+  "repository": "CnCNet/cncnet-map-api",
+  "fork": "woahwhattheheck/cncnet-map-api",
+  "base": "c454e5b5940097591873bffb36df52ef24143815",
+  "base_tree": "0f4d7bdb53a58c6115cfa0ae8e80f2784458efc8",
+  "branch": "feat/mapdb2-browser-0cbe7ede-20261008",
+  "title": "feat: Map browser sorting, filters, downloads, and map editing",
+  "original_commit": "b41eb412555e9cb9f4f6969ae72441171ce0486d",
+  "original_author": {
+    "name": "woahwhattheheck",
+    "email": "293286387+woahwhattheheck@users.noreply.github.com",
+    "date": "2026-10-08T06:04:13Z"
+  },
+  "packet_repository": "woahwhattheheck/bug-bounty",
+  "packet_ref": "claude/zen-cerf-rrfj52",
+  "packet_path": "bounty-work/CnCNet__cncnet-map-api__oc-mapdb2",
+  "patch_blob": "fc3ecdfb87b94b7189abfbedad54bf9760baf2af",
+  "handoff_blob": "fe7a6c0e349470af16a7b0627b8010cd208e38a1",
+  "paths": [
+    "docs/map_browser.md",
+    "kirovy/management/__init__.py",
+    "kirovy/management/commands/__init__.py",
+    "kirovy/management/commands/purge_temporary_maps.py",
+    "kirovy/migrations/0022_cncmap_download_count_cncmapdownloadstat.py",
+    "kirovy/models/__init__.py",
+    "kirovy/models/cnc_map.py",
+    "kirovy/models/moderabile.py",
+    "kirovy/serializers/cnc_map_serializers.py",
+    "kirovy/settings/_base.py",
+    "kirovy/urls.py",
+    "kirovy/views/cnc_map_views.py",
+    "tests/test_commands/test_purge_temporary_maps.py",
+    "tests/test_views/test_map_browser.py",
+    "tests/test_views/test_map_download.py",
+    "tests/test_views/test_map_edit.py"
+  ],
+  "preimages": {
+    "kirovy/models/__init__.py": "afdeaedcb82c4720ddb3ade4b0710fd1c4d66836",
+    "kirovy/models/cnc_map.py": "f9a065d4aa5d0d098d7915453ed7d39898506821",
+    "kirovy/models/moderabile.py": "b64827445f72dffd77a4c72b429efee20f5551dd",
+    "kirovy/serializers/cnc_map_serializers.py": "1e58bcf6c15e61c20e1f56dd380c8878c0eb1c12",
+    "kirovy/settings/_base.py": "fccedf1812edd7b475ed677b760dc8ceb235190a",
+    "kirovy/urls.py": "1563224491fad1fb6faa214a1cd58b1c1780da3e",
+    "kirovy/views/cnc_map_views.py": "b3efdc250569e3ba03391f174cdbd9845fed1395"
+  },
+  "postimages": {
+    "docs/map_browser.md": {
+      "sha": "cb14ead6e9f286b406d7e69408f8220d5080fc35",
+      "bytes": 5192
+    },
+    "kirovy/management/__init__.py": {
+      "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "bytes": 0
+    },
+    "kirovy/management/commands/__init__.py": {
+      "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "bytes": 0
+    },
+    "kirovy/management/commands/purge_temporary_maps.py": {
+      "sha": "0fd05209e0b97c26a22f562ebaf6a557c486d149",
+      "bytes": 3794
+    },
+    "kirovy/migrations/0022_cncmap_download_count_cncmapdownloadstat.py": {
+      "sha": "bea36c078b3a195bf5a8095f412095cd07dca09b",
+      "bytes": 2140
+    },
+    "kirovy/models/__init__.py": {
+      "sha": "1fb06f5613fc39b99c3801e2325fa0f7d84663b6",
+      "bytes": 391
+    },
+    "kirovy/models/cnc_map.py": {
+      "sha": "a79a8eeaf4225760b0fc0aafdca4a10a3041b7fa",
+      "bytes": 14788
+    },
+    "kirovy/models/moderabile.py": {
+      "sha": "35a65dc7193c59bff633c9641620d6fd222e06e6",
+      "bytes": 5181
+    },
+    "kirovy/serializers/cnc_map_serializers.py": {
+      "sha": "4f71e4d881b246fc05d615b2d906e4a6f269839b",
+      "bytes": 12183
+    },
+    "kirovy/settings/_base.py": {
+      "sha": "c8dc0a0e1380238fb53a57d04de5711dec52053a",
+      "bytes": 10666
+    },
+    "kirovy/urls.py": {
+      "sha": "e62897a3d82abbb8f8da19e69f3e8f95b7430bef",
+      "bytes": 5308
+    },
+    "kirovy/views/cnc_map_views.py": {
+      "sha": "e92869615943caa2379c8501c8a5d5ed2ef0db0a",
+      "bytes": 21868
+    },
+    "tests/test_commands/test_purge_temporary_maps.py": {
+      "sha": "a42a5fa1df40fe0458fec4096004c66f4475f5ee",
+      "bytes": 3000
+    },
+    "tests/test_views/test_map_browser.py": {
+      "sha": "d9920790e9daabf62b7ae67a43a5eb3dfb0313aa",
+      "bytes": 9289
+    },
+    "tests/test_views/test_map_download.py": {
+      "sha": "69e1ddd2e16bcd5335094a14d06f4797e1a9d694",
+      "bytes": 5638
+    },
+    "tests/test_views/test_map_edit.py": {
+      "sha": "4e2965ffa714ff3f6df8f1b433aebc5413dc5a2d",
+      "bytes": 4816
+    }
+  },
+  "expected_tree_sha": "75f888027e75fc42a1d9301a6c5119dee289c6e8",
+  "original_message": "feat: Map browser sorting, filters, downloads, and map editing\n\nMapDB 2.0 map gallery backend features from the \"New Map Database & Browser\"\nproject:\n\n- Count downloads. `CncMap.download_count` (all time) plus per-day\n  `CncMapDownloadStat` rows, incremented with F() expressions so concurrent\n  downloads are all counted. No downloader data is stored.\n- `GET /maps/<id>/download/` (optionally `?version=N`) for the new UI and\n  client integration. The MapDB 1.0 route `/<game>/<sha1>.zip` now counts\n  downloads too, and returns 404 for banned maps.\n- `/maps/search/` sorting: `popular`, `trending` (downloads within\n  MAP_TRENDING_WINDOW_DAYS, default 7), `newest` (new default), `updated`\n  (newest file version), plus name/size fields. Fixes a 500 when ordering by\n  the old `cnc_map_file__*` fields, which don't exist on CncMap.\n- `/maps/search/` filters: `author`, `cnc_user_id`, `category_slug`,\n  `min/max_width`, `min/max_height` (newest file version), and\n  `created_after/before`.\n- `PATCH /maps/<id>/` works now (it raised NotImplementedError). Authors can\n  edit name, description, categories, published and incomplete_upload; staff\n  can also curate with `is_reviewed`. Staff edits of other users' maps are\n  recorded in moderated_by / moderator_notes.\n- `manage.py purge_temporary_maps --days N [--dry-run]` removes old,\n  unused, anonymous lobby uploads and their files. Keeps banned maps and\n  maps that other maps credit as their parent.\n- Docs in docs/map_browser.md.\n"
+}

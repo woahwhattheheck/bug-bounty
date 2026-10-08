@@ -1,0 +1,16 @@
+1.004380337 launch
+27.218449744 app ready
+27.221226732 STEP1 selectors
+47.962967962 STEP2 review
+50.835040008 hide
+54.193781006 show hidden
+62.763418920 STEP3 calibrator
+94.264988773 auto calibrate
+115.152836927 calibrated
+115.155809672 validation: no identity
+123.733619367 select Canon 1100D zoom lens
+canon at 143 814 score 0.0
+139.016121314 validation: zoom without focal length
+147.588306004 set focal length
+156.341234282 validation passes
+167.415825688 end

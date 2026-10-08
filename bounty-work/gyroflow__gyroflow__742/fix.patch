@@ -1,19 +1,23 @@
-From 6b39dd2e901813f24c8931d17977d6d82b944abb Mon Sep 17 00:00:00 2001
+From 1dd5ad89e4d6ddf3e0b499360892e108869bc7c8 Mon Sep 17 00:00:00 2001
 From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 04:20:40 +0000
-Subject: [PATCH] fix(ui): register camera selector QML in the resource list
+Subject: [PATCH] fix(ui): register CameraLensSelector so the main window loads
 
-Non-deploy builds (just run / cargo build --release) load the UI from the
-explicit qrc! list in src/resources_qml.rs. CameraLensSelector.qml and
-CameraCatalog.js were not listed, so LensProfile.qml failed with
-"CameraLensSelector is not a type" and the main window did not load.
-Deploy builds were unaffected because build.rs compiles every file under
-src/ui.
+LensProfile.qml and LensCalibrate.qml instantiate CameraLensSelector, but the
+new component was not registered anywhere the UI loader looks:
+
+- src/ui/components/qmldir: compiled-QML (just deploy / release) builds
+  resolve component types only through qmldir, so the main window failed
+  with "CameraLensSelector is not a type".
+- src/resources_qml.rs: non-deploy builds (just run) embed QML through this
+  explicit qrc! list; CameraLensSelector.qml and CameraCatalog.js were
+  missing, with the same failure.
 
 Refs #742
 ---
- src/resources_qml.rs | 2 ++
- 1 file changed, 2 insertions(+)
+ src/resources_qml.rs     | 2 ++
+ src/ui/components/qmldir | 1 +
+ 2 files changed, 3 insertions(+)
 
 diff --git a/src/resources_qml.rs b/src/resources_qml.rs
 index a7fda49..9086f82 100644
@@ -28,6 +32,18 @@ index a7fda49..9086f82 100644
          "src/ui/components/CheckBox.qml",
          "src/ui/components/CheckBoxWithContent.qml",
          "src/ui/components/ComboBox.qml",
+diff --git a/src/ui/components/qmldir b/src/ui/components/qmldir
+index c518adb..d1f799b 100644
+--- a/src/ui/components/qmldir
++++ b/src/ui/components/qmldir
+@@ -3,6 +3,7 @@ Action 1.0 Action.qml
+ AdvancedSection 1.0 AdvancedSection.qml
+ BasicText 1.0 BasicText.qml
+ Button 1.0 Button.qml
++CameraLensSelector 1.0 CameraLensSelector.qml
+ CheckBox 1.0 CheckBox.qml
+ CheckBoxWithContent 1.0 CheckBoxWithContent.qml
+ ComboBox 1.0 ComboBox.qml
 -- 
 2.43.0
 

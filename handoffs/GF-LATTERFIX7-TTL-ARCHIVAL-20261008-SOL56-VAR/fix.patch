@@ -1,0 +1,204 @@
+diff --git a/src/storage.rs b/src/storage.rs
+--- a/src/storage.rs
++++ b/src/storage.rs
+@@
+-/// TTL threshold for triggering extensions (when to renew)
++/// Minimum remaining persistent-entry TTL before a renewal is triggered.
++///
++/// Together with `MAX_PERSISTENT_TTL`, this defines the bounded renewal
++/// window for long-lived state. `extend_ttl` is a no-op while an entry is
++/// above this threshold.
+ pub const TTL_EXTENSION_THRESHOLD: u32 = 100_000;
+@@
+-/// Get a value from persistent storage
++/// Get a value from persistent storage and renew it when it is approaching
++/// archival.
++///
++/// Active reads are a strong signal that an entry is still live application
++/// state. Renew only after a successful read so a lookup for a missing key
++/// cannot trap in `extend_ttl`.
+ pub fn get_persistent<K, V>(env: &Env, key: &K) -> Option<V>
+ where
+     K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+     V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+ {
+-    env.storage().persistent().get(key)
++    let value = env.storage().persistent().get(key);
++    if value.is_some() {
++        extend_persistent_ttl_default(env, key);
++    }
++    value
+ }
+@@
+ /// Refresh TTL for all critical persistent keys
+ ///
+ /// This should be called periodically (e.g., by a bot or during high-activity periods)
+ /// to ensure persistent data doesn't expire.
+ pub fn refresh_all_persistent_ttl(env: &Env) {
+-    extend_persistent_ttl_default(env, &PersistentKey::Statistics);
+-    extend_persistent_ttl_default(env, &PersistentKey::Categories);
+-    extend_persistent_ttl_default(env, &PersistentKey::Tags);
+-    extend_persistent_ttl_default(env, &PersistentKey::Leaderboard);
++    refresh_persistent_ttl_if_present(env, &PersistentKey::Statistics);
++    refresh_persistent_ttl_if_present(env, &PersistentKey::Categories);
++    refresh_persistent_ttl_if_present(env, &PersistentKey::Tags);
++    refresh_persistent_ttl_if_present(env, &PersistentKey::Leaderboard);
++}
++
++fn refresh_persistent_ttl_if_present<K>(env: &Env, key: &K)
++where
++    K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
++{
++    if env.storage().persistent().has(key) {
++        extend_persistent_ttl_default(env, key);
++    }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@
+ #[cfg(test)]
+ mod storage_migrator_test;
++#[cfg(test)]
++mod storage_ttl_test;
+@@
+     pub fn get_statistics(env: Env) -> storage::ContractStatistics {
+         storage::get_statistics(&env)
+     }
++
++    /// Admin-only maintenance hook for off-chain keepalive bots.
++    ///
++    /// Each key is renewed only when it exists and has fallen below the
++    /// storage module's renewal threshold, so callers may invoke this
++    /// periodically without rewriting business state.
++    pub fn refresh_persistent_storage(env: Env, admin: Address) {
++        admin.require_auth();
++
++        let stored_admin: Address = env
++            .storage()
++            .instance()
++            .get(&DataKey::Admin)
++            .unwrap_optimized();
++        if admin != stored_admin {
++            panic!();
++        }
++
++        storage::refresh_all_persistent_ttl(&env);
++    }
+ 
+     // ========================================================================
+     // Multi-Stablecoin Vault
+diff --git a/src/storage_ttl_test.rs b/src/storage_ttl_test.rs
+new file mode 100644
+--- /dev/null
++++ b/src/storage_ttl_test.rs
+@@
++#![cfg(test)]
++
++use crate::{
++    storage::{
++        self, ContractStatistics, PersistentKey, DEFAULT_PERSISTENT_TTL,
++        TTL_EXTENSION_THRESHOLD,
++    },
++    TaskManagerContract, TaskManagerContractClient,
++};
++use soroban_sdk::{
++    testutils::{storage::Persistent as _, Address as _},
++    Address, Env,
++};
++
++#[test]
++fn persistent_read_renews_entry_near_archival() {
++    let env = Env::default();
++    let contract_id = env.register_contract(None, TaskManagerContract);
++
++    env.as_contract(&contract_id, || {
++        // Write directly so the entry starts at the test network's minimum
++        // persistent TTL rather than going through set_persistent's write bump.
++        env.storage()
++            .persistent()
++            .set(&PersistentKey::Statistics, &ContractStatistics::default());
++
++        let before = env
++            .storage()
++            .persistent()
++            .get_ttl(&PersistentKey::Statistics);
++        assert!(before < TTL_EXTENSION_THRESHOLD);
++
++        let value: Option<ContractStatistics> =
++            storage::get_persistent(&env, &PersistentKey::Statistics);
++        assert!(value.is_some());
++
++        let after = env
++            .storage()
++            .persistent()
++            .get_ttl(&PersistentKey::Statistics);
++        assert_eq!(after, DEFAULT_PERSISTENT_TTL);
++    });
++}
++
++#[test]
++fn maintenance_refresh_is_admin_only_and_skips_missing_keys() {
++    let env = Env::default();
++    env.mock_all_auths();
++
++    let contract_id = env.register_contract(None, TaskManagerContract);
++    let client = TaskManagerContractClient::new(&env, &contract_id);
++    let admin = Address::generate(&env);
++    let token_admin = Address::generate(&env);
++    let token_contract = env.register_stellar_asset_contract(token_admin);
++    let fee_recipient = Address::generate(&env);
++
++    client.initialize(&admin, &100, &token_contract, &fee_recipient);
++
++    env.as_contract(&contract_id, || {
++        // Only Statistics exists. The maintenance sweep must safely skip
++        // Categories/Tags/Leaderboard until they are created.
++        env.storage()
++            .persistent()
++            .set(&PersistentKey::Statistics, &ContractStatistics::default());
++    });
++
++    let attacker = Address::generate(&env);
++    assert!(client.try_refresh_persistent_storage(&attacker).is_err());
++
++    client.refresh_persistent_storage(&admin);
++
++    env.as_contract(&contract_id, || {
++        assert_eq!(
++            env.storage()
++                .persistent()
++                .get_ttl(&PersistentKey::Statistics),
++            DEFAULT_PERSISTENT_TTL
++        );
++    });
++}
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@
+ **Bot Options:**
+ - `--dry-run`: Run without actually sending transactions.
+ - `--threshold`: TTL threshold in ledgers to trigger renewal (default: `10000`).
+ - `--extend-to`: Number of ledgers to extend the TTL to (default: `50000`).
+ - `--min-balance`: Minimum XLM balance for the bot wallet before alerting (default: `10.0`).
+ - `--interval`: Run continuously every N seconds (default: `0`, which means run once).
++
++### Persistent application-state TTL
++
++Persistent keys managed by `src/storage.rs` use a bounded renewal policy:
++`TTL_EXTENSION_THRESHOLD` is the minimum remaining lifetime that triggers a
++renewal, `DEFAULT_PERSISTENT_TTL` is the normal renewal target, and
++`MAX_PERSISTENT_TTL` is the documented ceiling.
++
++Successful reads through `storage::get_persistent` renew an active key when it
++falls below the threshold; writes already renew automatically. Maintenance bots
++may also call the admin-authenticated `refresh_persistent_storage(admin)`
++contract method. That sweep is safe when optional global keys have not been
++created yet and is a no-op for entries whose TTL is still healthy.
++
++The contract-level refresh is intentionally separate from `soroban contract
++extend`: the CLI command renews contract code/instance TTL, while
++`refresh_persistent_storage` renews the persistent application-data entries.
+ 
+ ---

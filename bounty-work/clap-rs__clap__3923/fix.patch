@@ -1,0 +1,373 @@
+From 9f7849a8c432f47e05bcfc645a6380fdf4a35285 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:18:35 +0000
+Subject: [PATCH 1/2] test(complete): Show require_equals behavior
+
+---
+ clap_complete/tests/testsuite/engine.rs | 100 ++++++++++++++++++++++++
+ 1 file changed, 100 insertions(+)
+
+diff --git a/clap_complete/tests/testsuite/engine.rs b/clap_complete/tests/testsuite/engine.rs
+index c611373b..9d8d463f 100644
+--- a/clap_complete/tests/testsuite/engine.rs
++++ b/clap_complete/tests/testsuite/engine.rs
+@@ -1309,6 +1309,106 @@ a_pos,c_pos
+     );
+ }
+ 
++#[test]
++fn suggest_require_equals() {
++    let mut cmd = Command::new("exhaustive")
++        .arg(
++            clap::Arg::new("format")
++                .long("format")
++                .short('F')
++                .require_equals(true)
++                .value_parser(["json", "yaml"]),
++        )
++        .arg(
++            clap::Arg::new("color")
++                .long("color")
++                .short('c')
++                .require_equals(true)
++                .num_args(0..=1)
++                .value_parser(["always", "never"]),
++        )
++        .arg(clap::Arg::new("pos").value_parser(["pos_a", "pos_b"]));
++
++    assert_data_eq!(
++        complete!(cmd, "--[TAB]"),
++        snapbox::str![[r#"
++--format
++--color
++--help	Print help
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "--format [TAB]"),
++        snapbox::str![[r#"
++json
++yaml
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "--color [TAB]"),
++        snapbox::str![[r#"
++always
++never
++pos_a
++pos_b
++--format
++--color
++--help	Print help
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "--color=[TAB]"),
++        snapbox::str![[r#"
++--color=always
++--color=never
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "-[TAB]"),
++        snapbox::str![[r#"
++-F	--format
++-c	--color
++-h	Print help
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "-F[TAB]"),
++        snapbox::str![[r#"
++-Fjson
++-Fyaml
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "-F [TAB]"),
++        snapbox::str![[r#"
++json
++yaml
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "-c[TAB]"),
++        snapbox::str![[r#"
++-calways
++-cnever
++"#]]
++    );
++
++    assert_data_eq!(
++        complete!(cmd, "-c=[TAB]"),
++        snapbox::str![[r#"
++-c=always
++-c=never
++"#]]
++    );
++}
++
+ #[test]
+ fn suggest_allow_hyphen() {
+     let mut cmd = Command::new("exhaustive")
+-- 
+2.43.0
+
+
+From b310ab90223715153414d533557aa1165b4eb526 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:19:42 +0000
+Subject: [PATCH 2/2] fix(complete): Respect require_equals in native
+ completions
+
+With `require_equals`, the parser only accepts a value attached with `=`.
+Native completions still treated the next argument as the value
+(`--format <TAB>` offered values) and attached short values without `=`
+(`-F<TAB>` offered `-Fjson`).
+
+Now
+- flags that require a value complete to `--format=` / `-F=`
+- the next argument is not treated as the value
+- short values are attached with `=` and values attached without `=` are
+  not completed
+- an optional value (`num_args(0..=1)`, like `--color[=<WHEN>]`) is only
+  taken after `=`, so the flag stays complete on its own and any following
+  short flags are parsed as flags, matching the parser
+---
+ clap_complete/src/engine/complete.rs    | 72 +++++++++++++++++++------
+ clap_complete/tests/testsuite/engine.rs | 31 ++++++-----
+ 2 files changed, 74 insertions(+), 29 deletions(-)
+
+diff --git a/clap_complete/src/engine/complete.rs b/clap_complete/src/engine/complete.rs
+index f8e0e207..95c2d7b7 100644
+--- a/clap_complete/src/engine/complete.rs
++++ b/clap_complete/src/engine/complete.rs
+@@ -90,7 +90,7 @@ pub fn complete(
+                 });
+ 
+                 if let Some(opt) = opt {
+-                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
++                    if takes_next_value(opt) && value.is_none() {
+                         next_state = ParseState::Opt((opt, 1));
+                     };
+                 } else if pos_allows_hyphen(current_cmd, pos_index) {
+@@ -101,7 +101,7 @@ pub fn complete(
+         } else if let Some(short) = arg.to_short() {
+             let (_, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
+             if let Some(opt) = takes_value_opt {
+-                if short.next_value_os().is_none() {
++                if takes_next_value(opt) && short.next_value_os().is_none() {
+                     next_state = ParseState::Opt((opt, 1));
+                 }
+             } else if pos_allows_hyphen(current_cmd, pos_index) {
+@@ -322,14 +322,24 @@ fn complete_option(
+                 };
+ 
+                 let value = short.next_value_os().unwrap_or(OsStr::new(""));
+-                completions.extend(
+-                    complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+-                        .into_iter()
+-                        .map(|comp| {
+-                            let sep = if has_equal { "=" } else { "" };
+-                            comp.add_prefix(format!("-{leading_flags}{sep}"))
+-                        }),
+-                );
++                let sep = if has_equal {
++                    Some("=")
++                } else if !opt.is_require_equals_set() {
++                    Some("")
++                } else if value.is_empty() {
++                    // `require_equals` values must be attached with `=`
++                    Some("=")
++                } else {
++                    // `require_equals` rejects values attached without `=`
++                    None
++                };
++                if let Some(sep) = sep {
++                    completions.extend(
++                        complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
++                            .into_iter()
++                            .map(|comp| comp.add_prefix(format!("-{leading_flags}{sep}"))),
++                    );
++                }
+             } else {
+                 completions.extend(
+                     shorts_and_visible_aliases(cmd)
+@@ -506,9 +516,10 @@ fn longs_and_visible_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
+     p.get_arguments()
+         .filter_map(|a| {
+             a.get_long_and_visible_aliases().map(|longs| {
+-                longs
+-                    .into_iter()
+-                    .map(|s| populate_arg_candidate(CompletionCandidate::new(format!("--{s}")), a))
++                longs.into_iter().map(|s| {
++                    let candidate = CompletionCandidate::new(format!("--{s}{}", flag_suffix(a)));
++                    populate_arg_candidate(candidate, a)
++                })
+             })
+         })
+         .flatten()
+@@ -523,7 +534,8 @@ fn hidden_longs_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
+         .filter_map(|a| {
+             a.get_aliases().map(|longs| {
+                 longs.into_iter().map(|s| {
+-                    populate_arg_candidate(CompletionCandidate::new(format!("--{s}")), a).hide(true)
++                    let candidate = CompletionCandidate::new(format!("--{s}{}", flag_suffix(a)));
++                    populate_arg_candidate(candidate, a).hide(true)
+                 })
+             })
+         })
+@@ -540,7 +552,8 @@ fn shorts_and_visible_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
+         .filter_map(|a| {
+             a.get_short_and_visible_aliases().map(|shorts| {
+                 shorts.into_iter().map(|s| {
+-                    populate_arg_candidate(CompletionCandidate::new(s.to_string()), a).help(
++                    let candidate = CompletionCandidate::new(format!("{s}{}", flag_suffix(a)));
++                    populate_arg_candidate(candidate, a).help(
+                         a.get_help()
+                             .cloned()
+                             .or_else(|| a.get_long().map(|long| format!("--{long}").into())),
+@@ -552,6 +565,16 @@ fn shorts_and_visible_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
+         .collect()
+ }
+ 
++/// Suffix to complete a flag into a valid argument
++fn flag_suffix(arg: &clap::Arg) -> &'static str {
++    // `require_equals` errors without an `=` when a value is required
++    if arg.is_require_equals_set() && arg.get_num_args().expect("built").min_values() > 0 {
++        "="
++    } else {
++        ""
++    }
++}
++
+ fn populate_arg_candidate(candidate: CompletionCandidate, arg: &clap::Arg) -> CompletionCandidate {
+     candidate
+         .help(arg.get_help().cloned())
+@@ -637,7 +660,7 @@ fn parse_shortflags<'c, 's>(
+                     is_find.unwrap_or(false)
+                 });
+                 if opt
+-                    .map(|o| o.get_num_args().expect("built").takes_values())
++                    .map(|o| takes_attached_value(o, &short))
+                     .unwrap_or(false)
+                 {
+                     takes_value_opt = opt;
+@@ -654,6 +677,23 @@ fn parse_shortflags<'c, 's>(
+     (leading_flags, takes_value_opt, short)
+ }
+ 
++/// Whether `opt` takes the rest of its short flags, `rest`, as its value
++fn takes_attached_value(opt: &clap::Arg, rest: &clap_lex::ShortFlags<'_>) -> bool {
++    let num_args = opt.get_num_args().expect("built");
++    if opt.is_require_equals_set() && num_args.min_values() == 0 {
++        // Without `=`, the optional value is skipped and `rest` is more short flags
++        matches!(rest.clone().next_flag(), Some(Ok('=')))
++    } else {
++        num_args.takes_values()
++    }
++}
++
++/// Whether `opt` takes its value from the next argument when none is attached
++fn takes_next_value(opt: &clap::Arg) -> bool {
++    // `require_equals` only accepts values attached with `=`
++    opt.get_num_args().expect("built").takes_values() && !opt.is_require_equals_set()
++}
++
+ /// Parse the positional arguments. Return the new state and the new positional index.
+ fn parse_positional<'a>(
+     cmd: &clap::Command,
+diff --git a/clap_complete/tests/testsuite/engine.rs b/clap_complete/tests/testsuite/engine.rs
+index 9d8d463f..44fd9a07 100644
+--- a/clap_complete/tests/testsuite/engine.rs
++++ b/clap_complete/tests/testsuite/engine.rs
+@@ -1332,7 +1332,7 @@ fn suggest_require_equals() {
+     assert_data_eq!(
+         complete!(cmd, "--[TAB]"),
+         snapbox::str![[r#"
+---format
++--format=
+ --color
+ --help	Print help
+ "#]]
+@@ -1341,19 +1341,20 @@ fn suggest_require_equals() {
+     assert_data_eq!(
+         complete!(cmd, "--format [TAB]"),
+         snapbox::str![[r#"
+-json
+-yaml
++pos_a
++pos_b
++--format=
++--color
++--help	Print help
+ "#]]
+     );
+ 
+     assert_data_eq!(
+         complete!(cmd, "--color [TAB]"),
+         snapbox::str![[r#"
+-always
+-never
+ pos_a
+ pos_b
+---format
++--format=
+ --color
+ --help	Print help
+ "#]]
+@@ -1370,7 +1371,7 @@ pos_b
+     assert_data_eq!(
+         complete!(cmd, "-[TAB]"),
+         snapbox::str![[r#"
+--F	--format
++-F=	--format
+ -c	--color
+ -h	Print help
+ "#]]
+@@ -1379,24 +1380,28 @@ pos_b
+     assert_data_eq!(
+         complete!(cmd, "-F[TAB]"),
+         snapbox::str![[r#"
+--Fjson
+--Fyaml
++-F=json
++-F=yaml
+ "#]]
+     );
+ 
+     assert_data_eq!(
+         complete!(cmd, "-F [TAB]"),
+         snapbox::str![[r#"
+-json
+-yaml
++pos_a
++pos_b
++--format=
++--color
++--help	Print help
+ "#]]
+     );
+ 
+     assert_data_eq!(
+         complete!(cmd, "-c[TAB]"),
+         snapbox::str![[r#"
+--calways
+--cnever
++-cF=	--format
++-cc	--color
++-ch	Print help
+ "#]]
+     );
+ 
+-- 
+2.43.0
+

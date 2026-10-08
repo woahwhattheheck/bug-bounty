@@ -1,0 +1,2282 @@
+From 0f872a5745378443ec5df2afc79f2ba562ba2849 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:47:10 +0000
+Subject: [PATCH] feat(connected-accounts): automated Mastodon posts for
+ collectives
+
+Part of opencollective/opencollective#7138: make the Fediverse a first
+class citizen for automated announcements, replacing what the removed
+Twitter integration used to do.
+
+- Add a `MicrobloggingService` interface (server/lib/microblogging) and
+  its Mastodon implementation. Collectives connect an account with an
+  access token from their Mastodon server, stored encrypted in a
+  `mastodon` ConnectedAccount. All requests go through the webhook SSRF
+  protections (pinned DNS, no private addresses, no redirects).
+- Activity-to-post pipeline, called by the notifications dispatcher on
+  `collective.member.created`: thank new financial contributors (with
+  a mention when their profile links a Mastodon account, never for
+  incognito contributors) and celebrate contributor milestones.
+- Monthly CRON job posting the stats of the previous month, threaded
+  with the previous report.
+- Each post type can be toggled per account. Posts are rate limited,
+  deduplicated with Idempotency-Key and fit the server's character
+  limit. Accounts whose token was revoked are flagged for reconnection.
+- GraphQL: `createConnectedAccount` accepts `service: mastodon` with
+  `instanceUrl`, new `editConnectedAccountPostSettings` mutation,
+  `ConnectedAccount.username` and post settings for admins.
+- Everything is behind the `MICROBLOGGING_POSTS` feature flag (off by
+  default).
+---
+ config/custom-environment-variables.json      |   3 +-
+ config/default.json                           |   3 +-
+ cron/monthly/microblogging-monthly-stats.ts   |  22 +
+ docs/environment_variables.md                 |   1 +
+ server/constants/connected-account.ts         |   1 +
+ server/graphql/schemaV2.graphql               |  46 ++
+ .../v2/input/ConnectedAccountCreateInput.ts   |   5 +
+ .../ConnectedAccountPostSettingsInput.ts      |  23 +
+ .../v2/mutation/ConnectedAccountMutations.ts  |  45 +-
+ server/graphql/v2/object/ConnectedAccount.ts  |  12 +-
+ server/lib/microblogging/index.ts             | 473 +++++++++++++++++
+ server/lib/microblogging/mastodon.ts          | 240 +++++++++
+ server/lib/microblogging/posts.ts             | 106 ++++
+ server/lib/microblogging/text.ts              |  67 +++
+ server/lib/microblogging/types.ts             |  85 +++
+ server/lib/notifications/index.ts             |  15 +-
+ test/server/lib/microblogging/index.test.ts   | 485 ++++++++++++++++++
+ .../server/lib/microblogging/mastodon.test.ts | 208 ++++++++
+ test/server/lib/microblogging/posts.test.ts   | 151 ++++++
+ 19 files changed, 1986 insertions(+), 5 deletions(-)
+ create mode 100644 cron/monthly/microblogging-monthly-stats.ts
+ create mode 100644 server/graphql/v2/input/ConnectedAccountPostSettingsInput.ts
+ create mode 100644 server/lib/microblogging/index.ts
+ create mode 100644 server/lib/microblogging/mastodon.ts
+ create mode 100644 server/lib/microblogging/posts.ts
+ create mode 100644 server/lib/microblogging/text.ts
+ create mode 100644 server/lib/microblogging/types.ts
+ create mode 100644 test/server/lib/microblogging/index.test.ts
+ create mode 100644 test/server/lib/microblogging/mastodon.test.ts
+ create mode 100644 test/server/lib/microblogging/posts.test.ts
+
+diff --git a/config/custom-environment-variables.json b/config/custom-environment-variables.json
+index 7b83eea2d..c8dab0701 100644
+--- a/config/custom-environment-variables.json
++++ b/config/custom-environment-variables.json
+@@ -287,7 +287,8 @@
+     "spaceId": "GITBOOK_SPACE_ID"
+   },
+   "features": {
+-    "newPricing": "NEW_PRICING"
++    "newPricing": "NEW_PRICING",
++    "microbloggingPosts": "MICROBLOGGING_POSTS"
+   },
+   "settlement": {
+     "minimumAmountInUSD": "SETTLEMENT_MINIMUM_AMOUNT_IN_USD"
+diff --git a/config/default.json b/config/default.json
+index a5de5184e..0de1a67a3 100644
+--- a/config/default.json
++++ b/config/default.json
+@@ -290,7 +290,8 @@
+     "expectedOrigins": ["http://localhost:3000"]
+   },
+   "features": {
+-    "newPricing": false
++    "newPricing": false,
++    "microbloggingPosts": false
+   },
+   "performance": {
+     "hostsWithManyTransactions": [],
+diff --git a/cron/monthly/microblogging-monthly-stats.ts b/cron/monthly/microblogging-monthly-stats.ts
+new file mode 100644
+index 000000000..596c5da1d
+--- /dev/null
++++ b/cron/monthly/microblogging-monthly-stats.ts
+@@ -0,0 +1,22 @@
++import '../../server/env';
++
++import config from 'config';
++
++import logger from '../../server/lib/logger';
++import { postMonthlyStatsForAllConnectedAccounts } from '../../server/lib/microblogging';
++import { parseToBoolean } from '../../server/lib/utils';
++import { runCronJob } from '../utils';
++
++/**
++ * Publishes the stats of the previous month on the microblogging accounts (Mastodon) connected
++ * by collectives that enabled monthly stats posts. Requires the `MICROBLOGGING_POSTS` feature flag.
++ */
++if (require.main === module) {
++  // Only run on the 1st of the month
++  if (config.env === 'production' && new Date().getDate() !== 1 && !parseToBoolean(process.env.OFFCYCLE)) {
++    logger.info('OC_ENV is production and today is not the 1st of month, script aborted!');
++    process.exit();
++  }
++
++  runCronJob('microblogging-monthly-stats', () => postMonthlyStatsForAllConnectedAccounts(), 23 * 60 * 60);
++}
+diff --git a/docs/environment_variables.md b/docs/environment_variables.md
+index 97628749a..49b827fb8 100644
+--- a/docs/environment_variables.md
++++ b/docs/environment_variables.md
+@@ -151,3 +151,4 @@
+ | GITBOOK_API_KEY                               | .gitbook.apiKey                                        | GitBook API key                                                                    |
+ | SETTLEMENT_MINIMUM_AMOUNT_IN_USD              | .settlement.minimumAmountInUSD                         | Minimum settlement amount in USD                                                   |
+ | NEW_PRICING                                   | .features.newPricing                                   | New pricing feature                                                                |
++| MICROBLOGGING_POSTS                           | .features.microbloggingPosts                           | Enable automated posts to Mastodon (thanks, milestones, monthly stats)             |
+diff --git a/server/constants/connected-account.ts b/server/constants/connected-account.ts
+index 4a1f69e41..ff481ec61 100644
+--- a/server/constants/connected-account.ts
++++ b/server/constants/connected-account.ts
+@@ -6,6 +6,7 @@ export enum Service {
+   TRANSFERWISE = 'transferwise',
+   PLAID = 'plaid',
+   GOCARDLESS = 'gocardless',
++  MASTODON = 'mastodon',
+   /** @deprecated */
+   TWITTER = 'twitter',
+   /** @deprecated */
+diff --git a/server/graphql/schemaV2.graphql b/server/graphql/schemaV2.graphql
+index e0ce2bf1a..128f0017e 100644
+--- a/server/graphql/schemaV2.graphql
++++ b/server/graphql/schemaV2.graphql
+@@ -6762,6 +6762,11 @@ type ConnectedAccount {
+   """
+   authorizationExpiresAt: DateTime
+   settings: JSON
++
++  """
++  The username of the account on the service, e.g. "@opencollective@mastodon.social" for Mastodon
++  """
++  username: String
+   service: ConnectedAccountService!
+ 
+   """
+@@ -6792,6 +6797,7 @@ enum ConnectedAccountService {
+   transferwise
+   plaid
+   gocardless
++  mastodon
+   twitter
+   privacy @deprecated(reason: "Not using this service anymore")
+   thegivingblock
+@@ -26508,6 +26514,21 @@ type Mutation {
+     connectedAccount: ConnectedAccountReferenceInput!
+   ): ConnectedAccount
+ 
++  """
++  Choose which automated posts are published on a microblogging connected account (Mastodon). Scope: "connectedAccounts".
++  """
++  editConnectedAccountPostSettings(
++    """
++    ConnectedAccount reference containing either id or legacyId
++    """
++    connectedAccount: ConnectedAccountReferenceInput!
++
++    """
++    The automated posts to enable or disable
++    """
++    postSettings: ConnectedAccountPostSettingsInput!
++  ): ConnectedAccount!
++
+   """
+   Set the balance/clearing accounting category used to attribute payments processed through this connected account. Scope: "connectedAccounts".
+   """
+@@ -29222,6 +29243,11 @@ input ConnectedAccountCreateInput {
+   """
+   data: JSON
+ 
++  """
++  URL of the server hosting the account, for federated services like Mastodon (e.g. https://mastodon.social)
++  """
++  instanceUrl: String
++
+   """
+   Refresh token for the connected account
+   """
+@@ -29260,6 +29286,26 @@ input ConnectedAccountReferenceInput {
+   legacyId: Int @deprecated(reason: "2026-02-25: use id")
+ }
+ 
++"""
++Automated posts published on a microblogging connected account (Mastodon). Omitted fields are unchanged.
++"""
++input ConnectedAccountPostSettingsInput {
++  """
++  Thank new financial contributors
++  """
++  newContributors: Boolean
++
++  """
++  Celebrate the number of financial contributors (10, 25, 50, 100...)
++  """
++  milestones: Boolean
++
++  """
++  Publish a summary of the previous month (money received and spent, new contributors, balance)
++  """
++  monthlyStats: Boolean
++}
++
+ type EmojiReactionResponse {
+   """
+   Reference to the update corresponding to the emojis
+diff --git a/server/graphql/v2/input/ConnectedAccountCreateInput.ts b/server/graphql/v2/input/ConnectedAccountCreateInput.ts
+index a1000093f..c4c42fdbe 100644
+--- a/server/graphql/v2/input/ConnectedAccountCreateInput.ts
++++ b/server/graphql/v2/input/ConnectedAccountCreateInput.ts
+@@ -17,6 +17,11 @@ export const GraphQLConnectedAccountCreateInput = new GraphQLInputObjectType({
+       type: GraphQLJSON,
+       description: 'Private data related to the connected account',
+     },
++    instanceUrl: {
++      type: GraphQLString,
++      description:
++        'URL of the server hosting the account, for federated services like Mastodon (e.g. https://mastodon.social)',
++    },
+     refreshToken: {
+       type: GraphQLString,
+       description: 'Refresh token for the connected account',
+diff --git a/server/graphql/v2/input/ConnectedAccountPostSettingsInput.ts b/server/graphql/v2/input/ConnectedAccountPostSettingsInput.ts
+new file mode 100644
+index 000000000..5266f5e44
+--- /dev/null
++++ b/server/graphql/v2/input/ConnectedAccountPostSettingsInput.ts
+@@ -0,0 +1,23 @@
++import { GraphQLBoolean, GraphQLInputObjectType } from 'graphql';
++
++import { MicrobloggingPostType } from '../../../lib/microblogging/types';
++
++export const GraphQLConnectedAccountPostSettingsInput = new GraphQLInputObjectType({
++  name: 'ConnectedAccountPostSettingsInput',
++  description:
++    'Automated posts published on a microblogging connected account (Mastodon). Omitted fields are unchanged.',
++  fields: () => ({
++    [MicrobloggingPostType.NEW_CONTRIBUTOR]: {
++      type: GraphQLBoolean,
++      description: 'Thank new financial contributors',
++    },
++    [MicrobloggingPostType.MILESTONE]: {
++      type: GraphQLBoolean,
++      description: 'Celebrate the number of financial contributors (10, 25, 50, 100...)',
++    },
++    [MicrobloggingPostType.MONTHLY_STATS]: {
++      type: GraphQLBoolean,
++      description: 'Publish a summary of the previous month (money received and spent, new contributors, balance)',
++    },
++  }),
++});
+diff --git a/server/graphql/v2/mutation/ConnectedAccountMutations.ts b/server/graphql/v2/mutation/ConnectedAccountMutations.ts
+index 237f06dce..3a5e8f145 100644
+--- a/server/graphql/v2/mutation/ConnectedAccountMutations.ts
++++ b/server/graphql/v2/mutation/ConnectedAccountMutations.ts
+@@ -7,6 +7,7 @@ import FEATURE from '../../../constants/feature';
+ import { getErrorMessageFromFeatureAccess, getFeatureAccess } from '../../../lib/allowed-features';
+ import { crypto } from '../../../lib/encryption';
+ import { disconnectGoCardlessAccount } from '../../../lib/gocardless/connect';
++import { connectMicrobloggingAccount, editMicrobloggingPostSettings } from '../../../lib/microblogging';
+ import * as paypal from '../../../lib/paypal';
+ import { disconnectPlaidAccount } from '../../../lib/plaid/connect';
+ import twoFactorAuthLib from '../../../lib/two-factor-authentication';
+@@ -21,6 +22,7 @@ import {
+ } from '../input/AccountingCategoryInput';
+ import { fetchAccountWithReference, GraphQLAccountReferenceInput } from '../input/AccountReferenceInput';
+ import { GraphQLConnectedAccountCreateInput } from '../input/ConnectedAccountCreateInput';
++import { GraphQLConnectedAccountPostSettingsInput } from '../input/ConnectedAccountPostSettingsInput';
+ import {
+   fetchConnectedAccountWithReference,
+   GraphQLConnectedAccountReferenceInput,
+@@ -51,6 +53,17 @@ const connectedAccountMutations = {
+ 
+       await twoFactorAuthLib.enforceForAccount(req, collective);
+ 
++      if (args.connectedAccount.service === Service.MASTODON) {
++        return connectMicrobloggingAccount({
++          collective,
++          service: args.connectedAccount.service,
++          token: args.connectedAccount.token,
++          instanceUrl: args.connectedAccount.instanceUrl,
++          settings: args.connectedAccount.settings,
++          remoteUser: req.remoteUser,
++        });
++      }
++
+       // Check feature access for PAYPAL_PAYOUTS
+       if (args.connectedAccount.service === Service.PAYPAL) {
+         const payoutsAccess = await getFeatureAccess(collective, FEATURE.PAYPAL_PAYOUTS, { loaders: req.loaders });
+@@ -76,7 +89,7 @@ const connectedAccountMutations = {
+           }
+         }
+       } else {
+-        throw new Unauthorized('Only PayPal is supported');
++        throw new Unauthorized('Only PayPal and Mastodon are supported');
+       }
+ 
+       const connectedAccount = await models.ConnectedAccount.create({
+@@ -151,6 +164,36 @@ const connectedAccountMutations = {
+       return connectedAccount;
+     },
+   },
++  editConnectedAccountPostSettings: {
++    type: new GraphQLNonNull(GraphQLConnectedAccount),
++    description:
++      'Choose which automated posts are published on a microblogging connected account (Mastodon). Scope: "connectedAccounts".',
++    args: {
++      connectedAccount: {
++        type: new GraphQLNonNull(GraphQLConnectedAccountReferenceInput),
++        description: 'ConnectedAccount reference containing either id or legacyId',
++      },
++      postSettings: {
++        type: new GraphQLNonNull(GraphQLConnectedAccountPostSettingsInput),
++        description: 'The automated posts to enable or disable',
++      },
++    },
++    async resolve(_: void, args, req: express.Request): Promise<ConnectedAccountModel> {
++      checkRemoteUserCanUseConnectedAccounts(req);
++
++      const connectedAccount = await fetchConnectedAccountWithReference(args.connectedAccount, {
++        throwIfMissing: true,
++      });
++
++      const collective = await req.loaders.Collective.byId.load(connectedAccount.CollectiveId);
++      if (!req.remoteUser.isAdminOfCollective(collective)) {
++        throw new Unauthorized("You don't have permission to edit this collective");
++      }
++
++      await twoFactorAuthLib.enforceForAccount(req, collective);
++      return editMicrobloggingPostSettings(connectedAccount, args.postSettings);
++    },
++  },
+   setConnectedAccountBalanceAccountingCategory: {
+     type: new GraphQLNonNull(GraphQLConnectedAccount),
+     description:
+diff --git a/server/graphql/v2/object/ConnectedAccount.ts b/server/graphql/v2/object/ConnectedAccount.ts
+index bd98a4dc3..cda1333c4 100644
+--- a/server/graphql/v2/object/ConnectedAccount.ts
++++ b/server/graphql/v2/object/ConnectedAccount.ts
+@@ -62,7 +62,17 @@ export const GraphQLConnectedAccount = new GraphQLObjectType<ConnectedAccount, E
+         if (!req.remoteUser?.isAdmin(connectedAccount.CollectiveId)) {
+           throw new Unauthorized('You need to be logged in as an admin of the account');
+         }
+-        return pick(connectedAccount.settings, ['mirroredCollective', 'isMirror']);
++        return pick(connectedAccount.settings, ['mirroredCollective', 'isMirror', 'posts', 'needsReconnect']);
++      },
++    },
++    username: {
++      type: GraphQLString,
++      description: 'The username of the account on the service, e.g. "@opencollective@mastodon.social" for Mastodon',
++      resolve(connectedAccount, _, req) {
++        if (!req.remoteUser?.isAdmin(connectedAccount.CollectiveId)) {
++          return null;
++        }
++        return connectedAccount.username;
+       },
+     },
+     service: { type: new GraphQLNonNull(GraphQLConnectedAccountService) },
+diff --git a/server/lib/microblogging/index.ts b/server/lib/microblogging/index.ts
+new file mode 100644
+index 000000000..192f4eb69
+--- /dev/null
++++ b/server/lib/microblogging/index.ts
+@@ -0,0 +1,473 @@
++import config from 'config';
++import { pick } from 'lodash';
++
++import ActivityTypes from '../../constants/activities';
++import { CollectiveType } from '../../constants/collectives';
++import { Service } from '../../constants/connected-account';
++import MemberRoles from '../../constants/roles';
++import { Forbidden, ValidationFailed } from '../../graphql/errors';
++import models, { Activity, Collective, ConnectedAccount, User } from '../../models';
++import { SocialLinkType } from '../../models/SocialLink';
++import logger from '../logger';
++import RateLimit, { ONE_HOUR_IN_SECONDS } from '../rate-limit';
++import { reportErrorToSentry } from '../sentry';
++import { parseToBoolean } from '../utils';
++
++import mastodon from './mastodon';
++import {
++  composeMilestonePost,
++  composeMonthlyStatsPost,
++  composeNewContributorPost,
++  getHighestMilestoneReached,
++  MonthlyStats,
++} from './posts';
++import { buildPostText } from './text';
++import {
++  MicrobloggingAuthenticationError,
++  MicrobloggingPost,
++  MicrobloggingPostResult,
++  MicrobloggingPostSettings,
++  MicrobloggingPostType,
++  MicrobloggingRequestError,
++  MicrobloggingService,
++} from './types';
++
++/** Connected account services that can receive automated posts */
++const MICROBLOGGING_SERVICES: readonly Service[] = [Service.MASTODON];
++
++const SERVICES: Partial<Record<Service, MicrobloggingService>> = {
++  [Service.MASTODON]: mastodon,
++};
++
++/** Account types that can connect a microblogging account for automated posts */
++const ALLOWED_ACCOUNT_TYPES: readonly CollectiveType[] = [
++  CollectiveType.COLLECTIVE,
++  CollectiveType.FUND,
++  CollectiveType.PROJECT,
++  CollectiveType.EVENT,
++  CollectiveType.ORGANIZATION,
++];
++
++const DEFAULT_POST_SETTINGS: MicrobloggingPostSettings = {
++  [MicrobloggingPostType.NEW_CONTRIBUTOR]: true,
++  [MicrobloggingPostType.MILESTONE]: true,
++  [MicrobloggingPostType.MONTHLY_STATS]: true,
++};
++
++/** Prevents flooding the timeline of collectives receiving many contributions at once */
++const MAX_NEW_CONTRIBUTOR_POSTS_PER_HOUR = 10;
++
++/** Platform-level feature flag (`MICROBLOGGING_POSTS` env variable) */
++const isMicrobloggingPostsEnabled = (): boolean => parseToBoolean(config.features?.microbloggingPosts);
++
++const isMicrobloggingService = (service: string): boolean => (MICROBLOGGING_SERVICES as string[]).includes(service);
++
++const getService = (service: string): MicrobloggingService => {
++  const microbloggingService = SERVICES[service];
++  if (!microbloggingService) {
++    throw new ValidationFailed(`Automated posts are not supported for ${service}`);
++  }
++  return microbloggingService;
++};
++
++/** Returns the post settings of the connected account. Posts that were never configured are disabled. */
++const getPostSettings = (connectedAccount: ConnectedAccount): MicrobloggingPostSettings => {
++  const settings = connectedAccount.settings?.posts || {};
++  return {
++    [MicrobloggingPostType.NEW_CONTRIBUTOR]: settings[MicrobloggingPostType.NEW_CONTRIBUTOR] === true,
++    [MicrobloggingPostType.MILESTONE]: settings[MicrobloggingPostType.MILESTONE] === true,
++    [MicrobloggingPostType.MONTHLY_STATS]: settings[MicrobloggingPostType.MONTHLY_STATS] === true,
++  };
++};
++
++/** Keeps the known boolean flags from `input`, falling back on `defaults` */
++const sanitizePostSettings = (input: unknown, defaults: MicrobloggingPostSettings): MicrobloggingPostSettings => {
++  const result = { ...defaults };
++  if (input && typeof input === 'object') {
++    for (const type of Object.values(MicrobloggingPostType)) {
++      if (typeof input[type] === 'boolean') {
++        result[type] = input[type];
++      }
++    }
++  }
++  return result;
++};
++
++/** Number of distinct financial contributors of a collective */
++const countFinancialContributors = (CollectiveId: number): Promise<number> => {
++  return models.Member.count({
++    where: { CollectiveId, role: MemberRoles.BACKER },
++    distinct: true,
++    col: 'MemberCollectiveId',
++  });
++};
++
++/**
++ * Connects (or reconnects) a microblogging account to `collective` after checking the credentials
++ * with the service.
++ */
++export const connectMicrobloggingAccount = async ({
++  collective,
++  service,
++  token,
++  instanceUrl,
++  settings,
++  remoteUser,
++}: {
++  collective: Collective;
++  service: string;
++  token: string;
++  instanceUrl: string;
++  settings?: Record<string, unknown>;
++  remoteUser: User;
++}): Promise<ConnectedAccount> => {
++  if (!isMicrobloggingPostsEnabled()) {
++    throw new Forbidden('Automated posts are not enabled on this platform');
++  } else if (!ALLOWED_ACCOUNT_TYPES.includes(collective.type as CollectiveType)) {
++    throw new ValidationFailed('Automated posts are not available for this type of account');
++  } else if (collective.isPrivate) {
++    throw new Forbidden('Automated posts are not available for private accounts');
++  }
++
++  const microbloggingService = getService(service);
++  const accountInfo = await microbloggingService.verifyCredentials({ instanceUrl, token });
++  const data = {
++    instanceUrl: accountInfo.instanceUrl,
++    accountId: accountInfo.id,
++    profileUrl: accountInfo.url,
++    limits: accountInfo.limits,
++  };
++
++  // Connecting the same remote account again refreshes its credentials (e.g. after a token was revoked)
++  const existingAccount = await models.ConnectedAccount.findOne({
++    where: { CollectiveId: collective.id, service, username: accountInfo.handle },
++  });
++  if (existingAccount) {
++    return existingAccount.update({
++      token,
++      data: { ...existingAccount.data, ...data },
++      settings: {
++        ...existingAccount.settings,
++        needsReconnect: false,
++        posts: sanitizePostSettings(settings?.posts, getPostSettings(existingAccount)),
++      },
++    });
++  }
++
++  // Only celebrate milestones reached after connecting the account
++  const lastMilestone = getHighestMilestoneReached(await countFinancialContributors(collective.id));
++  return models.ConnectedAccount.create({
++    service,
++    CollectiveId: collective.id,
++    CreatedByUserId: remoteUser.id,
++    username: accountInfo.handle,
++    token,
++    data: { ...data, posts: { [MicrobloggingPostType.MILESTONE]: { lastMilestone } } },
++    settings: { posts: sanitizePostSettings(settings?.posts, DEFAULT_POST_SETTINGS) },
++  });
++};
++
++export const editMicrobloggingPostSettings = async (
++  connectedAccount: ConnectedAccount,
++  postSettings: Partial<MicrobloggingPostSettings>,
++): Promise<ConnectedAccount> => {
++  if (!isMicrobloggingService(connectedAccount.service)) {
++    throw new ValidationFailed(`Automated posts are not supported for ${connectedAccount.service}`);
++  }
++
++  return connectedAccount.update({
++    settings: {
++      ...connectedAccount.settings,
++      posts: sanitizePostSettings(postSettings, getPostSettings(connectedAccount)),
++    },
++  });
++};
++
++const recordPost = (
++  connectedAccount: ConnectedAccount,
++  type: MicrobloggingPostType,
++  values: Record<string, unknown>,
++): Promise<ConnectedAccount> => {
++  const posts = connectedAccount.data?.posts || {};
++  return connectedAccount.update({
++    data: { ...connectedAccount.data, posts: { ...posts, [type]: { ...posts[type], ...values } } },
++  });
++};
++
++/**
++ * Publishes a post, without ever throwing: errors are reported to Sentry, and accounts whose
++ * credentials were revoked are flagged so that we stop posting until they get reconnected.
++ */
++const publish = async (
++  connectedAccount: ConnectedAccount,
++  post: MicrobloggingPost,
++  type: MicrobloggingPostType,
++): Promise<MicrobloggingPostResult | null> => {
++  try {
++    return await getService(connectedAccount.service).post(connectedAccount, post);
++  } catch (error) {
++    if (error instanceof MicrobloggingAuthenticationError) {
++      logger.warn(`Microblogging: credentials of connected account #${connectedAccount.id} were rejected`);
++      await connectedAccount.update({ settings: { ...connectedAccount.settings, needsReconnect: true } });
++    } else if (post.inReplyToId && error instanceof MicrobloggingRequestError && [404, 422].includes(error.status)) {
++      // The post we're replying to was probably deleted, start a new thread
++      return publish(connectedAccount, { ...post, inReplyToId: null }, type);
++    } else {
++      reportErrorToSentry(error, { extra: { connectedAccountId: connectedAccount.id, type } });
++    }
++    return null;
++  }
++};
++
++/** Returns `@user@domain` from a Mastodon profile URL such as `https://mastodon.social/@user` */
++export const getFediverseHandleFromProfileUrl = (profileUrl: string): string | null => {
++  let url: URL;
++  try {
++    url = new URL(profileUrl);
++  } catch {
++    return null;
++  }
++
++  if (!['https:', 'http:'].includes(url.protocol)) {
++    return null;
++  }
++
++  const match = url.pathname.match(/^\/(?:@|users\/)([\w.-]+)(?:@([\w-]+(?:\.[\w-]+)+))?\/?$/);
++  return match ? `@${match[1]}@${match[2] || url.hostname}` : null;
++};
++
++const getContributorFediverseHandle = async (CollectiveId: number): Promise<string | null> => {
++  const socialLink = await models.SocialLink.findOne({
++    where: { CollectiveId, type: SocialLinkType.MASTODON },
++    order: [['order', 'ASC']],
++  });
++  return socialLink ? getFediverseHandleFromProfileUrl(socialLink.url) : null;
++};
++
++const getAccountUrl = (collective: { slug?: string; urlPath?: string }): string => {
++  return `${config.host.website}${collective.urlPath || `/${collective.slug}`}`;
++};
++
++const postNewContributorThanks = async (connectedAccount: ConnectedAccount, activity: Activity): Promise<void> => {
++  const rateLimit = new RateLimit(
++    `microblogging-new-contributors-${connectedAccount.id}`,
++    MAX_NEW_CONTRIBUTOR_POSTS_PER_HOUR,
++    ONE_HOUR_IN_SECONDS,
++  );
++  if (!(await rateLimit.registerCall())) {
++    logger.info(`Microblogging: rate limit reached for new contributor posts on #${connectedAccount.id}`);
++    return;
++  }
++
++  const { collective, member, order } = activity.data;
++  const contributor = member.memberCollective || {};
++  const isIncognito = Boolean(contributor.isIncognito);
++  const contributorHandle = isIncognito || !contributor.id ? null : await getContributorFediverseHandle(contributor.id);
++  const body = composeNewContributorPost({
++    collectiveName: collective.name,
++    contributorName: contributor.name,
++    contributorHandle,
++    isIncognito,
++    amount: order?.netAmount ?? order?.totalAmount,
++    currency: order?.currency,
++    interval: order?.interval,
++  });
++
++  const limits = getService(connectedAccount.service).getTextLimits(connectedAccount);
++  const result = await publish(
++    connectedAccount,
++    {
++      text: buildPostText(body, getAccountUrl(collective), limits),
++      idempotencyKey: `opencollective-activity-${activity.id}`,
++    },
++    MicrobloggingPostType.NEW_CONTRIBUTOR,
++  );
++
++  if (result) {
++    await recordPost(connectedAccount, MicrobloggingPostType.NEW_CONTRIBUTOR, {
++      lastPostId: result.id,
++      lastPostedAt: result.createdAt || new Date(),
++    });
++  }
++};
++
++const postMilestoneIfReached = async (
++  connectedAccount: ConnectedAccount,
++  activity: Activity,
++  contributorsCount: number,
++): Promise<void> => {
++  const milestone = getHighestMilestoneReached(contributorsCount);
++  const lastMilestone =
++    connectedAccount.data?.posts?.[MicrobloggingPostType.MILESTONE]?.lastMilestone ??
++    getHighestMilestoneReached(contributorsCount - 1);
++  if (!milestone || milestone <= lastMilestone) {
++    return;
++  }
++
++  const { collective } = activity.data;
++  const limits = getService(connectedAccount.service).getTextLimits(connectedAccount);
++  const body = composeMilestonePost({ collectiveName: collective.name, milestone });
++  const result = await publish(
++    connectedAccount,
++    {
++      text: buildPostText(body, getAccountUrl(collective), limits),
++      idempotencyKey: `opencollective-milestone-${activity.CollectiveId}-${milestone}`,
++    },
++    MicrobloggingPostType.MILESTONE,
++  );
++
++  if (result) {
++    await recordPost(connectedAccount, MicrobloggingPostType.MILESTONE, {
++      lastMilestone: milestone,
++      lastPostId: result.id,
++      lastPostedAt: result.createdAt || new Date(),
++    });
++  }
++};
++
++/**
++ * Activity to post pipeline, called by the notifications dispatcher for every activity. It thanks new
++ * financial contributors and celebrates milestones on the microblogging accounts connected to the
++ * collective, according to their settings.
++ */
++export const postActivityToMicroblogging = async (activity: Activity): Promise<void> => {
++  if (
++    !isMicrobloggingPostsEnabled() ||
++    activity.type !== ActivityTypes.COLLECTIVE_MEMBER_CREATED ||
++    activity.data?.member?.role !== MemberRoles.BACKER ||
++    !activity.CollectiveId ||
++    !activity.data.collective ||
++    activity.data.collective.isPrivate
++  ) {
++    return;
++  }
++
++  const connectedAccounts = await models.ConnectedAccount.findAll({
++    where: { CollectiveId: activity.CollectiveId, service: MICROBLOGGING_SERVICES as Service[] },
++  });
++
++  const activeAccounts = connectedAccounts.filter(account => !account.settings?.needsReconnect);
++  if (!activeAccounts.length) {
++    return;
++  }
++
++  let contributorsCount: number = null;
++  for (const connectedAccount of activeAccounts) {
++    const postSettings = getPostSettings(connectedAccount);
++    if (postSettings[MicrobloggingPostType.NEW_CONTRIBUTOR]) {
++      await postNewContributorThanks(connectedAccount, activity);
++    }
++    if (postSettings[MicrobloggingPostType.MILESTONE]) {
++      contributorsCount ??= await countFinancialContributors(activity.CollectiveId);
++      await postMilestoneIfReached(connectedAccount, activity, contributorsCount);
++    }
++  }
++};
++
++/** Returns the boundaries of the month before `date` (UTC) */
++const getPreviousMonth = (date: Date): { startDate: Date; endDate: Date; period: string; periodKey: string } => {
++  const startDate = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() - 1, 1));
++  const endDate = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
++  return {
++    startDate,
++    endDate,
++    period: startDate.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' }),
++    periodKey: startDate.toISOString().slice(0, 7),
++  };
++};
++
++const getMonthlyStats = async (
++  collective: Collective,
++  { startDate, endDate, period }: { startDate: Date; endDate: Date; period: string },
++): Promise<MonthlyStats> => {
++  const [totalReceived, totalSpent, backersStats, activeContributors, balance] = await Promise.all([
++    collective.getTotalTransactions(startDate, endDate, 'donation', 'amount'),
++    collective.getTotalTransactions(startDate, endDate, 'expense', 'amount'),
++    collective.getBackersStats(startDate, endDate),
++    collective.getBackersCount({ since: startDate, until: endDate }),
++    collective.getBalance({ endDate }),
++  ]);
++
++  return {
++    period,
++    currency: collective.currency,
++    totalReceived,
++    totalSpent,
++    balance,
++    newContributors: backersStats.backers.new,
++    activeContributors: Number(activeContributors) || 0,
++  };
++};
++
++/** Posts the stats of the previous month for a connected account. Returns true if a post was published. */
++export const postMonthlyStats = async (
++  connectedAccount: ConnectedAccount,
++  collective: Collective,
++  { date = new Date() }: { date?: Date } = {},
++): Promise<boolean> => {
++  const month = getPreviousMonth(date);
++  const monthlyState = connectedAccount.data?.posts?.[MicrobloggingPostType.MONTHLY_STATS] || {};
++  if (
++    !getPostSettings(connectedAccount)[MicrobloggingPostType.MONTHLY_STATS] ||
++    connectedAccount.settings?.needsReconnect ||
++    collective.isPrivate ||
++    monthlyState.lastPeriod === month.periodKey
++  ) {
++    return false;
++  }
++
++  const stats = await getMonthlyStats(collective, month);
++  const limits = getService(connectedAccount.service).getTextLimits(connectedAccount);
++  const body = composeMonthlyStatsPost({ collectiveName: collective.name, stats });
++  const result = await publish(
++    connectedAccount,
++    {
++      text: buildPostText(
++        body,
++        getAccountUrl({ slug: collective.slug, urlPath: await collective.getUrlPath() }),
++        limits,
++      ),
++      inReplyToId: monthlyState.lastPostId || null, // Thread the monthly reports together
++      idempotencyKey: `opencollective-monthly-stats-${connectedAccount.id}-${month.periodKey}`,
++    },
++    MicrobloggingPostType.MONTHLY_STATS,
++  );
++
++  if (!result) {
++    return false;
++  }
++
++  await recordPost(connectedAccount, MicrobloggingPostType.MONTHLY_STATS, {
++    lastPeriod: month.periodKey,
++    lastPostId: result.id,
++    lastPostedAt: result.createdAt || new Date(),
++  });
++  return true;
++};
++
++/** Entry point of the monthly CRON job */
++export const postMonthlyStatsForAllConnectedAccounts = async ({ date = new Date() }: { date?: Date } = {}) => {
++  if (!isMicrobloggingPostsEnabled()) {
++    logger.info('Microblogging: automated posts are disabled, skipping monthly stats');
++    return { posted: 0 };
++  }
++
++  const connectedAccounts = await models.ConnectedAccount.findAll({
++    where: { service: MICROBLOGGING_SERVICES as Service[] },
++    include: [{ model: models.Collective, as: 'collective', required: true, where: { deactivatedAt: null } }],
++  });
++
++  let posted = 0;
++  for (const connectedAccount of connectedAccounts) {
++    try {
++      if (await postMonthlyStats(connectedAccount, connectedAccount.collective, { date })) {
++        posted++;
++      }
++    } catch (error) {
++      reportErrorToSentry(error, { extra: pick(connectedAccount, ['id', 'CollectiveId']) });
++    }
++  }
++
++  logger.info(`Microblogging: posted monthly stats for ${posted}/${connectedAccounts.length} connected accounts`);
++  return { posted };
++};
+diff --git a/server/lib/microblogging/mastodon.ts b/server/lib/microblogging/mastodon.ts
+new file mode 100644
+index 000000000..d6e63f4d5
+--- /dev/null
++++ b/server/lib/microblogging/mastodon.ts
+@@ -0,0 +1,240 @@
++import axios, { AxiosError, Method } from 'axios';
++
++import { Service } from '../../constants/connected-account';
++import { ValidationFailed } from '../../graphql/errors';
++import type { ConnectedAccount } from '../../models';
++import { getPinnedAxiosAgentsForWebhookUrl, WebhookUrlNotAllowedError } from '../webhooks';
++
++import {
++  MicrobloggingAccountInfo,
++  MicrobloggingAuthenticationError,
++  MicrobloggingPost,
++  MicrobloggingPostResult,
++  MicrobloggingRequestError,
++  MicrobloggingService,
++  MicrobloggingTextLimits,
++} from './types';
++
++/** Mastodon defaults, used when the instance does not advertise its own configuration */
++const DEFAULT_LIMITS: MicrobloggingTextLimits = { maxCharacters: 500, charactersReservedPerUrl: 23 };
++const REQUEST_TIMEOUT_MS = 15_000;
++/** Scopes that allow publishing statuses */
++const WRITE_STATUSES_SCOPES = ['write', 'write:statuses'];
++const USERNAME_REGEX = /^[\w.-]+$/;
++
++type MastodonAccount = { id: string; username: string; acct: string; url?: string };
++type MastodonStatus = { id: string; url?: string | null; uri?: string; created_at?: string };
++type MastodonInstanceV2 = {
++  domain?: string;
++  configuration?: { statuses?: { max_characters?: number; characters_reserved_per_url?: number } };
++};
++type MastodonInstanceV1 = MastodonInstanceV2 & { uri?: string; max_toot_chars?: number };
++type MastodonApplication = { scopes?: string[] };
++
++/**
++ * Normalizes what users type as their instance ("mastodon.social", "https://mastodon.social/@me")
++ * into an origin (`https://mastodon.social`). Only HTTPS is accepted.
++ */
++export const normalizeMastodonInstanceUrl = (value: string): string => {
++  let input = (value || '').trim();
++  if (!input) {
++    throw new ValidationFailed('Please provide the URL of your Mastodon server');
++  } else if (!/^[a-z][a-z\d+.-]*:\/\//i.test(input)) {
++    input = `https://${input}`;
++  }
++
++  let url: URL;
++  try {
++    url = new URL(input);
++  } catch {
++    throw new ValidationFailed(`Invalid Mastodon server URL: ${value}`);
++  }
++
++  if (url.protocol !== 'https:') {
++    throw new ValidationFailed('The Mastodon server URL must use HTTPS');
++  } else if (url.username || url.password) {
++    throw new ValidationFailed('The Mastodon server URL must not contain credentials');
++  }
++
++  return url.origin;
++};
++
++const getErrorMessage = (data: unknown): string | null => {
++  if (data && typeof data === 'object' && typeof data['error'] === 'string') {
++    return data['error'];
++  }
++  return null;
++};
++
++const request = async <T>(
++  instanceUrl: string,
++  token: string | null,
++  {
++    method = 'GET',
++    path,
++    data,
++    headers = {},
++  }: { method?: Method; path: string; data?: unknown; headers?: Record<string, string> },
++): Promise<T> => {
++  const url = new URL(path, instanceUrl).toString();
++  // Resolves and pins the IP addresses of the instance to prevent requests to internal networks (SSRF)
++  const agents = await getPinnedAxiosAgentsForWebhookUrl(url);
++  try {
++    const response = await axios.request<T>({
++      url,
++      method,
++      data,
++      headers: {
++        Accept: 'application/json',
++        ...(token ? { Authorization: `Bearer ${token}` } : {}),
++        ...headers,
++      },
++      timeout: REQUEST_TIMEOUT_MS,
++      maxRedirects: 0,
++      ...agents,
++    });
++    return response.data;
++  } catch (error) {
++    if (error instanceof AxiosError && error.response) {
++      const message = getErrorMessage(error.response.data) || error.message;
++      if (error.response.status === 401) {
++        throw new MicrobloggingAuthenticationError(`Mastodon rejected the access token: ${message}`);
++      }
++      throw new MicrobloggingRequestError(
++        `Mastodon API error (${error.response.status}): ${message}`,
++        error.response.status,
++      );
++    }
++    throw error;
++  }
++};
++
++const toPositiveInteger = (value: unknown): number | null => {
++  return Number.isInteger(value) && (value as number) > 0 ? (value as number) : null;
++};
++
++/**
++ * Fetches the domain and the post length limits of the instance, falling back on the v1 API for
++ * older servers and on Mastodon defaults when nothing is advertised.
++ */
++const fetchInstanceInfo = async (instanceUrl: string): Promise<{ domain: string; limits: MicrobloggingTextLimits }> => {
++  let instance: MastodonInstanceV1;
++  try {
++    instance = await request<MastodonInstanceV2>(instanceUrl, null, { path: '/api/v2/instance' });
++  } catch (error) {
++    if (!(error instanceof MicrobloggingRequestError)) {
++      throw error;
++    }
++    instance = await request<MastodonInstanceV1>(instanceUrl, null, { path: '/api/v1/instance' }).catch(() => null);
++  }
++
++  const statusesConfig = instance?.configuration?.statuses;
++  return {
++    domain: instance?.domain || instance?.uri || new URL(instanceUrl).hostname,
++    limits: {
++      maxCharacters:
++        toPositiveInteger(statusesConfig?.max_characters) ||
++        toPositiveInteger(instance?.max_toot_chars) ||
++        DEFAULT_LIMITS.maxCharacters,
++      charactersReservedPerUrl:
++        toPositiveInteger(statusesConfig?.characters_reserved_per_url) || DEFAULT_LIMITS.charactersReservedPerUrl,
++    },
++  };
++};
++
++/**
++ * Mastodon >= 4.3 returns the scopes of the token. Older servers don't, in which case we can't
++ * check ahead of time and rely on the first post failing.
++ */
++const assertCanWriteStatuses = async (instanceUrl: string, token: string): Promise<void> => {
++  const application = await request<MastodonApplication>(instanceUrl, token, {
++    path: '/api/v1/apps/verify_credentials',
++  }).catch(error => {
++    if (error instanceof MicrobloggingAuthenticationError) {
++      throw error;
++    }
++    return null;
++  });
++
++  const scopes = application?.scopes;
++  if (Array.isArray(scopes) && !scopes.some(scope => WRITE_STATUSES_SCOPES.includes(scope))) {
++    throw new ValidationFailed('The access token must have the "write:statuses" scope to publish posts');
++  }
++};
++
++const mastodon: MicrobloggingService = {
++  service: Service.MASTODON,
++
++  async verifyCredentials({ instanceUrl, token }): Promise<MicrobloggingAccountInfo> {
++    const origin = normalizeMastodonInstanceUrl(instanceUrl);
++    if (!token) {
++      throw new ValidationFailed('An access token is required');
++    }
++
++    let account: MastodonAccount;
++    try {
++      account = await request<MastodonAccount>(origin, token, { path: '/api/v1/accounts/verify_credentials' });
++      await assertCanWriteStatuses(origin, token);
++    } catch (error) {
++      if (error instanceof WebhookUrlNotAllowedError) {
++        throw new ValidationFailed(`This Mastodon server URL is not allowed: ${error.message}`);
++      } else if (error instanceof MicrobloggingAuthenticationError) {
++        throw new ValidationFailed('The access token was rejected by the Mastodon server');
++      } else if (error instanceof MicrobloggingRequestError) {
++        throw new ValidationFailed(
++          `Unable to verify the access token. Make sure it has the "profile" or "read:accounts" scope. (${error.message})`,
++        );
++      }
++      throw error;
++    }
++
++    if (!account?.id || !account.username || !USERNAME_REGEX.test(account.username)) {
++      throw new ValidationFailed('The Mastodon server returned an invalid account');
++    }
++
++    const { domain, limits } = await fetchInstanceInfo(origin);
++    return {
++      instanceUrl: origin,
++      id: String(account.id),
++      handle: `@${account.username}@${domain}`,
++      url: account.url || null,
++      limits,
++    };
++  },
++
++  async post(connectedAccount: ConnectedAccount, post: MicrobloggingPost): Promise<MicrobloggingPostResult> {
++    const instanceUrl = connectedAccount.data?.instanceUrl;
++    if (!instanceUrl) {
++      throw new Error(`Mastodon connected account #${connectedAccount.id} has no instance URL`);
++    }
++
++    const status = await request<MastodonStatus>(instanceUrl, connectedAccount.token, {
++      method: 'POST',
++      path: '/api/v1/statuses',
++      headers: post.idempotencyKey ? { 'Idempotency-Key': post.idempotencyKey } : {},
++      data: {
++        status: post.text,
++        visibility: 'public',
++        language: post.language || 'en',
++        ...(post.inReplyToId ? { in_reply_to_id: post.inReplyToId } : {}), // eslint-disable-line camelcase
++      },
++    });
++
++    return {
++      id: String(status.id),
++      url: status.url || status.uri || null,
++      createdAt: status.created_at ? new Date(status.created_at) : null,
++    };
++  },
++
++  getTextLimits(connectedAccount: ConnectedAccount): MicrobloggingTextLimits {
++    return {
++      maxCharacters: toPositiveInteger(connectedAccount.data?.limits?.maxCharacters) || DEFAULT_LIMITS.maxCharacters,
++      charactersReservedPerUrl:
++        toPositiveInteger(connectedAccount.data?.limits?.charactersReservedPerUrl) ||
++        DEFAULT_LIMITS.charactersReservedPerUrl,
++    };
++  },
++};
++
++export default mastodon;
+diff --git a/server/lib/microblogging/posts.ts b/server/lib/microblogging/posts.ts
+new file mode 100644
+index 000000000..abd4a0f29
+--- /dev/null
++++ b/server/lib/microblogging/posts.ts
+@@ -0,0 +1,106 @@
++import { formatCurrency } from '../utils';
++
++import { neutralizeUserInput } from './text';
++
++/** Number of financial contributors celebrated with a milestone post */
++const CONTRIBUTORS_MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000] as const;
++
++/** Returns the highest milestone reached with `count` contributors, or 0 */
++export const getHighestMilestoneReached = (count: number): number => {
++  return CONTRIBUTORS_MILESTONES.filter(milestone => count >= milestone).pop() || 0;
++};
++
++const formatInteger = (value: number): string => value.toLocaleString('en-US');
++
++const formatAmount = (amountInCents: number, currency: string): string => {
++  // Drop the decimals for round amounts (e.g. "$10" rather than "$10.00")
++  const precision = amountInCents % 100 === 0 ? 0 : 2;
++  return formatCurrency(amountInCents, currency, precision);
++};
++
++const INTERVAL_SUFFIXES = { month: '/month', year: '/year' };
++
++export const composeNewContributorPost = ({
++  collectiveName,
++  contributorName,
++  contributorHandle,
++  isIncognito,
++  amount,
++  currency,
++  interval,
++}: {
++  collectiveName: string;
++  contributorName?: string | null;
++  /** Fediverse handle of the contributor (`@user@domain`), used to mention them */
++  contributorHandle?: string | null;
++  isIncognito?: boolean;
++  /** Amount in cents */
++  amount?: number | null;
++  currency?: string | null;
++  interval?: string | null;
++}): string => {
++  const collective = neutralizeUserInput(collectiveName);
++  let contributor: string;
++  if (isIncognito) {
++    contributor = 'an anonymous financial contributor';
++  } else if (contributorHandle) {
++    contributor = contributorName
++      ? `${neutralizeUserInput(contributorName)} (${contributorHandle})`
++      : contributorHandle;
++  } else {
++    contributor = neutralizeUserInput(contributorName) || 'a new financial contributor';
++  }
++
++  const contribution =
++    amount > 0 && currency
++      ? `${formatAmount(amount, currency)}${INTERVAL_SUFFIXES[interval] || ''} contribution`
++      : 'contribution';
++
++  return `💖 Welcome to ${contributor}, who just joined ${collective} as a financial contributor!\n\nThank you for your ${contribution} 🙏`;
++};
++
++export const composeMilestonePost = ({ collectiveName, milestone }: { collectiveName: string; milestone: number }) => {
++  const collective = neutralizeUserInput(collectiveName);
++  return `🎉 ${collective} just reached ${formatInteger(milestone)} financial contributors! 🙌\n\nThank you all for your support. Join them:`;
++};
++
++export type MonthlyStats = {
++  /** e.g. "September 2026" */
++  period: string;
++  currency: string;
++  /** Amounts in cents */
++  totalReceived: number;
++  totalSpent: number;
++  balance: number;
++  newContributors: number;
++  activeContributors: number;
++};
++
++export const composeMonthlyStatsPost = ({ collectiveName, stats }: { collectiveName: string; stats: MonthlyStats }) => {
++  const collective = neutralizeUserInput(collectiveName);
++  const { currency } = stats;
++  const balance = formatAmount(stats.balance, currency);
++  if (!stats.totalReceived) {
++    return `📊 ${collective} in ${stats.period}: no new contributions this month.\n\nOur current balance is ${balance}. Become a financial contributor! 😃`;
++  }
++
++  const lines = [
++    `📊 ${collective} in ${stats.period}:`,
++    '',
++    `💰 ${formatAmount(stats.totalReceived, currency)} received from ${formatInteger(stats.activeContributors)} financial ${
++      stats.activeContributors === 1 ? 'contributor' : 'contributors'
++    }`,
++  ];
++
++  if (stats.newContributors > 0) {
++    lines.push(
++      `👋 ${formatInteger(stats.newContributors)} new ${stats.newContributors === 1 ? 'contributor' : 'contributors'}`,
++    );
++  }
++  if (stats.totalSpent) {
++    lines.push(`💸 ${formatAmount(Math.abs(stats.totalSpent), currency)} spent`);
++  }
++
++  lines.push(`🏦 Current balance: ${balance}`, '', 'Thank you! 🙏');
++  return lines.join('\n');
++};
+diff --git a/server/lib/microblogging/text.ts b/server/lib/microblogging/text.ts
+new file mode 100644
+index 000000000..50c3c6f3c
+--- /dev/null
++++ b/server/lib/microblogging/text.ts
+@@ -0,0 +1,67 @@
++import type { MicrobloggingTextLimits } from './types';
++
++const URL_REGEX = /https?:\/\/[^\s<>"]+/gi;
++/** `@user@domain` mentions only count for their `@user` part */
++const REMOTE_MENTION_REGEX = /(^|[^\w/])@([\w.-]+)@[\w.-]+\.\w+/gi;
++const ELLIPSIS = '…';
++const ZERO_WIDTH_SPACE = '​';
++
++const graphemeSegmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
++
++const splitGraphemes = (text: string): string[] => Array.from(graphemeSegmenter.segment(text), s => s.segment);
++
++/**
++ * Counts the characters of a post the way Mastodon does: URLs have a fixed weight, remote
++ * mentions only count their local part and emojis count as one character.
++ */
++export const countPostCharacters = (text: string, limits: MicrobloggingTextLimits): number => {
++  const countableText = text
++    .replace(URL_REGEX, 'x'.repeat(limits.charactersReservedPerUrl))
++    .replace(REMOTE_MENTION_REGEX, '$1@$2');
++  return splitGraphemes(countableText).length;
++};
++
++/**
++ * Builds the final text of a post: `body` is shortened with an ellipsis if needed so that the
++ * body and the optional `url` fit within the service limits. The URL is never truncated.
++ */
++export const buildPostText = (body: string, url: string | null, limits: MicrobloggingTextLimits): string => {
++  const suffix = url ? `\n\n${url}` : '';
++  const fullText = `${body}${suffix}`;
++  if (countPostCharacters(fullText, limits) <= limits.maxCharacters) {
++    return fullText;
++  }
++
++  // Binary search the longest prefix of the body that fits with the ellipsis
++  const graphemes = splitGraphemes(body);
++  let low = 0;
++  let high = graphemes.length;
++  while (low < high) {
++    const mid = Math.ceil((low + high) / 2);
++    const candidate = `${graphemes.slice(0, mid).join('').trimEnd()}${ELLIPSIS}${suffix}`;
++    if (countPostCharacters(candidate, limits) <= limits.maxCharacters) {
++      low = mid;
++    } else {
++      high = mid - 1;
++    }
++  }
++
++  return `${graphemes.slice(0, low).join('').trimEnd()}${ELLIPSIS}${suffix}`;
++};
++
++/**
++ * Makes a user-provided string (account name, etc.) safe to include in a post: it cannot
++ * mention anyone, add hashtags or links, or span multiple lines.
++ */
++export const neutralizeUserInput = (value: string, maxLength = 60): string => {
++  const singleLine = (value || '')
++    .replace(/[\p{Cc}\p{Cf}]/gu, ' ') // control and format characters (incl. zero-width & bidi overrides)
++    .replace(/\s+/g, ' ')
++    .trim();
++
++  const graphemes = splitGraphemes(singleLine);
++  const shortened =
++    graphemes.length > maxLength ? `${graphemes.slice(0, maxLength).join('').trimEnd()}${ELLIPSIS}` : singleLine;
++
++  return shortened.replace(/([@#])/g, `$1${ZERO_WIDTH_SPACE}`).replace(/:\/\//g, `:${ZERO_WIDTH_SPACE}//`);
++};
+diff --git a/server/lib/microblogging/types.ts b/server/lib/microblogging/types.ts
+new file mode 100644
+index 000000000..d9af6b7c9
+--- /dev/null
++++ b/server/lib/microblogging/types.ts
+@@ -0,0 +1,85 @@
++import type { Service } from '../../constants/connected-account';
++import type { ConnectedAccount } from '../../models';
++
++/**
++ * The kinds of automated posts that can be published on a microblogging account.
++ * Each of them can be toggled individually in `ConnectedAccount.settings.posts`.
++ */
++export enum MicrobloggingPostType {
++  /** Thank a new financial contributor */
++  NEW_CONTRIBUTOR = 'newContributors',
++  /** Celebrate a number of financial contributors (10, 25, 50, ...) */
++  MILESTONE = 'milestones',
++  /** Summary of the previous month: money received, spent, new contributors and balance */
++  MONTHLY_STATS = 'monthlyStats',
++}
++
++export type MicrobloggingPostSettings = Record<MicrobloggingPostType, boolean>;
++
++/** Rules used by a service to compute the length of a post */
++export type MicrobloggingTextLimits = {
++  /** Max number of characters in a post */
++  maxCharacters: number;
++  /** Number of characters counted for any URL, whatever its real length */
++  charactersReservedPerUrl: number;
++};
++
++export type MicrobloggingPost = {
++  text: string;
++  /** Thread the post under a previous one */
++  inReplyToId?: string | null;
++  /** Lets the service deduplicate retries of the same post */
++  idempotencyKey?: string;
++  language?: string;
++};
++
++export type MicrobloggingPostResult = {
++  id: string;
++  url: string | null;
++  createdAt: Date | null;
++};
++
++export type MicrobloggingAccountInfo = {
++  /** Normalized base URL of the server hosting the account, e.g. `https://mastodon.social` */
++  instanceUrl: string;
++  /** Remote id of the account on the service */
++  id: string;
++  /** Full handle of the account, e.g. `@opencollective@mastodon.social` */
++  handle: string;
++  /** Public URL of the profile */
++  url: string | null;
++  limits: MicrobloggingTextLimits;
++};
++
++/**
++ * Interface implemented by every microblogging service (Mastodon today) that Open Collective
++ * can publish automated posts to. Credentials live in a `ConnectedAccount`.
++ */
++export interface MicrobloggingService {
++  readonly service: Service;
++  /** Checks the credentials and returns the account they belong to, plus the posting limits */
++  verifyCredentials(credentials: { instanceUrl: string; token: string }): Promise<MicrobloggingAccountInfo>;
++  /** Publishes a post with the credentials stored in the connected account */
++  post(connectedAccount: ConnectedAccount, post: MicrobloggingPost): Promise<MicrobloggingPostResult>;
++  /** Returns the text limits for this connected account */
++  getTextLimits(connectedAccount: ConnectedAccount): MicrobloggingTextLimits;
++}
++
++/** Raised when the service rejects the credentials. The account must be reconnected. */
++export class MicrobloggingAuthenticationError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'MicrobloggingAuthenticationError';
++  }
++}
++
++/** Raised when the service answers with an HTTP error other than an authentication error */
++export class MicrobloggingRequestError extends Error {
++  public readonly status: number;
++
++  constructor(message: string, status: number) {
++    super(message);
++    this.name = 'MicrobloggingRequestError';
++    this.status = status;
++  }
++}
+diff --git a/server/lib/notifications/index.ts b/server/lib/notifications/index.ts
+index f00e2027e..3850a02f7 100644
+--- a/server/lib/notifications/index.ts
++++ b/server/lib/notifications/index.ts
+@@ -5,6 +5,7 @@ import { channels } from '../../constants';
+ import ActivityTypes, { HostApplicationActivities } from '../../constants/activities';
+ import { Activity, Notification } from '../../models';
+ import logger from '../logger';
++import { postActivityToMicroblogging } from '../microblogging';
+ import { reportErrorToSentry, reportMessageToSentry } from '../sentry';
+ import slackLib from '../slack';
+ import { parseToBoolean } from '../utils';
+@@ -97,8 +98,18 @@ const dispatch = async (
+       active: true,
+     };
+ 
++    // Automated posts (Mastodon, etc.) are configured on the connected accounts, not through notifications
++    const microbloggingPromise = onlyChannels
++      ? null
++      : postActivityToMicroblogging(activity).catch(e => {
++          reportErrorToSentry(e, {
++            tags: { notificationChannel: 'microblogging' },
++            extra: { activityId: activity.id },
++          });
++        });
++
+     const notificationChannels = await Notification.findAll({ where });
+-    return Promise.all(
++    await Promise.all(
+       notificationChannels.map(async notifConfig => {
+         if (!shouldNotifyChannel(notifConfig.channel)) {
+           return;
+@@ -131,6 +142,8 @@ const dispatch = async (
+         }
+       }),
+     );
++
++    await microbloggingPromise;
+   };
+ 
+   if (onlyAwaitEmails) {
+diff --git a/test/server/lib/microblogging/index.test.ts b/test/server/lib/microblogging/index.test.ts
+new file mode 100644
+index 000000000..bcc019f85
+--- /dev/null
++++ b/test/server/lib/microblogging/index.test.ts
+@@ -0,0 +1,485 @@
++/* eslint-disable camelcase */
++import dns from 'dns';
++
++import { expect } from 'chai';
++import config from 'config';
++import nock from 'nock';
++import sinon from 'sinon';
++
++import ActivityTypes from '../../../../server/constants/activities';
++import { Service } from '../../../../server/constants/connected-account';
++import {
++  connectMicrobloggingAccount,
++  editMicrobloggingPostSettings,
++  getFediverseHandleFromProfileUrl,
++  postActivityToMicroblogging,
++  postMonthlyStats,
++  postMonthlyStatsForAllConnectedAccounts,
++} from '../../../../server/lib/microblogging';
++import dispatch from '../../../../server/lib/notifications';
++import * as emailNotifications from '../../../../server/lib/notifications/email';
++import RateLimit from '../../../../server/lib/rate-limit';
++import models, { Activity, Collective, User } from '../../../../server/models';
++import { SocialLinkType } from '../../../../server/models/SocialLink';
++
++const INSTANCE_URL = 'https://social.example.org';
++const TOKEN = 'mastodon-access-token';
++const COLLECTIVE_ID = 1001;
++const COLLECTIVE_URL = `${config.host.website}/babel`;
++
++type StatusRequest = { status: string; visibility: string; language: string; in_reply_to_id?: string };
++
++describe('server/lib/microblogging', () => {
++  let sandbox: sinon.SinonSandbox;
++  let nextConnectedAccountId = 1;
++
++  before(() => nock.disableNetConnect());
++  after(() => nock.enableNetConnect());
++
++  beforeEach(() => {
++    sandbox = sinon.createSandbox();
++    sandbox.stub(config, 'features').value({ ...config.features, microbloggingPosts: true });
++    sandbox.stub(dns.promises, 'resolve4').resolves(['93.184.216.34']);
++    sandbox.stub(dns.promises, 'resolve6').rejects(new Error('No IPv6 address'));
++  });
++
++  afterEach(() => {
++    sandbox.restore();
++    nock.cleanAll();
++  });
++
++  /** A Mastodon connected account that is never persisted: `update` only sets the values */
++  const buildConnectedAccount = ({ posts = {}, data = {}, settings = {} } = {}) => {
++    const connectedAccount = models.ConnectedAccount.build({
++      id: nextConnectedAccountId++, // Each account gets its own rate limit
++      service: Service.MASTODON,
++      CollectiveId: COLLECTIVE_ID,
++      username: '@babel@social.example.org',
++      token: TOKEN,
++      data: { instanceUrl: INSTANCE_URL, limits: { maxCharacters: 500, charactersReservedPerUrl: 23 }, ...data },
++      settings: { posts: { newContributors: true, milestones: true, monthlyStats: true, ...posts }, ...settings },
++    });
++    sandbox.stub(connectedAccount, 'update').callsFake(async values => connectedAccount.set(values));
++    return connectedAccount;
++  };
++
++  const buildMemberCreatedActivity = ({ memberCollective = {}, role = 'BACKER', collective = {} } = {}) =>
++    ({
++      id: 555,
++      type: ActivityTypes.COLLECTIVE_MEMBER_CREATED,
++      CollectiveId: COLLECTIVE_ID,
++      data: {
++        collective: {
++          id: COLLECTIVE_ID,
++          name: 'Babel',
++          slug: 'babel',
++          urlPath: '/babel',
++          isPrivate: false,
++          ...collective,
++        },
++        member: {
++          role,
++          memberCollective: { id: 77, name: 'Alice', slug: 'alice', isIncognito: false, ...memberCollective },
++        },
++        order: { totalAmount: 1100, netAmount: 1000, currency: 'USD', interval: 'month' },
++      },
++    }) as unknown as Activity;
++
++  /** Mocks the Mastodon API and records the statuses that get published */
++  const mockStatusesApi = (statusCode = 200, times = 1) => {
++    const requests: Array<{ body: StatusRequest; idempotencyKey: string }> = [];
++    let nextId = 9000;
++    const scope = nock(INSTANCE_URL, { reqheaders: { authorization: `Bearer ${TOKEN}` } })
++      .post('/api/v1/statuses')
++      .times(times)
++      .reply(function (_uri, body) {
++        requests.push({ body: body as StatusRequest, idempotencyKey: this.req.headers['idempotency-key'] as string });
++        return statusCode === 200
++          ? [200, { id: String(++nextId), url: `${INSTANCE_URL}/@babel/${nextId}`, created_at: '2026-10-01T08:00:00Z' }]
++          : [statusCode, { error: 'Error' }];
++      });
++    return { scope, requests };
++  };
++
++  describe('getFediverseHandleFromProfileUrl', () => {
++    it('extracts handles from Mastodon profile URLs', () => {
++      expect(getFediverseHandleFromProfileUrl('https://fosstodon.org/@alice')).to.eq('@alice@fosstodon.org');
++      expect(getFediverseHandleFromProfileUrl('https://fosstodon.org/users/alice/')).to.eq('@alice@fosstodon.org');
++      expect(getFediverseHandleFromProfileUrl('https://mastodon.social/@alice@example.org')).to.eq(
++        '@alice@example.org',
++      );
++      expect(getFediverseHandleFromProfileUrl('https://fosstodon.org/about')).to.be.null;
++      expect(getFediverseHandleFromProfileUrl('javascript:alert(1)')).to.be.null;
++      expect(getFediverseHandleFromProfileUrl('not a url')).to.be.null;
++    });
++  });
++
++  describe('postActivityToMicroblogging', () => {
++    it('does nothing when the feature flag is disabled', async () => {
++      sandbox.stub(config, 'features').value({ microbloggingPosts: false });
++      const findAll = sandbox.stub(models.ConnectedAccount, 'findAll').resolves([buildConnectedAccount()]);
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      expect(findAll).to.not.have.been.called;
++    });
++
++    it('ignores other activities, other roles and private collectives', async () => {
++      const findAll = sandbox.stub(models.ConnectedAccount, 'findAll').resolves([buildConnectedAccount()]);
++
++      await postActivityToMicroblogging({
++        ...buildMemberCreatedActivity(),
++        type: ActivityTypes.COLLECTIVE_EXPENSE_CREATED,
++      } as Activity);
++      await postActivityToMicroblogging(buildMemberCreatedActivity({ role: 'ADMIN' }));
++      await postActivityToMicroblogging(buildMemberCreatedActivity({ collective: { isPrivate: true } }));
++      expect(findAll).to.not.have.been.called;
++    });
++
++    it('thanks new contributors and mentions their fediverse handle', async () => {
++      const connectedAccount = buildConnectedAccount({ posts: { milestones: false } });
++      sandbox.stub(models.ConnectedAccount, 'findAll').resolves([connectedAccount]);
++      const findSocialLink = sandbox.stub(models.SocialLink, 'findOne').resolves(
++        models.SocialLink.build({
++          CollectiveId: 77,
++          type: SocialLinkType.MASTODON,
++          url: 'https://fosstodon.org/@alice',
++          order: 0,
++        }),
++      );
++      const { scope, requests } = mockStatusesApi();
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++
++      scope.done();
++      expect(findSocialLink.firstCall.args[0]).to.deep.include({
++        where: { CollectiveId: 77, type: SocialLinkType.MASTODON },
++      });
++      expect(requests).to.have.length(1);
++      expect(requests[0].idempotencyKey).to.eq('opencollective-activity-555');
++      expect(requests[0].body.visibility).to.eq('public');
++      expect(requests[0].body.status).to.eq(
++        `💖 Welcome to Alice (@alice@fosstodon.org), who just joined Babel as a financial contributor!\n\nThank you for your $10/month contribution 🙏\n\n${COLLECTIVE_URL}`,
++      );
++      expect(connectedAccount.data.posts.newContributors.lastPostId).to.eq('9001');
++    });
++
++    it('never names or mentions incognito contributors', async () => {
++      sandbox
++        .stub(models.ConnectedAccount, 'findAll')
++        .resolves([buildConnectedAccount({ posts: { milestones: false } })]);
++      const findSocialLink = sandbox.stub(models.SocialLink, 'findOne').resolves(null);
++      const { requests } = mockStatusesApi();
++
++      await postActivityToMicroblogging(
++        buildMemberCreatedActivity({ memberCollective: { name: 'Secret Person', isIncognito: true } }),
++      );
++
++      expect(findSocialLink).to.not.have.been.called;
++      expect(requests[0].body.status).to.include('Welcome to an anonymous financial contributor');
++      expect(requests[0].body.status).to.not.include('Secret Person');
++    });
++
++    it('celebrates each milestone once', async () => {
++      const connectedAccount = buildConnectedAccount({
++        posts: { newContributors: false },
++        data: { posts: { milestones: { lastMilestone: 0 } } },
++      });
++      sandbox.stub(models.ConnectedAccount, 'findAll').resolves([connectedAccount]);
++      const countMembers = sandbox.stub(models.Member, 'count').resolves(10);
++      const { scope, requests } = mockStatusesApi();
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      scope.done();
++      expect(countMembers.firstCall.args[0]).to.deep.include({
++        where: { CollectiveId: COLLECTIVE_ID, role: 'BACKER' },
++      });
++      expect(requests[0].idempotencyKey).to.eq(`opencollective-milestone-${COLLECTIVE_ID}-10`);
++      expect(requests[0].body.status).to.eq(
++        `🎉 Babel just reached 10 financial contributors! 🙌\n\nThank you all for your support. Join them:\n\n${COLLECTIVE_URL}`,
++      );
++      expect(connectedAccount.data.posts.milestones).to.include({ lastMilestone: 10, lastPostId: '9001' });
++
++      // Next contributors don't trigger a new post until the next milestone
++      countMembers.resolves(11);
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      countMembers.resolves(24);
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      expect(requests).to.have.length(1);
++    });
++
++    it('only celebrates milestones crossed by the new contributor when there is no history', async () => {
++      sandbox
++        .stub(models.ConnectedAccount, 'findAll')
++        .resolves([buildConnectedAccount({ posts: { newContributors: false } })]);
++      sandbox.stub(models.Member, 'count').resolves(600); // 500 was reached before the account was connected
++      const { scope } = mockStatusesApi();
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      expect(scope.isDone()).to.be.false;
++    });
++
++    it('only publishes the enabled posts', async () => {
++      const connectedAccount = buildConnectedAccount({ posts: { newContributors: false, milestones: false } });
++      sandbox.stub(models.ConnectedAccount, 'findAll').resolves([connectedAccount]);
++      const countMembers = sandbox.stub(models.Member, 'count').resolves(10);
++      const { scope } = mockStatusesApi();
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      expect(countMembers).to.not.have.been.called;
++      expect(scope.isDone()).to.be.false;
++    });
++
++    it('flags accounts whose token was revoked and stops posting to them', async () => {
++      const connectedAccount = buildConnectedAccount({ posts: { milestones: false } });
++      sandbox.stub(models.ConnectedAccount, 'findAll').resolves([connectedAccount]);
++      sandbox.stub(models.SocialLink, 'findOne').resolves(null);
++      const { requests } = mockStatusesApi(401, 2);
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      expect(connectedAccount.settings.needsReconnect).to.be.true;
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      expect(requests).to.have.length(1);
++    });
++
++    it('limits the number of new contributor posts per hour', async () => {
++      sandbox
++        .stub(models.ConnectedAccount, 'findAll')
++        .resolves([buildConnectedAccount({ posts: { milestones: false } })]);
++      sandbox.stub(RateLimit.prototype, 'registerCall').resolves(false);
++      const { scope } = mockStatusesApi();
++
++      await postActivityToMicroblogging(buildMemberCreatedActivity());
++      expect(scope.isDone()).to.be.false;
++    });
++
++    it('is called by the notifications dispatcher', async () => {
++      sandbox.stub(emailNotifications, 'notifyByEmail').resolves();
++      sandbox.stub(models.Notification, 'findAll').resolves([]);
++      sandbox
++        .stub(models.ConnectedAccount, 'findAll')
++        .resolves([buildConnectedAccount({ posts: { milestones: false } })]);
++      sandbox.stub(models.SocialLink, 'findOne').resolves(null);
++      const { scope, requests } = mockStatusesApi();
++
++      await dispatch(buildMemberCreatedActivity());
++      scope.done();
++      expect(requests[0].body.status).to.include('Welcome to Alice, who just joined Babel');
++
++      // Not when the dispatch is restricted to some channels
++      const { scope: secondScope } = mockStatusesApi();
++      await dispatch(buildMemberCreatedActivity(), { onlyChannels: ['email'] });
++      expect(secondScope.isDone()).to.be.false;
++    });
++  });
++
++  describe('monthly stats', () => {
++    const date = new Date('2026-10-01T05:00:00Z');
++
++    const buildCollective = () =>
++      ({
++        id: COLLECTIVE_ID,
++        name: 'Babel',
++        slug: 'babel',
++        currency: 'USD',
++        isPrivate: false,
++        getTotalTransactions: sandbox
++          .stub()
++          .callsFake(async (_start, _end, type) => (type === 'donation' ? 125000 : -40050)),
++        getBackersStats: sandbox.stub().resolves({ backers: { new: 3, lastMonth: 45, previousMonth: 42 } }),
++        getBackersCount: sandbox.stub().resolves(42),
++        getBalance: sandbox.stub().resolves(300000),
++        getUrlPath: sandbox.stub().resolves('/babel'),
++      }) as unknown as Collective;
++
++    it('posts the stats of the previous month, threaded with the previous report', async () => {
++      const collective = buildCollective();
++      const connectedAccount = buildConnectedAccount({ data: { posts: { monthlyStats: { lastPostId: '8000' } } } });
++      const { scope, requests } = mockStatusesApi();
++
++      expect(await postMonthlyStats(connectedAccount, collective, { date })).to.be.true;
++      scope.done();
++
++      expect(collective.getTotalTransactions).to.have.been.calledWith(
++        new Date('2026-09-01T00:00:00Z'),
++        new Date('2026-10-01T00:00:00Z'),
++        'donation',
++        'amount',
++      );
++      expect(requests[0].body.in_reply_to_id).to.eq('8000');
++      expect(requests[0].idempotencyKey).to.eq(`opencollective-monthly-stats-${connectedAccount.id}-2026-09`);
++      expect(requests[0].body.status).to.eq(
++        [
++          '📊 Babel in September 2026:',
++          '',
++          '💰 $1,250 received from 42 financial contributors',
++          '👋 3 new contributors',
++          '💸 $400.50 spent',
++          '🏦 Current balance: $3,000',
++          '',
++          'Thank you! 🙏',
++          '',
++          COLLECTIVE_URL,
++        ].join('\n'),
++      );
++      expect(connectedAccount.data.posts.monthlyStats).to.include({ lastPeriod: '2026-09', lastPostId: '9001' });
++
++      // Running the job again the same month doesn't post twice
++      expect(await postMonthlyStats(connectedAccount, collective, { date })).to.be.false;
++      expect(requests).to.have.length(1);
++    });
++
++    it('starts a new thread when the previous report was deleted', async () => {
++      const connectedAccount = buildConnectedAccount({ data: { posts: { monthlyStats: { lastPostId: '8000' } } } });
++      const requests: StatusRequest[] = [];
++      nock(INSTANCE_URL)
++        .post('/api/v1/statuses', body => requests.push(body) && Boolean(body.in_reply_to_id))
++        .reply(404, { error: 'Record not found' })
++        .post('/api/v1/statuses', body => requests.push(body) && !body.in_reply_to_id)
++        .reply(200, { id: '9100', url: `${INSTANCE_URL}/@babel/9100` });
++
++      expect(await postMonthlyStats(connectedAccount, buildCollective(), { date })).to.be.true;
++      expect(nock.isDone()).to.be.true;
++      expect(connectedAccount.data.posts.monthlyStats.lastPostId).to.eq('9100');
++    });
++
++    it('skips accounts without monthly stats', async () => {
++      const collective = buildCollective();
++      const { scope } = mockStatusesApi();
++
++      expect(await postMonthlyStats(buildConnectedAccount({ posts: { monthlyStats: false } }), collective, { date })).to
++        .be.false;
++      expect(
++        await postMonthlyStats(buildConnectedAccount({ settings: { needsReconnect: true } }), collective, { date }),
++      ).to.be.false;
++      expect(collective.getTotalTransactions).to.not.have.been.called;
++      expect(scope.isDone()).to.be.false;
++    });
++
++    it('posts for all the connected accounts from the CRON job, only when the feature is enabled', async () => {
++      const connectedAccount = buildConnectedAccount();
++      connectedAccount.collective = buildCollective();
++      const findAll = sandbox.stub(models.ConnectedAccount, 'findAll').resolves([connectedAccount]);
++      const { scope } = mockStatusesApi();
++
++      expect(await postMonthlyStatsForAllConnectedAccounts({ date })).to.deep.eq({ posted: 1 });
++      scope.done();
++      expect(findAll.firstCall.args[0].where).to.deep.eq({ service: [Service.MASTODON] });
++
++      sandbox.stub(config, 'features').value({ microbloggingPosts: false });
++      findAll.resetHistory();
++      expect(await postMonthlyStatsForAllConnectedAccounts({ date })).to.deep.eq({ posted: 0 });
++      expect(findAll).to.not.have.been.called;
++    });
++  });
++
++  describe('connectMicrobloggingAccount', () => {
++    const collective = { id: COLLECTIVE_ID, type: 'COLLECTIVE', isPrivate: false } as Collective;
++    const remoteUser = { id: 3 } as User;
++
++    const mockVerifyCredentials = () => {
++      // The instance information is public, it's fetched without the token
++      nock(INSTANCE_URL)
++        .get('/api/v2/instance')
++        .reply(200, { domain: 'social.example.org', configuration: { statuses: { max_characters: 500 } } });
++      return nock(INSTANCE_URL, { reqheaders: { authorization: `Bearer ${TOKEN}` } })
++        .get('/api/v1/accounts/verify_credentials')
++        .reply(200, { id: '109', username: 'babel', acct: 'babel', url: `${INSTANCE_URL}/@babel` })
++        .get('/api/v1/apps/verify_credentials')
++        .reply(200, { scopes: ['write:statuses', 'profile'] });
++    };
++
++    it('connects a Mastodon account', async () => {
++      const scope = mockVerifyCredentials();
++      sandbox.stub(models.ConnectedAccount, 'findOne').resolves(null);
++      sandbox.stub(models.Member, 'count').resolves(30);
++      const create = sandbox.stub(models.ConnectedAccount, 'create').callsFake(async values => values);
++
++      await connectMicrobloggingAccount({
++        collective,
++        remoteUser,
++        service: Service.MASTODON,
++        token: TOKEN,
++        instanceUrl: 'social.example.org',
++        settings: { posts: { monthlyStats: false, unknownSetting: true } },
++      });
++
++      scope.done();
++      expect(create.firstCall.args[0]).to.deep.eq({
++        service: Service.MASTODON,
++        CollectiveId: COLLECTIVE_ID,
++        CreatedByUserId: 3,
++        username: '@babel@social.example.org',
++        token: TOKEN,
++        data: {
++          instanceUrl: INSTANCE_URL,
++          accountId: '109',
++          profileUrl: `${INSTANCE_URL}/@babel`,
++          limits: { maxCharacters: 500, charactersReservedPerUrl: 23 },
++          posts: { milestones: { lastMilestone: 25 } }, // Milestones reached before connecting are not celebrated
++        },
++        settings: { posts: { newContributors: true, milestones: true, monthlyStats: false } },
++      });
++    });
++
++    it('refreshes the credentials when connecting the same account again', async () => {
++      mockVerifyCredentials();
++      const existingAccount = buildConnectedAccount({
++        posts: { milestones: false },
++        settings: { needsReconnect: true },
++      });
++      sandbox.stub(models.ConnectedAccount, 'findOne').resolves(existingAccount);
++      const create = sandbox.stub(models.ConnectedAccount, 'create');
++
++      const result = await connectMicrobloggingAccount({
++        collective,
++        remoteUser,
++        service: Service.MASTODON,
++        token: TOKEN,
++        instanceUrl: INSTANCE_URL,
++      });
++
++      expect(create).to.not.have.been.called;
++      expect(result).to.eq(existingAccount);
++      expect(existingAccount.settings).to.deep.eq({
++        needsReconnect: false,
++        posts: { newContributors: true, milestones: false, monthlyStats: true },
++      });
++    });
++
++    it('refuses to connect when the feature is disabled or for private accounts', async () => {
++      const scope = mockVerifyCredentials();
++      const params = { collective, remoteUser, service: Service.MASTODON, token: TOKEN, instanceUrl: INSTANCE_URL };
++
++      await expect(
++        connectMicrobloggingAccount({ ...params, collective: { ...collective, isPrivate: true } as Collective }),
++      ).to.be.rejectedWith('not available for private accounts');
++      await expect(
++        connectMicrobloggingAccount({ ...params, collective: { ...collective, type: 'USER' } as Collective }),
++      ).to.be.rejectedWith('not available for this type of account');
++
++      sandbox.stub(config, 'features').value({ microbloggingPosts: false });
++      await expect(connectMicrobloggingAccount(params)).to.be.rejectedWith('not enabled on this platform');
++      expect(scope.isDone()).to.be.false;
++    });
++  });
++
++  describe('editMicrobloggingPostSettings', () => {
++    it('only updates the known post settings', async () => {
++      const connectedAccount = buildConnectedAccount();
++      await editMicrobloggingPostSettings(connectedAccount, { monthlyStats: false, foo: 'bar' } as never);
++      expect(connectedAccount.settings.posts).to.deep.eq({
++        newContributors: true,
++        milestones: true,
++        monthlyStats: false,
++      });
++    });
++
++    it('rejects other services', async () => {
++      const connectedAccount = models.ConnectedAccount.build({ service: Service.STRIPE });
++      await expect(editMicrobloggingPostSettings(connectedAccount, { monthlyStats: true })).to.be.rejectedWith(
++        'not supported for stripe',
++      );
++    });
++  });
++});
+diff --git a/test/server/lib/microblogging/mastodon.test.ts b/test/server/lib/microblogging/mastodon.test.ts
+new file mode 100644
+index 000000000..bb120e55b
+--- /dev/null
++++ b/test/server/lib/microblogging/mastodon.test.ts
+@@ -0,0 +1,208 @@
++/* eslint-disable camelcase */
++import dns from 'dns';
++
++import { expect } from 'chai';
++import nock from 'nock';
++import sinon from 'sinon';
++
++import { Service } from '../../../../server/constants/connected-account';
++import mastodon, { normalizeMastodonInstanceUrl } from '../../../../server/lib/microblogging/mastodon';
++import {
++  MicrobloggingAuthenticationError,
++  MicrobloggingRequestError,
++} from '../../../../server/lib/microblogging/types';
++import models from '../../../../server/models';
++
++const INSTANCE_URL = 'https://social.example.org';
++const TOKEN = 'mastodon-access-token';
++
++const buildConnectedAccount = (data: Record<string, unknown> = {}) =>
++  models.ConnectedAccount.build({
++    id: 4242,
++    service: Service.MASTODON,
++    CollectiveId: 1,
++    username: '@mycollective@example.org',
++    token: TOKEN,
++    data: { instanceUrl: INSTANCE_URL, ...data },
++  });
++
++describe('server/lib/microblogging/mastodon', () => {
++  let sandbox: sinon.SinonSandbox;
++
++  before(() => nock.disableNetConnect());
++  after(() => nock.enableNetConnect());
++
++  beforeEach(() => {
++    sandbox = sinon.createSandbox();
++    // Public address, so that the SSRF protection lets the (mocked) requests through
++    sandbox.stub(dns.promises, 'resolve4').resolves(['93.184.216.34']);
++    sandbox.stub(dns.promises, 'resolve6').rejects(new Error('No IPv6 address'));
++  });
++
++  afterEach(() => {
++    sandbox.restore();
++    nock.cleanAll();
++  });
++
++  describe('normalizeMastodonInstanceUrl', () => {
++    it('accepts domains and profile URLs', () => {
++      expect(normalizeMastodonInstanceUrl('social.example.org')).to.eq(INSTANCE_URL);
++      expect(normalizeMastodonInstanceUrl(' https://social.example.org/@mycollective ')).to.eq(INSTANCE_URL);
++    });
++
++    it('only accepts HTTPS URLs without credentials', () => {
++      expect(() => normalizeMastodonInstanceUrl('http://social.example.org')).to.throw('must use HTTPS');
++      expect(() => normalizeMastodonInstanceUrl('ftp://social.example.org')).to.throw('must use HTTPS');
++      expect(() => normalizeMastodonInstanceUrl('https://user:pass@social.example.org')).to.throw('credentials');
++      expect(() => normalizeMastodonInstanceUrl('')).to.throw('Please provide');
++    });
++  });
++
++  describe('verifyCredentials', () => {
++    it('returns the account handle and the limits advertised by the server', async () => {
++      nock(INSTANCE_URL, { reqheaders: { authorization: `Bearer ${TOKEN}` } })
++        .get('/api/v1/accounts/verify_credentials')
++        .reply(200, { id: '109', username: 'mycollective', acct: 'mycollective', url: `${INSTANCE_URL}/@mycollective` })
++        .get('/api/v1/apps/verify_credentials')
++        .reply(200, { name: 'Open Collective', scopes: ['profile', 'write:statuses'] });
++      nock(INSTANCE_URL)
++        .get('/api/v2/instance')
++        .reply(200, {
++          domain: 'example.org', // Split domain: handles use `example.org`, the API is served by `social.example.org`
++          configuration: { statuses: { max_characters: 1000, characters_reserved_per_url: 23 } },
++        });
++
++      const result = await mastodon.verifyCredentials({ instanceUrl: 'social.example.org/', token: TOKEN });
++      expect(result).to.deep.eq({
++        instanceUrl: INSTANCE_URL,
++        id: '109',
++        handle: '@mycollective@example.org',
++        url: `${INSTANCE_URL}/@mycollective`,
++        limits: { maxCharacters: 1000, charactersReservedPerUrl: 23 },
++      });
++      expect(nock.isDone()).to.be.true;
++    });
++
++    it('falls back on the v1 instance API for older servers', async () => {
++      nock(INSTANCE_URL)
++        .get('/api/v1/accounts/verify_credentials')
++        .reply(200, { id: '7', username: 'mycollective', acct: 'mycollective' })
++        .get('/api/v1/apps/verify_credentials')
++        .reply(200, { name: 'Open Collective' }) // Servers older than Mastodon 4.3 don't return the scopes
++        .get('/api/v2/instance')
++        .reply(404, { error: 'Not Found' })
++        .get('/api/v1/instance')
++        .reply(200, { uri: 'social.example.org', max_toot_chars: 5000 });
++
++      const result = await mastodon.verifyCredentials({ instanceUrl: INSTANCE_URL, token: TOKEN });
++      expect(result.handle).to.eq('@mycollective@social.example.org');
++      expect(result.url).to.be.null;
++      expect(result.limits).to.deep.eq({ maxCharacters: 5000, charactersReservedPerUrl: 23 });
++      expect(nock.isDone()).to.be.true;
++    });
++
++    it('rejects tokens that cannot publish statuses', async () => {
++      nock(INSTANCE_URL)
++        .get('/api/v1/accounts/verify_credentials')
++        .reply(200, { id: '7', username: 'mycollective', acct: 'mycollective' })
++        .get('/api/v1/apps/verify_credentials')
++        .reply(200, { name: 'Open Collective', scopes: ['read'] });
++
++      await expect(mastodon.verifyCredentials({ instanceUrl: INSTANCE_URL, token: TOKEN })).to.be.rejectedWith(
++        'must have the "write:statuses" scope',
++      );
++    });
++
++    it('rejects invalid tokens', async () => {
++      nock(INSTANCE_URL)
++        .get('/api/v1/accounts/verify_credentials')
++        .reply(401, { error: 'The access token is invalid' });
++
++      await expect(mastodon.verifyCredentials({ instanceUrl: INSTANCE_URL, token: TOKEN })).to.be.rejectedWith(
++        'The access token was rejected by the Mastodon server',
++      );
++    });
++
++    it('rejects servers resolving to private addresses (SSRF)', async () => {
++      (dns.promises.resolve4 as sinon.SinonStub).resolves(['10.0.0.12']);
++      const scope = nock(INSTANCE_URL).get('/api/v1/accounts/verify_credentials').reply(200, {});
++
++      await expect(mastodon.verifyCredentials({ instanceUrl: INSTANCE_URL, token: TOKEN })).to.be.rejectedWith(
++        'This Mastodon server URL is not allowed',
++      );
++      expect(scope.isDone()).to.be.false;
++    });
++
++    it('rejects internal hostnames without resolving them', async () => {
++      await expect(
++        mastodon.verifyCredentials({ instanceUrl: 'https://mastodon.internal', token: TOKEN }),
++      ).to.be.rejectedWith('This Mastodon server URL is not allowed');
++      expect(dns.promises.resolve4).to.not.have.been.called;
++    });
++  });
++
++  describe('post', () => {
++    it('publishes a public status, threaded and with an idempotency key', async () => {
++      const scope = nock(INSTANCE_URL, {
++        reqheaders: { authorization: `Bearer ${TOKEN}`, 'idempotency-key': 'opencollective-test-1' },
++      })
++        .post('/api/v1/statuses', {
++          status: 'Hello Fediverse!',
++          visibility: 'public',
++          language: 'en',
++          in_reply_to_id: '42',
++        })
++        .reply(200, { id: '43', url: `${INSTANCE_URL}/@mycollective/43`, created_at: '2026-10-01T08:00:00.000Z' });
++
++      const result = await mastodon.post(buildConnectedAccount(), {
++        text: 'Hello Fediverse!',
++        inReplyToId: '42',
++        idempotencyKey: 'opencollective-test-1',
++      });
++
++      expect(result).to.deep.eq({
++        id: '43',
++        url: `${INSTANCE_URL}/@mycollective/43`,
++        createdAt: new Date('2026-10-01T08:00:00.000Z'),
++      });
++      scope.done();
++    });
++
++    it('throws an authentication error when the token was revoked', async () => {
++      nock(INSTANCE_URL).post('/api/v1/statuses').reply(401, { error: 'The access token was revoked' });
++
++      const promise = mastodon.post(buildConnectedAccount(), { text: 'Hello' });
++      await expect(promise).to.be.rejectedWith(MicrobloggingAuthenticationError, 'The access token was revoked');
++    });
++
++    it('throws a request error with the HTTP status for other errors', async () => {
++      nock(INSTANCE_URL)
++        .post('/api/v1/statuses')
++        .reply(422, { error: 'Validation failed: Text character limit of 500 exceeded' });
++
++      const error = await mastodon.post(buildConnectedAccount(), { text: 'Hello' }).catch(e => e);
++      expect(error).to.be.instanceOf(MicrobloggingRequestError);
++      expect(error.status).to.eq(422);
++      expect(error.message).to.include('character limit of 500 exceeded');
++    });
++
++    it('does not follow redirects', async () => {
++      nock(INSTANCE_URL).post('/api/v1/statuses').reply(302, '', { Location: 'http://169.254.169.254/latest' });
++
++      const error = await mastodon.post(buildConnectedAccount(), { text: 'Hello' }).catch(e => e);
++      expect(error).to.be.instanceOf(MicrobloggingRequestError);
++      expect(error.status).to.eq(302);
++    });
++  });
++
++  describe('getTextLimits', () => {
++    it('uses the limits stored when connecting, or Mastodon defaults', () => {
++      const custom = { maxCharacters: 1000, charactersReservedPerUrl: 23 };
++      expect(mastodon.getTextLimits(buildConnectedAccount({ limits: custom }))).to.deep.eq(custom);
++      expect(mastodon.getTextLimits(buildConnectedAccount())).to.deep.eq({
++        maxCharacters: 500,
++        charactersReservedPerUrl: 23,
++      });
++    });
++  });
++});
+diff --git a/test/server/lib/microblogging/posts.test.ts b/test/server/lib/microblogging/posts.test.ts
+new file mode 100644
+index 000000000..f133157f0
+--- /dev/null
++++ b/test/server/lib/microblogging/posts.test.ts
+@@ -0,0 +1,151 @@
++import { expect } from 'chai';
++
++import {
++  composeMilestonePost,
++  composeMonthlyStatsPost,
++  composeNewContributorPost,
++  getHighestMilestoneReached,
++} from '../../../../server/lib/microblogging/posts';
++import { buildPostText, countPostCharacters, neutralizeUserInput } from '../../../../server/lib/microblogging/text';
++
++const MASTODON_LIMITS = { maxCharacters: 500, charactersReservedPerUrl: 23 };
++const ZWSP = '​';
++
++describe('server/lib/microblogging/posts', () => {
++  describe('countPostCharacters', () => {
++    it('counts characters like Mastodon', () => {
++      expect(countPostCharacters('Hello', MASTODON_LIMITS)).to.eq(5);
++      // URLs always count for 23 characters
++      expect(
++        countPostCharacters('https://opencollective.com/a-very-long-collective-slug-for-testing', MASTODON_LIMITS),
++      ).to.eq(23);
++      // Remote mentions only count their local part
++      expect(countPostCharacters('Hi @alice@fosstodon.org!', MASTODON_LIMITS)).to.eq('Hi @alice!'.length);
++      // Emojis (including multi code points ones) count for one character
++      expect(countPostCharacters('🎉👩‍💻', MASTODON_LIMITS)).to.eq(2);
++    });
++  });
++
++  describe('buildPostText', () => {
++    const url = 'https://opencollective.com/babel';
++
++    it('appends the URL when everything fits', () => {
++      expect(buildPostText('Thank you!', url, MASTODON_LIMITS)).to.eq(`Thank you!\n\n${url}`);
++      expect(buildPostText('Thank you!', null, MASTODON_LIMITS)).to.eq('Thank you!');
++    });
++
++    it('shortens the body but never the URL', () => {
++      const limits = { maxCharacters: 60, charactersReservedPerUrl: 23 };
++      const text = buildPostText('🎉 '.repeat(100), url, limits);
++      expect(text.endsWith(`…\n\n${url}`)).to.be.true;
++      expect(countPostCharacters(text, limits)).to.be.at.most(60);
++      expect(countPostCharacters(text, limits)).to.be.at.least(58);
++    });
++  });
++
++  describe('neutralizeUserInput', () => {
++    it('prevents mentions, hashtags, links and line breaks', () => {
++      const result = neutralizeUserInput('Spam @everyone@evil.example #ad\nhttps://evil.example');
++      expect(result).to.eq(`Spam @${ZWSP}everyone@${ZWSP}evil.example #${ZWSP}ad https:${ZWSP}//evil.example`);
++    });
++
++    it('strips invisible characters and limits the length', () => {
++      expect(neutralizeUserInput('A‮b​c')).to.eq('A b c');
++      expect(neutralizeUserInput('x'.repeat(100), 10)).to.eq(`${'x'.repeat(10)}…`);
++      expect(neutralizeUserInput(null)).to.eq('');
++    });
++  });
++
++  describe('composeNewContributorPost', () => {
++    it('thanks the contributor and mentions their fediverse handle', () => {
++      const post = composeNewContributorPost({
++        collectiveName: 'Babel',
++        contributorName: 'Alice',
++        contributorHandle: '@alice@fosstodon.org',
++        amount: 1000,
++        currency: 'USD',
++        interval: 'month',
++      });
++      expect(post).to.eq(
++        '💖 Welcome to Alice (@alice@fosstodon.org), who just joined Babel as a financial contributor!\n\nThank you for your $10/month contribution 🙏',
++      );
++    });
++
++    it('never names incognito contributors', () => {
++      const post = composeNewContributorPost({
++        collectiveName: 'Babel',
++        contributorName: 'Secret Person',
++        isIncognito: true,
++        amount: 2550,
++        currency: 'EUR',
++      });
++      expect(post).to.include('an anonymous financial contributor');
++      expect(post).to.include('€25.50 contribution');
++      expect(post).to.not.include('Secret Person');
++    });
++
++    it('handles zero-decimal currencies and missing amounts', () => {
++      expect(
++        composeNewContributorPost({ collectiveName: 'Babel', contributorName: 'Bob', amount: 1500, currency: 'JPY' }),
++      ).to.include('¥15 contribution');
++      expect(composeNewContributorPost({ collectiveName: 'Babel', contributorName: '' })).to.include(
++        'Welcome to a new financial contributor',
++      );
++    });
++  });
++
++  describe('composeMilestonePost', () => {
++    it('celebrates the number of contributors', () => {
++      expect(composeMilestonePost({ collectiveName: 'Babel', milestone: 1000 })).to.eq(
++        '🎉 Babel just reached 1,000 financial contributors! 🙌\n\nThank you all for your support. Join them:',
++      );
++    });
++  });
++
++  describe('getHighestMilestoneReached', () => {
++    it('returns the highest milestone reached', () => {
++      expect(getHighestMilestoneReached(0)).to.eq(0);
++      expect(getHighestMilestoneReached(9)).to.eq(0);
++      expect(getHighestMilestoneReached(10)).to.eq(10);
++      expect(getHighestMilestoneReached(99)).to.eq(50);
++      expect(getHighestMilestoneReached(123456)).to.eq(10000);
++    });
++  });
++
++  describe('composeMonthlyStatsPost', () => {
++    const stats = {
++      period: 'September 2026',
++      currency: 'USD',
++      totalReceived: 125000,
++      totalSpent: -40050,
++      balance: 300000,
++      newContributors: 3,
++      activeContributors: 42,
++    };
++
++    it('summarizes the month', () => {
++      expect(composeMonthlyStatsPost({ collectiveName: 'Babel', stats })).to.eq(
++        [
++          '📊 Babel in September 2026:',
++          '',
++          '💰 $1,250 received from 42 financial contributors',
++          '👋 3 new contributors',
++          '💸 $400.50 spent',
++          '🏦 Current balance: $3,000',
++          '',
++          'Thank you! 🙏',
++        ].join('\n'),
++      );
++    });
++
++    it('has a call to action when nothing was received', () => {
++      const post = composeMonthlyStatsPost({
++        collectiveName: 'Babel',
++        stats: { ...stats, totalReceived: 0, totalSpent: 0, newContributors: 0, activeContributors: 0 },
++      });
++      expect(post).to.eq(
++        '📊 Babel in September 2026: no new contributions this month.\n\nOur current balance is $3,000. Become a financial contributor! 😃',
++      );
++    });
++  });
++});
+-- 
+2.43.0
+

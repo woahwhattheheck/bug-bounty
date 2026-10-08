@@ -356,7 +356,7 @@ int main(int argc, char **argv)
 	}
 	CHECK(!again.empty() && !againSidechain.empty(),
 	      "plug-in list from VST3_PATH scan contains both classes of again.vst3 (multi-class module)");
-	std::string cacheFile = configDir + "/plugins/obs-vst3/plugin-cache.json";
+	std::string cacheFile = configDir + "/obs-vst3/plugin-cache.json";
 	CHECK(os_file_exists(cacheFile.c_str()), "scan cache written to %s", cacheFile.c_str());
 	obs_source_release(probe);
 
@@ -468,18 +468,51 @@ int main(int argc, char **argv)
 	/* 8. Editor on X11 (Xvfb) ------------------------------------------------------------------------ */
 	if (!editorScreenshot.empty()) {
 		CHECK(pressButton(filter, "open_editor"), "\"Open Plug-in Interface\" button is visible and clicked");
-		pumpFor(1500);
+		/* Keep audio flowing while the editor is open (its VU meter is fed by output parameters). */
+		for (int iteration = 0; iteration < 100; iteration++) {
+			runBlock(tone, capture, channels, frames, sine);
+			pumpFor(20);
+		}
 		bool exists = windowExists("AGain VST3 - VST3 test");
 		CHECK(exists, "editor window \"AGain VST3 - VST3 test\" created by the host process");
-		std::string command = "import -window root " + editorScreenshot;
+		system("xwininfo -root -tree | grep -A3 'AGain VST3 - VST3 test' | sed 's/^/      /'");
+		std::string command = "import -window \"$(xdotool search --name 'AGain VST3 - VST3 test' | head -1)\" " +
+				      editorScreenshot;
 		system(command.c_str());
 		CHECK(os_file_exists(editorScreenshot.c_str()), "screenshot written to %s", editorScreenshot.c_str());
+
+		/* Drag the gain slider in the plug-in GUI: IComponentHandler::performEdit -> processor. */
+		uint32_t editsBefore = 0;
+		system("xdotool search --name 'AGain VST3 - VST3 test' | head -1 > /tmp/vst3-editor-window");
+		system("w=$(cat /tmp/vst3-editor-window); xdotool mousemove --window $w 127 98 mousedown 1 "
+		       "mousemove --window $w 160 98 mousemove --window $w 200 98 mouseup 1");
+		double measuredGain = 0.0;
+		for (int iteration = 0; iteration < 50; iteration++) {
+			output = runBlock(tone, capture, channels, frames, sine);
+			pumpFor(20);
+		}
+		measuredGain = output[0][100] / sine(0, 100);
+		(void)editsBefore;
+		CHECK(std::fabs(measuredGain - 0.25) > 0.05,
+		      "moving the slider in the plug-in editor changes the processed gain (now %.3f, was 0.25)",
+		      measuredGain);
+		pumpFor(1500);
+		obs_source_save(filter);
+		settings = obs_source_get_settings(filter);
+		std::string afterEdit = obs_data_get_string(settings, "component_state");
+		obs_data_release(settings);
+		CHECK(afterEdit != encoded, "saved state reflects the edit made in the editor (%s)", afterEdit.c_str());
+		command = "import -window \"$(cat /tmp/vst3-editor-window)\" " + editorScreenshot.substr(0, editorScreenshot.size() - 4) + "-after-edit.png";
+		system(command.c_str());
 		CHECK(pressButton(filter, "close_editor"), "\"Close Plug-in Interface\" button is visible and clicked");
 		pumpFor(500);
 		CHECK(!windowExists("AGain VST3 - VST3 test"), "editor window closed");
 	}
 
 	/* 9. Crash isolation and recovery ---------------------------------------------------------------- */
+	output = runBlock(tone, capture, channels, frames, sine);
+	double expectedGain = output[0][100] / sine(0, 100);
+	pumpFor(1500); /* let the filter take its periodic state snapshot */
 	hosts = hostProcesses();
 	CHECK(hosts.size() == 1, "one host process before the crash test");
 	if (!hosts.empty()) {
@@ -497,12 +530,12 @@ int main(int argc, char **argv)
 	for (int attempt = 0; attempt < 100 && !recovered; attempt++) {
 		pumpFor(100);
 		output = runBlock(tone, capture, channels, frames, sine);
-		recovered = gainError(output, 0, 2, frames, 0.25) < 1e-6;
+		recovered = gainError(output, 0, 2, frames, expectedGain) < 1e-5;
 	}
 	hosts = hostProcesses();
 	CHECK(recovered && hosts.size() == 1,
-	      "host restarted automatically (pid %d) and the last known state (gain 0.25) was restored",
-	      hosts.empty() ? -1 : hosts[0]);
+	      "host restarted automatically (pid %d) and the last known state (gain %.3f) was restored",
+	      hosts.empty() ? -1 : hosts[0], expectedGain);
 
 	obs_source_filter_remove(tone, filter);
 	obs_source_release(filter);

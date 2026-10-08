@@ -1,0 +1,620 @@
+From ae72be310f11d24fd21dc95fcb75888b5f6e6a75 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:02:27 +0000
+Subject: [PATCH] fix: return HybridApp Classic users to OldDot after required
+ 2FA setup
+
+A HybridApp user who would open OldDot after signing in is kept in NewDot
+until the required 2FA setup is done, but nothing remembered that decision.
+The 2FA success screen re-derived it from nvp_tryNewDot, which the Onyx
+reset after the 2FA validation drops, so "Got it" left the user in NewDot.
+That reset also dropped HAS_LOADED_APP and the personal details while
+marking the app as loading, so withAgentAccessDenied unmounted the 2FA
+screens and the verify step came back empty.
+
+- Store the "return to OldDot after 2FA setup" decision on HYBRID_APP at
+  sign in and use it on the 2FA success screen.
+- Mark 2FA as enabled in the TwoFactorAuth_Validate success data so the
+  verify step advances without waiting for the next OpenApp.
+- Keep HAS_LOADED_APP and the personal details through the login-required
+  2FA reset so the 2FA screens stay mounted.
+
+Fixes https://github.com/Expensify/App/issues/102437
+---
+ src/libs/HybridApp.ts                         |  14 +-
+ src/libs/actions/HybridApp/index.ts           |  14 +-
+ src/libs/actions/Session/index.ts             |  17 ++-
+ .../TwoFactorAuth/DynamicSuccessPage.tsx      |  16 +-
+ src/selectors/HybridApp.ts                    |   4 +-
+ src/types/onyx/HybridApp.ts                   |   6 +
+ tests/actions/SessionTest.ts                  |  57 +++++++
+ tests/ui/DynamicSuccessPageTest.tsx           | 140 ++++++++++++++++++
+ tests/unit/HybridAppTest.ts                   |  98 ++++++++++++
+ tests/unit/withAgentAccessDenied.test.tsx     |  44 ++++++
+ 10 files changed, 400 insertions(+), 10 deletions(-)
+ create mode 100644 tests/ui/DynamicSuccessPageTest.tsx
+ create mode 100644 tests/unit/HybridAppTest.ts
+
+diff --git a/src/libs/HybridApp.ts b/src/libs/HybridApp.ts
+index 85de133139e..8c4c8192abb 100644
+--- a/src/libs/HybridApp.ts
++++ b/src/libs/HybridApp.ts
+@@ -8,7 +8,7 @@ import type {OnyxEntry} from 'react-native-onyx';
+ import HybridAppModule from '@expensify/react-native-hybrid-app';
+ import Onyx from 'react-native-onyx';
+ 
+-import {closeReactNativeApp, setReadyToShowAuthScreens, setUseNewDotSignInPage} from './actions/HybridApp';
++import {closeReactNativeApp, setReadyToShowAuthScreens, setShouldReturnToOldDotAfter2FASetup, setUseNewDotSignInPage} from './actions/HybridApp';
+ import Log from './Log';
+ import {getCurrentUserEmail} from './Network/NetworkStore';
+ import {shouldUseOldApp} from './TryNewDotUtils';
+@@ -117,11 +117,17 @@ function signInToOldDotAndChooseExperience(
+ 
+     if (tryNewDot !== undefined) {
+         setUseNewDotSignInPage(false).then(() => {
+-            if (shouldUseOldApp(tryNewDot) && (!account?.needsTwoFactorAuthSetup || account?.requiresTwoFactorAuth)) {
++            const shouldOpenOldDot = !!shouldUseOldApp(tryNewDot);
++            const isRequired2FASetupPending = !!account?.needsTwoFactorAuthSetup && !account?.requiresTwoFactorAuth;
++            if (shouldOpenOldDot && !isRequired2FASetupPending) {
+                 closeReactNativeApp({shouldSetNVP: false, isTrackingGPS: false});
+-            } else {
+-                setReadyToShowAuthScreens(true);
++                return;
+             }
++
++            // The user is kept in NewDot only until the required 2FA setup is done. Remember that on HYBRID_APP, which
++            // survives the Onyx reset that follows the 2FA validation, so the 2FA success screen can send them back to OldDot.
++            setShouldReturnToOldDotAfter2FASetup(shouldOpenOldDot && isRequired2FASetupPending);
++            setReadyToShowAuthScreens(true);
+         });
+     }
+ }
+diff --git a/src/libs/actions/HybridApp/index.ts b/src/libs/actions/HybridApp/index.ts
+index 96561822d9c..dad80e35b14 100644
+--- a/src/libs/actions/HybridApp/index.ts
++++ b/src/libs/actions/HybridApp/index.ts
+@@ -134,6 +134,17 @@ function setReadyToShowAuthScreens(readyToShowAuthScreens: boolean) {
+     Onyx.merge(ONYXKEYS.HYBRID_APP, {readyToShowAuthScreens});
+ }
+ 
++/*
++ * Remembers whether the user has to be sent back to OldDot once the required 2FA setup is done
++ */
++function setShouldReturnToOldDotAfter2FASetup(shouldReturnToOldDotAfter2FASetup: boolean) {
++    // This value is only relevant for HybridApp, so we can skip it in other environments.
++    if (!CONFIG.IS_HYBRID_APP) {
++        return;
++    }
++    Onyx.merge(ONYXKEYS.HYBRID_APP, {shouldReturnToOldDotAfter2FASetup});
++}
++
+ function setUseNewDotSignInPage(useNewDotSignInPage: boolean) {
+     // This value is only relevant for HybridApp, so we can skip it in other environments.
+     if (!CONFIG.IS_HYBRID_APP) {
+@@ -154,7 +165,8 @@ function resetSignInFlow() {
+     return Onyx.merge(ONYXKEYS.HYBRID_APP, {
+         readyToShowAuthScreens: false,
+         useNewDotSignInPage: true,
++        shouldReturnToOldDotAfter2FASetup: false,
+     });
+ }
+ 
+-export {getHybridAppSettings, setReadyToShowAuthScreens, resetSignInFlow, setUseNewDotSignInPage, closeReactNativeApp};
++export {getHybridAppSettings, setReadyToShowAuthScreens, resetSignInFlow, setUseNewDotSignInPage, setShouldReturnToOldDotAfter2FASetup, closeReactNativeApp};
+diff --git a/src/libs/actions/Session/index.ts b/src/libs/actions/Session/index.ts
+index 1f7cf8b0b53..ed5b7131fb1 100644
+--- a/src/libs/actions/Session/index.ts
++++ b/src/libs/actions/Session/index.ts
+@@ -1463,6 +1463,10 @@ function validateTwoFactorAuth(twoFactorAuthCode: string, shouldClearData: boole
+                 // Clear the secret key once we know we no longer need to show it
+                 // This is necessary in case the user needs to complete the replaceTwoFactorDevice flow on this device at some point in the future - that flow uses the presence of this key to know when to navigate from one step to the next
+                 twoFactorAuthSecretKey: null,
++                // A valid code turns 2FA on. Set it right away so the verify step moves to the success step without waiting
++                // for the OpenApp that follows, and the required-2FA state doesn't come back while that OpenApp is running.
++                requiresTwoFactorAuth: true,
++                needsTwoFactorAuthSetup: false,
+             },
+         },
+     ];
+@@ -1520,8 +1524,17 @@ function validateTwoFactorAuth(twoFactorAuthCode: string, shouldClearData: boole
+ 
+         // Clear onyx data if the user has just signed in and is forced to add 2FA
+         if (shouldClearData) {
+-            const keysToPreserveWithPrivatePersonalDetails = [...KEYS_TO_PRESERVE, ONYXKEYS.PRIVATE_PERSONAL_DETAILS];
+-            clearOnyxAndSeedFullReconnect(keysToPreserveWithPrivatePersonalDetails).then(() => updateAuthTokenAndOpenApp(response.authToken, response.encryptedAuthToken));
++            // The 2FA screens are hidden by withAgentAccessDenied while the identity of the user is unknown, which is what this reset
++            // causes when it drops HAS_LOADED_APP and the personal details and marks the app as loading. The account doesn't change
++            // here, so keep both (like the delegate reset does) to keep the 2FA flow mounted until OpenApp refreshes them.
++            const keysToPreserveForRequired2FA = [
++                ...KEYS_TO_PRESERVE,
++                ONYXKEYS.PRIVATE_PERSONAL_DETAILS,
++                ONYXKEYS.HAS_LOADED_APP,
++                // eslint-disable-next-line rulesdir/no-direct-personal-details-list -- only names the key to keep through Onyx.clear, which works for a collection key too
++                ONYXKEYS.PERSONAL_DETAILS_LIST,
++            ];
++            clearOnyxAndSeedFullReconnect(keysToPreserveForRequired2FA).then(() => updateAuthTokenAndOpenApp(response.authToken, response.encryptedAuthToken));
+             return;
+         }
+ 
+diff --git a/src/pages/settings/Security/TwoFactorAuth/DynamicSuccessPage.tsx b/src/pages/settings/Security/TwoFactorAuth/DynamicSuccessPage.tsx
+index a29ab71415a..88f17ea8cda 100644
+--- a/src/pages/settings/Security/TwoFactorAuth/DynamicSuccessPage.tsx
++++ b/src/pages/settings/Security/TwoFactorAuth/DynamicSuccessPage.tsx
+@@ -13,7 +13,7 @@ import type {TwoFactorAuthNavigatorParamList} from '@libs/Navigation/types';
+ import {shouldHideOldAppRedirect} from '@libs/TryNewDotUtils';
+ 
+ import {openReimbursementAccountPage} from '@userActions/BankAccounts';
+-import {closeReactNativeApp} from '@userActions/HybridApp';
++import {closeReactNativeApp, setShouldReturnToOldDotAfter2FASetup} from '@userActions/HybridApp';
+ import {openLink} from '@userActions/Link';
+ import {clearTwoFactorAuthData, quitAndNavigateBack} from '@userActions/TwoFactorAuthActions';
+ import {buildOnboardingFlowParams, resumeOnboardingAfterRequired2FASetup} from '@userActions/Welcome/OnboardingFlow';
+@@ -23,6 +23,7 @@ import CONST from '@src/CONST';
+ import ONYXKEYS from '@src/ONYXKEYS';
+ import ROUTES, {DYNAMIC_ROUTES} from '@src/ROUTES';
+ import SCREENS from '@src/SCREENS';
++import {shouldReturnToOldDotAfter2FASetupSelector} from '@src/selectors/HybridApp';
+ import {hasCompletedGuidedSetupFlowSelector} from '@src/selectors/Onboarding';
+ import isLoadingOnyxValue from '@src/types/utils/isLoadingOnyxValue';
+ 
+@@ -44,6 +45,7 @@ function DynamicSuccessPage({route}: DynamicSuccessPageProps) {
+     const isSecuritySettingsFlow = focusedRoute?.name === SCREENS.SETTINGS.SECURITY;
+ 
+     const [tryNewDot, tryNewDotMetadata] = useOnyx(ONYXKEYS.NVP_TRY_NEW_DOT);
++    const [shouldReturnToOldDotAfter2FASetup] = useOnyx(ONYXKEYS.HYBRID_APP, {selector: shouldReturnToOldDotAfter2FASetupSelector});
+     const [account] = useOnyx(ONYXKEYS.ACCOUNT);
+     const [onboardingValues] = useOnyx(ONYXKEYS.NVP_ONBOARDING);
+     const hasCompletedGuidedSetupFlow = hasCompletedGuidedSetupFlowSelector(onboardingValues);
+@@ -53,6 +55,10 @@ function DynamicSuccessPage({route}: DynamicSuccessPageProps) {
+     const isLoadingTryNewDot = isLoadingOnyxValue(tryNewDotMetadata);
+     const isClassicRedirectBlocked = shouldHideOldAppRedirect(tryNewDot, isLoadingTryNewDot, CONFIG.IS_HYBRID_APP);
+     const isClassicRedirectDismissed = tryNewDot?.classicRedirect?.dismissed;
++    // Users who would have opened OldDot after signing in, but were kept in NewDot to finish the required 2FA setup, go back
++    // to OldDot here. That decision is stored on HYBRID_APP at sign in, because nvp_tryNewDot is dropped by the Onyx reset
++    // that follows the 2FA validation and only comes back once the next OpenApp finishes.
++    const shouldReturnToOldDot = CONFIG.IS_HYBRID_APP && (!!shouldReturnToOldDotAfter2FASetup || (!!isClassicRedirectDismissed && !isClassicRedirectBlocked));
+     const isIncompleteOnboarding = hasCompletedGuidedSetupFlow === false;
+     const hasSavedOnboardingPath = !!onboardingInitialPath?.includes(`/${ROUTES.ONBOARDING_ROOT.route}`);
+     // Forced onboarding 2FA always enters via Settings > Security (from the require-2FA overlay).
+@@ -73,6 +79,9 @@ function DynamicSuccessPage({route}: DynamicSuccessPageProps) {
+     };
+ 
+     const goBack = () => {
++        if (shouldReturnToOldDotAfter2FASetup) {
++            setShouldReturnToOldDotAfter2FASetup(false);
++        }
+         if (shouldReturnToOnboardingAfter2FA) {
+             completeForcedOnboarding2FAHandoff();
+             return;
+@@ -94,7 +103,10 @@ function DynamicSuccessPage({route}: DynamicSuccessPageProps) {
+     };
+ 
+     const onButtonPress = () => {
+-        if (CONFIG.IS_HYBRID_APP && isClassicRedirectDismissed && !isClassicRedirectBlocked) {
++        if (shouldReturnToOldDot) {
++            // The 2FA RHP isn't removed when NewDot closes, so clear the setup data here instead of in its beforeRemove listener.
++            clearTwoFactorAuthData(true);
++            setShouldReturnToOldDotAfter2FASetup(false);
+             closeReactNativeApp({shouldSetNVP: false, isTrackingGPS: false});
+             return;
+         }
+diff --git a/src/selectors/HybridApp.ts b/src/selectors/HybridApp.ts
+index 847371104cd..13b16fa9f12 100644
+--- a/src/selectors/HybridApp.ts
++++ b/src/selectors/HybridApp.ts
+@@ -6,4 +6,6 @@ const isSingleNewDotEntrySelector = (hybridApp: OnyxEntry<HybridApp>) => hybridA
+ 
+ const isClosingReactNativeAppSelector = (hybridApp: OnyxEntry<HybridApp>) => hybridApp?.closingReactNativeApp;
+ 
+-export {isSingleNewDotEntrySelector, isClosingReactNativeAppSelector};
++const shouldReturnToOldDotAfter2FASetupSelector = (hybridApp: OnyxEntry<HybridApp>) => hybridApp?.shouldReturnToOldDotAfter2FASetup;
++
++export {isSingleNewDotEntrySelector, isClosingReactNativeAppSelector, shouldReturnToOldDotAfter2FASetupSelector};
+diff --git a/src/types/onyx/HybridApp.ts b/src/types/onyx/HybridApp.ts
+index c5962bef979..72550ff9fa3 100644
+--- a/src/types/onyx/HybridApp.ts
++++ b/src/types/onyx/HybridApp.ts
+@@ -58,6 +58,12 @@ type HybridApp = {
+ 
+     /** Indicates if user pressed the "Try New Expensify" button */
+     pressedTryNewExpensify?: boolean;
++
++    /**
++     * Indicates that the user would have been sent to OldDot after signing in, but was kept in NewDot to finish the
++     * required 2FA setup first. The 2FA success screen uses it to send the user back to OldDot when the setup is done.
++     */
++    shouldReturnToOldDotAfter2FASetup?: boolean;
+ };
+ 
+ export default HybridApp;
+diff --git a/tests/actions/SessionTest.ts b/tests/actions/SessionTest.ts
+index e57328263a1..d667b21d9d7 100644
+--- a/tests/actions/SessionTest.ts
++++ b/tests/actions/SessionTest.ts
+@@ -806,6 +806,63 @@ describe('Session', () => {
+     });
+ 
+     describe('validateTwoFactorAuth', () => {
++        beforeEach(() => {
++            jest.restoreAllMocks();
++        });
++
++        test('success data marks 2FA as enabled so the verify step does not wait for the next OpenApp', () => {
++            // Given a user submitting a code to finish a required 2FA setup
++            const makeRequestSpy = jest.spyOn(API, 'makeRequestWithSideEffects').mockResolvedValue({});
++
++            // When the code is submitted
++            SessionUtil.validateTwoFactorAuth('123456', true);
++
++            // Then a successful validation turns 2FA on and clears the required-setup state right away
++            const [, , onyxData] = makeRequestSpy.mock.calls.at(0) ?? [];
++            expect(onyxData?.successData).toEqual([
++                expect.objectContaining({
++                    key: ONYXKEYS.ACCOUNT,
++                    value: expect.objectContaining({
++                        isLoading: false,
++                        twoFactorAuthSecretKey: null,
++                        requiresTwoFactorAuth: true,
++                        needsTwoFactorAuthSetup: false,
++                    }),
++                }),
++            ]);
++            // And a failed validation leaves the required-setup state untouched
++            expect(onyxData?.failureData).toEqual([expect.objectContaining({key: ONYXKEYS.ACCOUNT, value: {isLoading: false}})]);
++
++            makeRequestSpy.mockRestore();
++        });
++
++        test('login-required path keeps the loaded identity through the Onyx reset before OpenApp', async () => {
++            // Given a signed-in user finishing a required 2FA setup
++            const makeRequestSpy = jest.spyOn(API, 'makeRequestWithSideEffects').mockResolvedValue({
++                authToken: 'newAuthToken',
++                encryptedAuthToken: 'newEncryptedAuthToken',
++            });
++            const multiSetSpy = jest.spyOn(Onyx, 'multiSet').mockResolvedValue(undefined);
++            const clearSpy = jest.spyOn(Onyx, 'clear').mockResolvedValue(undefined);
++            const openAppSpy = jest.spyOn(API, 'writeWithNoDuplicatesOpenAppConflictAction').mockResolvedValue(undefined);
++
++            // When the 2FA validation succeeds
++            SessionUtil.validateTwoFactorAuth('123456', true);
++            await waitForBatchedUpdates();
++
++            // Then the reset keeps HAS_LOADED_APP and the personal details, so the 2FA screens stay mounted while OpenApp runs
++            expect(clearSpy.mock.calls.at(0)?.at(0)).toEqual(
++                expect.arrayContaining([ONYXKEYS.ACCOUNT, ONYXKEYS.SESSION, ONYXKEYS.HYBRID_APP, ONYXKEYS.PRIVATE_PERSONAL_DETAILS, ONYXKEYS.HAS_LOADED_APP, ONYXKEYS.PERSONAL_DETAILS_LIST]),
++            );
++            // And OpenApp still runs right after the reset
++            expect(openAppSpy).toHaveBeenCalled();
++
++            makeRequestSpy.mockRestore();
++            multiSetSpy.mockRestore();
++            clearSpy.mockRestore();
++            openAppSpy.mockRestore();
++        });
++
+         test('forced onboarding path updates auth token before clearing Onyx without openApp', async () => {
+             // Given a user completing forced-onboarding 2FA while the success screen remains open.
+             const makeRequestSpy = jest.spyOn(API, 'makeRequestWithSideEffects').mockResolvedValue({
+diff --git a/tests/ui/DynamicSuccessPageTest.tsx b/tests/ui/DynamicSuccessPageTest.tsx
+new file mode 100644
+index 00000000000..329289b9588
+--- /dev/null
++++ b/tests/ui/DynamicSuccessPageTest.tsx
+@@ -0,0 +1,140 @@
++import {fireEvent, render, screen} from '@testing-library/react-native';
++
++import OnyxListItemProvider from '@components/OnyxListItemProvider';
++
++import Navigation from '@libs/Navigation/Navigation';
++import type {PlatformStackScreenProps} from '@libs/Navigation/PlatformStackNavigation/types';
++import type {TwoFactorAuthNavigatorParamList} from '@libs/Navigation/types';
++
++import DynamicSuccessPage from '@pages/settings/Security/TwoFactorAuth/DynamicSuccessPage';
++
++import {closeReactNativeApp, setShouldReturnToOldDotAfter2FASetup} from '@userActions/HybridApp';
++import {clearTwoFactorAuthData} from '@userActions/TwoFactorAuthActions';
++
++import ONYXKEYS from '@src/ONYXKEYS';
++import ROUTES from '@src/ROUTES';
++import type SCREENS from '@src/SCREENS';
++
++import type ReactNative from 'react-native';
++
++import React from 'react';
++import Onyx from 'react-native-onyx';
++
++import waitForBatchedUpdatesWithAct from '../utils/waitForBatchedUpdatesWithAct';
++
++jest.mock('@src/CONFIG', () => {
++    const actualConfig = jest.requireActual<{default: Record<string, unknown>}>('@src/CONFIG');
++    return {
++        __esModule: true,
++        default: {...actualConfig.default, IS_HYBRID_APP: true},
++    };
++});
++
++jest.mock('@userActions/HybridApp', () => ({
++    closeReactNativeApp: jest.fn(),
++    setShouldReturnToOldDotAfter2FASetup: jest.fn(),
++}));
++
++jest.mock('@userActions/TwoFactorAuthActions', () => ({
++    clearTwoFactorAuthData: jest.fn(),
++    quitAndNavigateBack: jest.fn(),
++}));
++
++jest.mock('@userActions/Welcome/OnboardingFlow', () => ({
++    buildOnboardingFlowParams: jest.fn(),
++    resumeOnboardingAfterRequired2FASetup: jest.fn(),
++}));
++
++jest.mock('@userActions/BankAccounts', () => ({
++    openReimbursementAccountPage: jest.fn(),
++}));
++
++jest.mock('@userActions/Link', () => ({
++    openLink: jest.fn(),
++}));
++
++jest.mock('@libs/Navigation/Navigation', () => ({
++    navigate: jest.fn(),
++    goBack: jest.fn(),
++    revealRouteBeforeDismissingModal: jest.fn(),
++}));
++
++// The 2FA flow was opened from Settings > Security by the required-2FA overlay
++jest.mock('@hooks/useDynamicBackPath', () => () => 'settings/security');
++jest.mock('@hooks/useDynamicForwardPath', () => () => undefined);
++jest.mock('@hooks/useEnvironment', () => () => ({environmentURL: 'https://dev.new.expensify.com:8082'}));
++jest.mock('@libs/Navigation/helpers/getStateFromPath', () => () => ({routes: [{name: jest.requireActual<{default: typeof SCREENS}>('@src/SCREENS').default.SETTINGS.SECURITY}]}));
++
++// The base page only adds the confirmation chrome, which needs a navigator to render
++jest.mock('@pages/settings/Security/TwoFactorAuth/SuccessPageBase', () => {
++    const mockReact = jest.requireActual<typeof React>('react');
++    const {Pressable, Text} = jest.requireActual<typeof ReactNative>('react-native');
++    return {
++        __esModule: true,
++        default: ({onButtonPress}: {onButtonPress: () => void}) =>
++            mockReact.createElement(Pressable, {testID: 'gotItButton', onPress: onButtonPress}, mockReact.createElement(Text, null, 'Got it')),
++    };
++});
++
++type DynamicSuccessPageProps = PlatformStackScreenProps<TwoFactorAuthNavigatorParamList, typeof SCREENS.TWO_FACTOR_AUTH.DYNAMIC_SUCCESS>;
++
++function renderPage() {
++    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- test-only route stub. The page only reads route.params.policyID
++    const props = {route: {params: {}}} as unknown as DynamicSuccessPageProps;
++    return render(
++        <OnyxListItemProvider>
++            <DynamicSuccessPage {...props} />
++        </OnyxListItemProvider>,
++    );
++}
++
++describe('DynamicSuccessPage', () => {
++    beforeAll(() => {
++        Onyx.init({keys: ONYXKEYS});
++    });
++
++    beforeEach(async () => {
++        jest.clearAllMocks();
++        await Onyx.clear();
++        // 2FA was just enabled and the Onyx reset that follows the validation dropped nvp_tryNewDot
++        await Onyx.multiSet({
++            [ONYXKEYS.ACCOUNT]: {requiresTwoFactorAuth: true},
++            [ONYXKEYS.NVP_ONBOARDING]: {hasCompletedGuidedSetupFlow: true},
++        });
++        await waitForBatchedUpdatesWithAct();
++    });
++
++    it('sends a user who was kept in NewDot for the required 2FA setup back to OldDot even when nvp_tryNewDot is not loaded', async () => {
++        await Onyx.merge(ONYXKEYS.HYBRID_APP, {shouldReturnToOldDotAfter2FASetup: true});
++        renderPage();
++        await waitForBatchedUpdatesWithAct();
++
++        fireEvent.press(screen.getByTestId('gotItButton'));
++
++        expect(clearTwoFactorAuthData).toHaveBeenCalledWith(true);
++        expect(setShouldReturnToOldDotAfter2FASetup).toHaveBeenCalledWith(false);
++        expect(closeReactNativeApp).toHaveBeenCalledWith({shouldSetNVP: false, isTrackingGPS: false});
++        expect(Navigation.navigate).not.toHaveBeenCalled();
++    });
++
++    it('keeps a NewDot user on the 2FA enabled page', async () => {
++        renderPage();
++        await waitForBatchedUpdatesWithAct();
++
++        fireEvent.press(screen.getByTestId('gotItButton'));
++
++        expect(closeReactNativeApp).not.toHaveBeenCalled();
++        expect(Navigation.navigate).toHaveBeenCalledWith(ROUTES.SETTINGS_2FA_ENABLED, {forceReplace: true});
++    });
++
++    it('still sends a user who chose Classic back to OldDot when nvp_tryNewDot is loaded', async () => {
++        await Onyx.merge(ONYXKEYS.NVP_TRY_NEW_DOT, {classicRedirect: {dismissed: true}});
++        renderPage();
++        await waitForBatchedUpdatesWithAct();
++
++        fireEvent.press(screen.getByTestId('gotItButton'));
++
++        expect(closeReactNativeApp).toHaveBeenCalledWith({shouldSetNVP: false, isTrackingGPS: false});
++        expect(Navigation.navigate).not.toHaveBeenCalled();
++    });
++});
+diff --git a/tests/unit/HybridAppTest.ts b/tests/unit/HybridAppTest.ts
+new file mode 100644
+index 00000000000..2e085b7817d
+--- /dev/null
++++ b/tests/unit/HybridAppTest.ts
+@@ -0,0 +1,98 @@
++import ONYXKEYS from '@src/ONYXKEYS';
++import type {TryNewDot} from '@src/types/onyx';
++
++import type * as HybridAppPackage from '@expensify/react-native-hybrid-app';
++
++import Onyx from 'react-native-onyx';
++
++import getOnyxValue from '../utils/getOnyxValue';
++import waitForBatchedUpdates from '../utils/waitForBatchedUpdates';
++
++jest.mock('@src/CONFIG', () => {
++    const actualConfig = jest.requireActual<{default: Record<string, unknown>}>('@src/CONFIG');
++    return {
++        __esModule: true,
++        default: {...actualConfig.default, IS_HYBRID_APP: true},
++    };
++});
++
++jest.mock('@libs/Navigation/Navigation', () => ({
++    clearPreloadedRoutes: jest.fn(),
++}));
++
++const {default: HybridAppModule} = jest.requireActual<typeof HybridAppPackage>('@expensify/react-native-hybrid-app');
++
++// Subscribes to Onyx and chooses between OldDot and NewDot once the user is signed in
++require('@libs/HybridApp');
++
++function buildTryNewDot(dismissed: boolean): TryNewDot {
++    return {classicRedirect: {dismissed, timestamp: new Date(), completedHybridAppOnboarding: true}};
++}
++
++const SIGNED_IN_STATE = {
++    [ONYXKEYS.SESSION]: {authToken: 'authToken', accountID: 1, email: 'admin@expensify.com'},
++    [ONYXKEYS.CREDENTIALS]: {autoGeneratedLogin: 'autoGeneratedLogin', autoGeneratedPassword: 'autoGeneratedPassword'},
++};
++
++async function signInOnNewDotSignInPage(tryNewDot: TryNewDot, needsTwoFactorAuthSetup: boolean) {
++    await Onyx.multiSet({
++        ...SIGNED_IN_STATE,
++        [ONYXKEYS.HYBRID_APP]: {useNewDotSignInPage: true},
++        [ONYXKEYS.ACCOUNT]: {needsTwoFactorAuthSetup, requiresTwoFactorAuth: false},
++        [ONYXKEYS.NVP_TRY_NEW_DOT]: tryNewDot,
++    });
++    await waitForBatchedUpdates();
++}
++
++describe('HybridApp sign in', () => {
++    let closeNativeAppSpy: jest.SpiedFunction<typeof HybridAppModule.closeReactNativeApp>;
++
++    beforeAll(() => {
++        Onyx.init({keys: ONYXKEYS});
++    });
++
++    beforeEach(async () => {
++        jest.spyOn(HybridAppModule, 'signInToOldDot').mockImplementation(() => {});
++        closeNativeAppSpy = jest.spyOn(HybridAppModule, 'closeReactNativeApp').mockImplementation(() => {});
++        await Onyx.clear();
++        await waitForBatchedUpdates();
++    });
++
++    afterEach(() => {
++        jest.restoreAllMocks();
++    });
++
++    it('keeps a Classic user in NewDot for the required 2FA setup and remembers to send them back to OldDot afterwards', async () => {
++        await signInOnNewDotSignInPage(buildTryNewDot(true), true);
++
++        expect(closeNativeAppSpy).not.toHaveBeenCalled();
++        expect(await getOnyxValue(ONYXKEYS.HYBRID_APP)).toEqual(
++            expect.objectContaining({
++                useNewDotSignInPage: false,
++                readyToShowAuthScreens: true,
++                shouldReturnToOldDotAfter2FASetup: true,
++            }),
++        );
++    });
++
++    it('remembers to send the user back to OldDot when nvp_tryNewDot has no classicRedirect, like the sign in decision does', async () => {
++        await signInOnNewDotSignInPage({}, true);
++
++        expect(closeNativeAppSpy).not.toHaveBeenCalled();
++        expect(await getOnyxValue(ONYXKEYS.HYBRID_APP)).toEqual(expect.objectContaining({readyToShowAuthScreens: true, shouldReturnToOldDotAfter2FASetup: true}));
++    });
++
++    it('does not send a NewDot user to OldDot after the required 2FA setup', async () => {
++        await signInOnNewDotSignInPage(buildTryNewDot(false), true);
++
++        expect(closeNativeAppSpy).not.toHaveBeenCalled();
++        expect(await getOnyxValue(ONYXKEYS.HYBRID_APP)).toEqual(expect.objectContaining({readyToShowAuthScreens: true, shouldReturnToOldDotAfter2FASetup: false}));
++    });
++
++    it('opens OldDot right away for a Classic user without a pending 2FA setup', async () => {
++        await signInOnNewDotSignInPage(buildTryNewDot(true), false);
++
++        expect(closeNativeAppSpy).toHaveBeenCalledWith({shouldSetNVP: false});
++        expect((await getOnyxValue(ONYXKEYS.HYBRID_APP))?.shouldReturnToOldDotAfter2FASetup).toBeUndefined();
++    });
++});
+diff --git a/tests/unit/withAgentAccessDenied.test.tsx b/tests/unit/withAgentAccessDenied.test.tsx
+index 20baaec0c20..e288d1900d8 100644
+--- a/tests/unit/withAgentAccessDenied.test.tsx
++++ b/tests/unit/withAgentAccessDenied.test.tsx
+@@ -6,9 +6,13 @@ import {LocaleContextProvider} from '@components/LocaleContextProvider';
+ import OnyxListItemProvider from '@components/OnyxListItemProvider';
+ import Text from '@components/Text';
+ 
++import HttpUtils from '@libs/HttpUtils';
+ import withAgentAccessDenied from '@libs/Navigation/AppNavigator/withAgentAccessDenied';
+ import Navigation from '@libs/Navigation/Navigation';
+ 
++import {validateTwoFactorAuth} from '@userActions/Session';
++
++import * as API from '@src/libs/API';
+ import ONYXKEYS from '@src/ONYXKEYS';
+ import ROUTES from '@src/ROUTES';
+ 
+@@ -17,6 +21,7 @@ import type * as NativeNavigation from '@react-navigation/native';
+ import React from 'react';
+ import Onyx from 'react-native-onyx';
+ 
++import getOnyxValue from '../utils/getOnyxValue';
+ import * as TestHelper from '../utils/TestHelper';
+ import waitForBatchedUpdatesWithAct from '../utils/waitForBatchedUpdatesWithAct';
+ 
+@@ -245,4 +250,43 @@ describe('withAgentAccessDenied', () => {
+         expect(screen.getByTestId('protected-content')).toBeDefined();
+         expect(Navigation.navigate).not.toHaveBeenCalled();
+     });
++
++    it('keeps the 2FA screen mounted through the Onyx reset that follows a required 2FA validation', async () => {
++        // A user who signed in with required 2FA pending sets it up. The valid code triggers an Onyx reset followed by
++        // OpenApp. While that OpenApp is in flight, the guarded 2FA screen must not be unmounted, otherwise it comes back
++        // as an empty verify step.
++        const accountID = 1;
++        await TestHelper.signInWithTestUser(accountID, 'user@expensify.com');
++        await Onyx.multiSet({
++            [ONYXKEYS.IS_LOADING_APP]: false,
++            [ONYXKEYS.HAS_LOADED_APP]: true,
++        });
++        await Onyx.merge(ONYXKEYS.ACCOUNT, {needsTwoFactorAuthSetup: true, requiresTwoFactorAuth: false});
++        await waitForBatchedUpdatesWithAct();
++
++        renderComponent();
++        await waitForBatchedUpdatesWithAct();
++        expect(screen.getByTestId('protected-content')).toBeDefined();
++
++        const makeRequestSpy = jest.spyOn(API, 'makeRequestWithSideEffects').mockResolvedValue({authToken: 'postValidateAuthToken', encryptedAuthToken: 'postValidateEncryptedAuthToken'});
++        // Keep the OpenApp that follows the reset in flight
++        const xhrSpy = jest.spyOn(HttpUtils, 'xhr').mockReturnValue(new Promise(() => {}));
++
++        await act(async () => {
++            validateTwoFactorAuth('123456', true);
++        });
++        await waitForBatchedUpdatesWithAct();
++
++        // The reset ran and OpenApp is in flight, but the guarded 2FA screen is still rendered
++        expect(await getOnyxValue(ONYXKEYS.IS_LOADING_APP)).toBe(true);
++        expect(screen.getByTestId('protected-content')).toBeDefined();
++        expect(Navigation.navigate).not.toHaveBeenCalled();
++
++        // The reset dropped the data that OpenApp refetches, but kept the loaded identity of the user
++        expect(await getOnyxValue(ONYXKEYS.HAS_LOADED_APP)).toBe(true);
++        expect((await getOnyxValue(ONYXKEYS.PERSONAL_DETAILS_LIST))?.[accountID]?.login).toBe('user@expensify.com');
++
++        makeRequestSpy.mockRestore();
++        xhrSpy.mockRestore();
++    });
+ });
+-- 
+2.43.0
+

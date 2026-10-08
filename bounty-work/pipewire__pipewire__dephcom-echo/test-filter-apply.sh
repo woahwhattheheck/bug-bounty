@@ -15,6 +15,11 @@
 # usage: test-filter-apply.sh <pipewire-source-dir> [<builddir>]
 set -u
 
+# wireplumber wants a session bus
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session > /dev/null; then
+	exec dbus-run-session -- "$0" "$@"
+fi
+
 SRC=${1:?pipewire source dir}
 BUILD=${2:-$SRC/builddir}
 WORK=$(mktemp -d)
@@ -36,8 +41,6 @@ export LD_LIBRARY_PATH=$BUILD/src/pipewire
 export PATH=$BUILD/src/daemon:$BUILD/src/tools:$PATH
 export PIPEWIRE_LOG_SYSTEMD=false
 export DISABLE_RTKIT=1
-# no D-Bus session in the container
-unset DBUS_SESSION_BUS_ADDRESS
 
 PIDS=()
 cleanup() {
@@ -129,6 +132,7 @@ check "module-echo-cancel unloaded when unused" wait_for 20 n_ec_is 0
 check "echo-cancel nodes removed" sh -c '! pactl list short sinks | grep -q echo-cancel'
 
 if [ $FAIL != 0 ]; then
+	echo "---- wireplumber log"; tail -30 "$WORK/wireplumber.log"
 	echo "---- pipewire-pulse log (filter lines)"
 	grep -i "filter\|echo" "$WORK/pipewire-pulse.log" | tail -60
 	echo "RESULT: FAIL"

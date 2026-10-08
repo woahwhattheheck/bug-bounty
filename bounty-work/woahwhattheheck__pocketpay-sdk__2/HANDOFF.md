@@ -66,7 +66,7 @@ The regressions catch the bug. The other 114 cases, including every pre-existing
 
 ### 3. Legacy codes are unchanged: direct probe of `validateAmount` at base ddd18b3 vs head 62ec4dd
 
-Each line shows input → code and reason at head. The script is at `scratchpad/probe307.ts` and runs with `npx tsx` against the clone's `src/utils/index.ts`.
+Each line shows input → code and reason at head. The script is `probe307.ts` in this directory. Run it from the checkout root with `npx tsx <path>/probe307.ts`.
 
 ```
 "1"                        ok true
@@ -107,6 +107,7 @@ No full suite, coverage, presubmit or build was run.
 
 ## Deliverable
 
+- `probe307.ts`: the legacy-code probe used in step 3.
 - `fix.patch`: `git format-patch ddd18b3..62ec4dd` of the carrier's 2 commits, exported unchanged. Applying it with `git am` on a scratch worktree at ddd18b3 gives tree `0deec3da748929ed62e72ef02dc7fb80979651c7`, the same tree as carrier head 62ec4dd. The carrier commits keep their existing author line, `woahwhattheheck <brycembusiness2@gmail.com>`. This pass created no new commits.
 - How to apply (fresh branch from sponsor main):
   ```

@@ -1,0 +1,275 @@
+diff --git a/packages/appium/types/cli.ts b/packages/appium/types/cli.ts
+--- a/packages/appium/types/cli.ts
++++ b/packages/appium/types/cli.ts
+@@
+-import type {DriverType, PluginType, ServerArgs, SetOptional} from '@appium/types';
++import type {DriverClass, DriverType, PluginType, ServerArgs, SetOptional} from '@appium/types';
+@@
+ export interface ProgrammaticArgs {
+@@
+ }
++
++/**
++ * A driver supplied directly to the programmatic Appium API. ESM namespace
++ * objects are accepted as well as a DriverClass so default/named exports from
++ * a driver package can be passed without relying on APPIUM_HOME discovery.
++ */
++export type EmbeddedDriverModule = DriverClass | Readonly<Record<string, unknown>>;
++
++type ProgrammaticServerArgs = Omit<ServerArgs, 'useDrivers'> & {
++  useDrivers: Array<string | EmbeddedDriverModule>;
++};
+@@
+ export type CommonArgs<
+@@
+ > = MoreArgs &
+   ProgrammaticArgs &
+   (Cmd extends CliCommandServer
+-    ? ServerArgs
++    ? ProgrammaticServerArgs
+     : Cmd extends CliCommandSetup
+       ? SetupArgs
+       : Cmd extends CliExtensionCommand
+diff --git a/packages/appium/lib/bootstrap/appium-initializer.ts b/packages/appium/lib/bootstrap/appium-initializer.ts
+--- a/packages/appium/lib/bootstrap/appium-initializer.ts
++++ b/packages/appium/lib/bootstrap/appium-initializer.ts
+@@
+       return this.finishServerInit(
+         preConfigArgs,
+         configResult,
+         driverConfig,
+         pluginConfig,
+         appiumHome,
+         appiumHomeSourceName,
++        args !== undefined,
+       );
+@@
+   private async finishServerInit<Cmd extends CliCommand>(
+@@
+     pluginConfig: ExtensionConfigs['pluginConfig'],
+     appiumHome: string,
+     appiumHomeSourceName: string,
++    programmaticArgs: boolean,
+   ): Promise<InitResult<Cmd>> {
+@@
+-    await preflightChecks(serverArgs, this.throwInsteadOfExit);
++    await preflightChecks(serverArgs, this.throwInsteadOfExit, programmaticArgs);
+diff --git a/packages/appium/lib/bootstrap/main-helpers.ts b/packages/appium/lib/bootstrap/main-helpers.ts
+--- a/packages/appium/lib/bootstrap/main-helpers.ts
++++ b/packages/appium/lib/bootstrap/main-helpers.ts
+@@
+-export async function preflightChecks(args: ParsedArgs<CliCommandServer>, throwInsteadOfExit = false): Promise<void> {
++export async function preflightChecks(
++  args: ParsedArgs<CliCommandServer>,
++  throwInsteadOfExit = false,
++  programmaticArgs = false,
++): Promise<void> {
+   try {
+@@
+-    validateSchema(args);
++    // Direct driver modules are a programmatic-only API. Keep the public
++    // CLI/config schema strict (string[]), while still validating every normal
++    // server option and every string-valued useDrivers entry.
++    const schemaArgs =
++      programmaticArgs && args.useDrivers.some((entry) => typeof entry !== 'string')
++        ? {
++            ...args,
++            useDrivers: args.useDrivers.filter((entry): entry is string => typeof entry === 'string'),
++          }
++        : args;
++    validateSchema(schemaArgs as ParsedArgs<CliCommandServer>);
+diff --git a/packages/appium/lib/extension/driver-config.ts b/packages/appium/lib/extension/driver-config.ts
+--- a/packages/appium/lib/extension/driver-config.ts
++++ b/packages/appium/lib/extension/driver-config.ts
+@@
+ export class DriverConfig extends ExtensionConfig<DriverType> {
+   private static readonly _instances = new WeakMap<Manifest, DriverConfig>();
+   private knownAutomationNames = new Set<string>();
+   /** Drivers added by {@linkcode DriverConfig.addResolvedDriver}; never written to the manifest */
+   private resolvedDrivers: ExtRecord<DriverType> = {};
++  /** Driver classes passed directly to the programmatic Appium API. */
++  private embeddedDrivers = new Map<string, {driver: DriverClass; driverName: string}>();
+@@
+   async addResolvedDriver(location: string): Promise<ExtName<DriverType>> {
+@@
+     return driverName as ExtName<DriverType>;
+   }
++
++  /**
++   * Registers an already-imported driver class without mutating extensions.yaml.
++   *
++   * The conventional *Driver class suffix gives programmatic callers a stable
++   * automation identity (XCUITestDriver -> XCUITest, UiAutomator2Driver ->
++   * UiAutomator2). A driver may instead expose a static automationName string.
++   */
++  addEmbeddedDriver(driver: DriverClass): string {
++    const declaredAutomationName = (driver as DriverClass & {automationName?: unknown}).automationName;
++    const automationName =
++      typeof declaredAutomationName === 'string'
++        ? declaredAutomationName
++        : driver.name.replace(/Driver$/, '');
++    if (!automationName) {
++      throw new TypeError('An embedded Appium driver must have a class name or static automationName');
++    }
++    const driverName = automationName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
++    if (!driverName) {
++      throw new TypeError(`Could not derive a driver name from automationName '${automationName}'`);
++    }
++    this.embeddedDrivers.set(automationName.toLowerCase(), {driver, driverName});
++    return driverName;
++  }
+@@
+   async findMatchingDriver<C extends StringRecord>({automationName, platformName}: C): Promise<MatchedDriver> {
+@@
+     log.info(
+       `Attempting to find matching driver for automationName ` +
+         `'${automationName}' and platformName '${platformName}'`,
+     );
++
++    const embedded = this.embeddedDrivers.get(automationName.toLowerCase());
++    if (embedded) {
++      log.info(`Using directly supplied '${embedded.driver.name}' driver for automationName '${automationName}'`);
++      return {driver: embedded.driver, version: '', driverName: embedded.driverName};
++    }
+ 
+     try {
+diff --git a/packages/appium/lib/extension/index.ts b/packages/appium/lib/extension/index.ts
+--- a/packages/appium/lib/extension/index.ts
++++ b/packages/appium/lib/extension/index.ts
+@@
+ import path from 'node:path';
+ 
+ import {timing, util} from '@appium/support';
+ import type {DriverClass, ExtensionType, PluginClass} from '@appium/types';
+-import type {ExtClass} from 'appium/types/index.js';
++import type {EmbeddedDriverModule, ExtClass} from 'appium/types/index.js';
+@@
+ export async function getActiveDrivers(
+   driverConfig: DriverConfig,
+   maxParallelImports: number,
+-  useDrivers: string[] = [],
++  useDrivers: Array<string | EmbeddedDriverModule> = [],
+ ): Promise<DriverNameMap> {
+   let filteredDriverNames: string[] = [];
++  const embeddedPairs: Array<[DriverClass, string]> = [];
+   if (util.isEmpty(useDrivers)) {
+     filteredDriverNames = Object.keys(driverConfig.installedExtensions);
+   } else {
+-    for (const driverName of useDrivers) {
++    for (const entry of useDrivers) {
++      if (typeof entry !== 'string') {
++        const driver = unwrapEmbeddedDriver(entry);
++        embeddedPairs.push([driver, driverConfig.addEmbeddedDriver(driver)]);
++        continue;
++      }
++      const driverName = entry;
+       if (isDriverLocation(driverName)) {
+         filteredDriverNames.push(await driverConfig.addResolvedDriver(driverName));
+@@
+   }
+   const pairs = await importExtensions('driver', driverConfig, filteredDriverNames, maxParallelImports);
+-  return new Map(pairs as Array<[DriverClass, string]>);
++  return new Map([...embeddedPairs, ...(pairs as Array<[DriverClass, string]>)]);
+ }
+ 
+ /** Whether a `useDrivers` entry is the location of a driver package rather than a driver name */
+ function isDriverLocation(useDriversEntry: string): boolean {
+   return useDriversEntry.startsWith('file:') || path.isAbsolute(useDriversEntry);
+ }
++
++function isDriverClass(value: unknown): value is DriverClass {
++  return (
++    typeof value === 'function' &&
++    typeof (value as {prototype?: {createSession?: unknown}}).prototype?.createSession === 'function'
++  );
++}
++
++/**
++ * Accept a direct class or an ESM namespace/default-export wrapper. Requiring
++ * exactly one distinct DriverClass keeps ambiguous module namespaces explicit.
++ */
++function unwrapEmbeddedDriver(value: EmbeddedDriverModule): DriverClass {
++  if (isDriverClass(value)) {
++    return value;
++  }
++  const candidates = new Set<DriverClass>();
++  for (const exported of Object.values(value)) {
++    if (isDriverClass(exported)) {
++      candidates.add(exported);
++    }
++  }
++  if (candidates.size !== 1) {
++    throw new TypeError(
++      `A useDrivers module entry must expose exactly one Appium driver class; found ${candidates.size}`,
++    );
++  }
++  return [...candidates][0];
++}
+diff --git a/packages/appium/test/unit/extension/resolved-driver.spec.ts b/packages/appium/test/unit/extension/resolved-driver.spec.ts
+--- a/packages/appium/test/unit/extension/resolved-driver.spec.ts
++++ b/packages/appium/test/unit/extension/resolved-driver.spec.ts
+@@
+ import {fs, tempDir} from '@appium/support';
++import type {DriverClass} from '@appium/types';
+@@
+   describe('getActiveDrivers()', function () {
+@@
+     it('should load drivers given by location', async function () {
+       const drivers = await getActiveDrivers(driverConfig, 1, [pathToFileURL(entryPoint).href]);
+       assert.deepEqual([...drivers.values()], ['resolved']);
+       assert.equal([...drivers.keys()][0].name, 'ResolvedDriver');
+     });
++
++    it('should load the literal imported driver module without Appium discovery', async function () {
++      class LiteralDriver {
++        async createSession(): Promise<void> {}
++      }
++      const driver = LiteralDriver as unknown as DriverClass;
++      const moduleNamespace = {default: driver, LiteralDriver: driver};
++
++      const drivers = await getActiveDrivers(driverConfig, 1, [moduleNamespace]);
++      assert.equal([...drivers.keys()][0], driver);
++      assert.deepEqual([...drivers.values()], ['literal']);
++      assert.deepEqual(
++        await driverConfig.findMatchingDriver({
++          automationName: 'Literal',
++          platformName: 'Fake',
++        }),
++        {driver, version: '', driverName: 'literal'},
++      );
++      assert.deepEqual(driverConfig.manifest.getExtensionData('driver'), {});
++    });
+   });
+ });
+diff --git a/packages/appium/docs/en/guides/managing-exts.md b/packages/appium/docs/en/guides/managing-exts.md
+--- a/packages/appium/docs/en/guides/managing-exts.md
++++ b/packages/appium/docs/en/guides/managing-exts.md
+@@
+-If you publish a package that starts Appium itself, such as a tool that ships Appium together with
+-the drivers it needs, the drivers can end up installed in different places depending on the package
+-manager and the project that uses your package. Instead of relying on `APPIUM_HOME`, resolve each
+-driver from your own package with Node.js module resolution, and pass its location in `useDrivers`:
++If you publish a package that starts Appium itself, such as a tool that ships Appium together with
++the drivers it needs, the drivers can end up installed in different places depending on the package
++manager and the project that uses your package. Programmatic callers can bypass Appium's extension
++discovery by importing the driver and passing it directly in `useDrivers`:
+@@
+ import {main} from 'appium';
++import XCUITestDriver from 'appium-xcuitest-driver';
+ 
+ await main({
+-  useDrivers: [import.meta.resolve('appium-xcuitest-driver')],
++  useDrivers: [XCUITestDriver],
+ });
+ ```
+ 
+-A location can be an absolute path or a `file:` URL of the driver package directory, of its
+-`package.json`, or of any file in the package, such as the entry point returned by
+-`import.meta.resolve()` or `require.resolve()`. Appium reads the driver's metadata from the
+-`package.json` of that package and loads the driver from there. These drivers are not added to
+-`extensions.yaml`, and they take precedence over installed drivers with the same name or
+-`automationName`. Names of installed drivers can be listed alongside them.
++Appium also accepts an ESM namespace object whose default/named exports identify one driver class.
++Directly supplied drivers stay in memory and are not added to `extensions.yaml`. String entries
++remain supported: a string can name an installed driver, or be an absolute path/`file:` URL for a
++driver package resolved by the embedding package.

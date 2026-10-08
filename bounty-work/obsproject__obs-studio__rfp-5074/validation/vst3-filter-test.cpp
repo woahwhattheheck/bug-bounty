@@ -268,10 +268,14 @@ std::string statusText(obs_source_t *filter)
 	return text;
 }
 
+int shell(const std::string &command)
+{
+	return system(command.c_str());
+}
+
 bool windowExists(const std::string &titlePrefix)
 {
-	std::string command = "xwininfo -root -tree | grep -F '\"" + titlePrefix + "' > /dev/null";
-	return system(command.c_str()) == 0;
+	return shell("xwininfo -root -tree | grep -F '\"" + titlePrefix + "' > /dev/null") == 0;
 }
 
 } // namespace
@@ -311,7 +315,10 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	obs_set_ui_task_handler(uiTaskHandler);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 	obs_add_data_path(libobsData.c_str());
+#pragma GCC diagnostic pop
 
 	obs_audio_info audioInfo = {48000, surround ? SPEAKERS_5POINT1 : SPEAKERS_STEREO};
 	CHECK(obs_reset_audio(&audioInfo), "obs_reset_audio (%s, 48 kHz)", surround ? "5.1" : "stereo");
@@ -358,6 +365,10 @@ int main(int argc, char **argv)
 	      "plug-in list from VST3_PATH scan contains both classes of again.vst3 (multi-class module)");
 	std::string cacheFile = configDir + "/obs-vst3/plugin-cache.json";
 	CHECK(os_file_exists(cacheFile.c_str()), "scan cache written to %s", cacheFile.c_str());
+	obs_properties_t *typeProperties = obs_get_source_properties("vst3_filter");
+	CHECK(typeProperties && obs_property_list_item_count(obs_properties_get(typeProperties, "plugin")) >= 3,
+	      "type-level obs_get_source_properties(\"vst3_filter\") lists plug-ins without an instance");
+	obs_properties_destroy(typeProperties);
 	obs_source_release(probe);
 
 	/* 2. Load AGain, default gain 1.0 ------------------------------------------------------------- */
@@ -475,16 +486,16 @@ int main(int argc, char **argv)
 		}
 		bool exists = windowExists("AGain VST3 - VST3 test");
 		CHECK(exists, "editor window \"AGain VST3 - VST3 test\" created by the host process");
-		system("xwininfo -root -tree | grep -A3 'AGain VST3 - VST3 test' | sed 's/^/      /'");
+		shell("xwininfo -root -tree | grep -A3 'AGain VST3 - VST3 test' | sed 's/^/      /'");
 		std::string command = "import -window \"$(xdotool search --name 'AGain VST3 - VST3 test' | head -1)\" " +
 				      editorScreenshot;
-		system(command.c_str());
+		shell(command);
 		CHECK(os_file_exists(editorScreenshot.c_str()), "screenshot written to %s", editorScreenshot.c_str());
 
 		/* Drag the gain slider in the plug-in GUI: IComponentHandler::performEdit -> processor. */
 		uint32_t editsBefore = 0;
-		system("xdotool search --name 'AGain VST3 - VST3 test' | head -1 > /tmp/vst3-editor-window");
-		system("w=$(cat /tmp/vst3-editor-window); xdotool mousemove --window $w 127 98 mousedown 1 "
+		shell("xdotool search --name 'AGain VST3 - VST3 test' | head -1 > /tmp/vst3-editor-window");
+		shell("w=$(cat /tmp/vst3-editor-window); xdotool mousemove --window $w 127 98 mousedown 1 "
 		       "mousemove --window $w 160 98 mousemove --window $w 200 98 mouseup 1");
 		double measuredGain = 0.0;
 		for (int iteration = 0; iteration < 50; iteration++) {
@@ -503,7 +514,7 @@ int main(int argc, char **argv)
 		obs_data_release(settings);
 		CHECK(afterEdit != encoded, "saved state reflects the edit made in the editor (%s)", afterEdit.c_str());
 		command = "import -window \"$(cat /tmp/vst3-editor-window)\" " + editorScreenshot.substr(0, editorScreenshot.size() - 4) + "-after-edit.png";
-		system(command.c_str());
+		shell(command);
 		CHECK(pressButton(filter, "close_editor"), "\"Close Plug-in Interface\" button is visible and clicked");
 		pumpFor(500);
 		CHECK(!windowExists("AGain VST3 - VST3 test"), "editor window closed");

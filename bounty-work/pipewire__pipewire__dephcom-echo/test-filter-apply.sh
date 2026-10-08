@@ -134,7 +134,7 @@ check "echo-cancel nodes removed" sh -c '! pactl list short sinks | grep -q echo
 if [ $FAIL != 0 ]; then
 	echo "---- wireplumber log"; tail -30 "$WORK/wireplumber.log"
 	echo "---- pipewire-pulse log (filter lines)"
-	grep -i "filter\|echo" "$WORK/pipewire-pulse.log" | tail -60
+	grep "filter-apply.c\|module.c" "$WORK/pipewire-pulse.log" | tail -${LOG_LINES:-60}
 	echo "RESULT: FAIL"
 	exit 1
 fi

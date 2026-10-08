@@ -1,0 +1,296 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { NoRoutesEmptyState } from "@/components/no-routes-empty-state";
+import { PathComparison } from "@/components/path-comparison";
+import { PathForm } from "@/components/path-form";
+import { PathList } from "@/components/path-list";
+import { ResultsSkeleton } from "@/components/results-skeleton";
+import { SavedPairsChips } from "@/components/saved-pairs-chips";
+import { useInterval } from "@/hooks/use-interval";
+import { useNetwork } from "@/hooks/use-network";
+import { usePaths } from "@/hooks/use-paths";
+import { exportPathsAsCsv } from "@/lib/export-csv";
+import { checkHorizonHealth } from "@/lib/network-health";
+import type { HorizonHealth } from "@/lib/network-health";
+import { pathChainKey } from "@/types/path";
+import type { RateChange } from "@/types/path";
+
+// Re-fetch interval for live polling, in milliseconds.
+const LIVE_POLL_MS = 15_000;
+
+export default function HomePage() {
+  const { network } = useNetwork();
+  const { paths, usdPrices, loading, error, hasSearched, lastInput, search, refetch, reset } =
+    usePaths();
+  const lastNetwork = useRef(network);
+
+  // Accessibility: State for ARIA live region announcements
+  const [announcement, setAnnouncement] = useState("");
+  const [horizonHealth, setHorizonHealth] = useState<HorizonHealth>("ok");
+  const [healthBannerDismissed, setHealthBannerDismissed] = useState(false);
+
+  // Live polling: re-run the last search on an interval and highlight how each
+  // route's rate has moved since the previous fetch.
+  const [live, setLive] = useState(false);
+  const [rateChanges, setRateChanges] = useState<Map<string, RateChange>>(
+    () => new Map(),
+  );
+  // Previous fetch's rate per route (keyed by asset chain). A ref so updating
+  // the baseline never triggers a re-render.
+  const prevRatesRef = useRef<Map<string, number>>(new Map());
+
+  // A poll re-fetch keeps the existing results on screen (only the initial /
+  // empty load shows the skeleton).
+  const isPolling = live && paths.length > 0;
+
+  useEffect(() => {
+    let cancelled = false;
+    setHealthBannerDismissed(false);
+
+    void checkHorizonHealth(network).then((health) => {
+      if (!cancelled) setHorizonHealth(health);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [network]);
+
+  useEffect(() => {
+    if (lastNetwork.current === network) return;
+    lastNetwork.current = network;
+    reset();
+    setLive(false);
+    prevRatesRef.current = new Map();
+    setRateChanges(new Map());
+    setAnnouncement(""); // clear on network reset
+  }, [network, reset]);
+
+  // A new search target invalidates the polling baseline so stale indicators
+  // never carry over. Polling re-fetches reuse the same lastInput reference, so
+  // this only fires on a genuinely new search — not on each poll.
+  useEffect(() => {
+    prevRatesRef.current = new Map();
+    setRateChanges(new Map());
+  }, [lastInput]);
+
+  // Stop polling if a fetch fails, rather than hammering a failing endpoint.
+  useEffect(() => {
+    if (error) setLive(false);
+  }, [error]);
+
+  // Drive the polling loop. Passing `null` while inactive clears the interval;
+  // the guard plus the disabled toggle prevent overlapping requests, and the
+  // hook clears the timer on unmount.
+  useInterval(
+    () => {
+      if (!loading) void refetch();
+    },
+    live ? LIVE_POLL_MS : null,
+  );
+
+  // After each fetch, compare the new rate of every route against the baseline.
+  useEffect(() => {
+    if (!live) return;
+
+    const current = new Map<string, number>();
+    for (const path of paths) current.set(pathChainKey(path), Number(path.rate));
+
+    const prev = prevRatesRef.current;
+    if (prev.size === 0) {
+      // First fetch since polling started: establish the baseline silently.
+      prevRatesRef.current = current;
+      return;
+    }
+
+    let moved = false;
+    const next = new Map<string, RateChange>();
+    for (const [key, rate] of current) {
+      const before = prev.get(key);
+      if (before === undefined) continue;
+      if (rate > before) {
+        next.set(key, "up");
+        moved = true;
+      } else if (rate < before) {
+        next.set(key, "down");
+        moved = true;
+      } else {
+        next.set(key, "same");
+      }
+    }
+
+    // Ignore re-renders where no rate actually changed (e.g. background hop-rate
+    // enrichment) so a freshly shown indicator is not wiped a moment later.
+    if (!moved) return;
+    prevRatesRef.current = current;
+    setRateChanges(next);
+  }, [paths, live]);
+
+  const toggleLive = useCallback(() => {
+    setLive((on) => {
+      const next = !on;
+      if (!next) {
+        // Turning off: stop tracking and clear indicators immediately.
+        prevRatesRef.current = new Map();
+        setRateChanges(new Map());
+      }
+      return next;
+    });
+  }, []);
+
+  // Accessibility: Update announcement when search resolves
+  useEffect(() => {
+    if (hasSearched && !loading) {
+      if (error) {
+        setAnnouncement(`Search failed: ${error}`);
+      } else if (paths.length === 0) {
+        setAnnouncement("No routes found between these assets at this amount.");
+      } else {
+        setAnnouncement(
+          `Found ${paths.length} routes. Sorted by rate, descending.`,
+        );
+      }
+    }
+  }, [hasSearched, loading, error, paths.length]);
+
+  return (
+    <main className="mx-auto max-w-5xl px-4 py-10 sm:px-6 sm:py-16">
+      {/* Accessibility: ARIA live region to announce search results */}
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcement}
+      </div>
+
+      <header className="space-y-3">
+        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-emerald-400">
+          Stellar · Path Payments
+        </p>
+        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl text-slate-50">
+          Stellar Path Finder
+        </h1>
+        <p className="max-w-2xl text-slate-300">
+          Compare path payment routes between any two assets on the Stellar
+          network. Pick a source, a destination, and an amount. See every hop,
+          every price, and the best rate at a glance.
+        </p>
+      </header>
+
+      <section className="mt-8 rounded-xl border border-slate-700 bg-slate-900/40 p-5 sm:mt-12 sm:p-8">
+        {horizonHealth === "degraded" && !healthBannerDismissed ? (
+          <div
+            role="status"
+            className="mb-5 flex items-start justify-between gap-4 rounded-lg border border-amber-600/60 bg-amber-950/30 px-4 py-3 text-amber-100"
+          >
+            <p className="text-sm">
+              Horizon may be experiencing delays. Results could be slower than usual.
+            </p>
+            <button
+              type="button"
+              onClick={() => setHealthBannerDismissed(true)}
+              aria-label="Dismiss Horizon status notice"
+              className="shrink-0 rounded px-2 py-1 text-xs font-semibold text-amber-200 transition-colors hover:bg-amber-900/50 focus:outline-none focus:ring-2 focus:ring-amber-400"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+        <SavedPairsChips network={network} onSelectPair={search} />
+        <PathForm onSubmit={search} loading={loading} />
+      </section>
+
+      {loading && !isPolling ? (
+        <ResultsSkeleton />
+      ) : (
+        <>
+          {error ? (
+            <section className="mt-6 rounded-xl border border-rose-800/60 bg-rose-950/30 p-4">
+              <p className="text-sm font-medium text-rose-300">Search failed</p>
+              <p className="mt-1 text-sm text-rose-200">{error}</p>
+            </section>
+          ) : null}
+
+          {hasSearched && !error && paths.length === 0 ? (
+            <NoRoutesEmptyState input={lastInput} />
+          ) : null}
+
+          {paths.length > 0 ? (
+            <div className="mt-8 space-y-8">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
+                  Rates update with order book activity
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => exportPathsAsCsv(paths)}
+                    className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/40 px-3 py-1.5 text-xs font-semibold text-slate-300 transition-colors hover:border-slate-600 focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 focus:ring-offset-slate-900"
+                  >
+                    Download CSV
+                  </button>
+                  <button
+                    type="button"
+                    onClick={toggleLive}
+                    disabled={loading}
+                    aria-pressed={live}
+                    aria-label={
+                      live
+                        ? "Turn off live rate updates"
+                        : "Turn on live rate updates"
+                    }
+                    className={
+                      "inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 focus:ring-offset-slate-900 disabled:cursor-not-allowed disabled:opacity-50 " +
+                      (live
+                        ? "border-emerald-500 bg-emerald-500/10 text-emerald-300"
+                        : "border-slate-700 bg-slate-900/40 text-slate-300 hover:border-slate-600")
+                    }
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={
+                        "inline-block h-2 w-2 rounded-full " +
+                        (live
+                          ? loading
+                            ? "animate-pulse bg-emerald-400"
+                            : "bg-emerald-400"
+                          : "bg-slate-500")
+                      }
+                    />
+                    {live ? (loading ? "Updating…" : "Live") : "Go live"}
+                  </button>
+                </div>
+              </div>
+              <PathComparison paths={paths} network={network} rateChanges={rateChanges} usdPrices={usdPrices} />
+              <section className="space-y-3">
+                <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                  All {paths.length} path{paths.length === 1 ? "" : "s"} · click
+                  a row to inspect the route
+                </p>
+                <PathList
+                  paths={paths}
+                  direction={lastInput?.direction ?? "strict-send"}
+                  network={lastInput?.network ?? "mainnet"}
+                  rateChanges={rateChanges}
+                  usdPrices={usdPrices}
+                />
+              </section>
+            </div>
+          ) : null}
+        </>
+      )}
+      <footer className="mt-16 border-t border-slate-700 pt-6 text-center text-sm text-slate-400">
+        <a
+          href="https://github.com/ShippedLabs/Stellar-Path-Finder"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="transition-colors hover:text-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 focus:ring-offset-slate-900 rounded-sm"
+        >
+          View on GitHub
+        </a>
+        <span className="mx-2" aria-hidden="true">
+          ·
+        </span>
+        <span>Powered by Stellar Horizon</span>
+      </footer>
+    </main>
+  );
+}

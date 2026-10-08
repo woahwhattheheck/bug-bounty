@@ -1,0 +1,193 @@
+{
+    "name": "Folders Test",
+    "current_scene": "Game",
+    "current_program_scene": "Game",
+    "scene_order": [
+        {
+            "name": "Starting Soon"
+        },
+        {
+            "name": "Game"
+        },
+        {
+            "name": "Game + Cam"
+        },
+        {
+            "name": "BRB"
+        },
+        {
+            "name": "Webcam Frame"
+        },
+        {
+            "name": "Alerts"
+        },
+        {
+            "name": "Ending"
+        }
+    ],
+    "sources": [
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "Starting Soon",
+            "uuid": "1ae3fcd4-d658-5180-bbf3-82d21beea22c",
+            "settings": {
+                "id_counter": 0,
+                "custom_size": false,
+                "items": []
+            },
+            "private_settings": {},
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false
+        },
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "Game",
+            "uuid": "7e2fcb7b-43dd-5d37-9a58-ac468e529ed1",
+            "settings": {
+                "id_counter": 0,
+                "custom_size": false,
+                "items": []
+            },
+            "private_settings": {
+                "scene_folder": "Gameplay"
+            },
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false
+        },
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "Game + Cam",
+            "uuid": "8da7cb93-1450-5efe-8f3e-fbaa7d92b771",
+            "settings": {
+                "id_counter": 0,
+                "custom_size": false,
+                "items": []
+            },
+            "private_settings": {
+                "scene_folder": "Gameplay"
+            },
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false
+        },
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "BRB",
+            "uuid": "10bfd70d-445f-5036-975c-2d265317eddc",
+            "settings": {
+                "id_counter": 0,
+                "custom_size": false,
+                "items": []
+            },
+            "private_settings": {},
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false
+        },
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "Webcam Frame",
+            "uuid": "eb635c48-6627-5b17-956e-962868e66b84",
+            "settings": {
+                "id_counter": 0,
+                "custom_size": false,
+                "items": []
+            },
+            "private_settings": {
+                "scene_folder": "Components"
+            },
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false
+        },
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "Alerts",
+            "uuid": "15769d1b-f314-5045-93c9-8ef1be781775",
+            "settings": {
+                "id_counter": 0,
+                "custom_size": false,
+                "items": []
+            },
+            "private_settings": {
+                "scene_folder": "Components",
+                "show_in_multiview": false
+            },
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false
+        },
+        {
+            "id": "scene",
+            "versioned_id": "scene",
+            "name": "Ending",
+            "uuid": "5b59b380-f384-5bea-b316-6f7bcd47d482",
+            "settings": {
+                "id_counter": 0,
+                "custom_size": false,
+                "items": []
+            },
+            "private_settings": {},
+            "mixers": 0,
+            "sync": 0,
+            "flags": 0,
+            "volume": 1.0,
+            "balance": 0.5,
+            "enabled": true,
+            "muted": false
+        }
+    ],
+    "groups": [],
+    "transitions": [],
+    "current_transition": "Fade",
+    "transition_duration": 300,
+    "scene_folders": [
+        {
+            "name": "Gameplay",
+            "collapsed": false,
+            "position": 1
+        },
+        {
+            "name": "Empty Folder",
+            "collapsed": false,
+            "position": 3
+        },
+        {
+            "name": "Components",
+            "collapsed": true,
+            "position": 4
+        }
+    ]
+}

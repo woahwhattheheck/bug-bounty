@@ -1,0 +1,3315 @@
+From 11151dda15665812369b615318dff7fa989c3e37 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:37:38 +0000
+Subject: [PATCH 1/3] frontend: Add scene tree layout model
+
+Scene folders need a data model that is independent from the Qt
+widget, so that loading, saving and undo/redo can share one tested
+implementation.
+
+The layout of the Scenes dock is described as a list of top-level
+entries (scenes and folders with their scenes). It is persisted in a
+way that stays compatible with versions of OBS without folders:
+
+* "scene_order" keeps the flat list of all scenes in display order, so
+  older versions still load every scene in the same order.
+* Folder membership is stored in each scene's private settings
+  ("scene_folder"), which every version of OBS preserves.
+* The folder list (name, collapsed state, position) is stored in a new
+  top-level "scene_folders" array that older versions ignore.
+
+When "scene_folders" is missing (e.g. the collection was saved by an
+older version), folders are rebuilt from the private settings at the
+position of their first scene.
+
+Also adds a cmocka test for the save/load round trip and the
+compatibility cases.
+---
+ frontend/cmake/ui-models.cmake         |  11 +-
+ frontend/models/SceneTreeLayout.cpp    | 260 +++++++++++++++++++++++
+ frontend/models/SceneTreeLayout.hpp    |  79 +++++++
+ test/cmocka/CMakeLists.txt             |  11 +
+ test/cmocka/test_scene_tree_layout.cpp | 280 +++++++++++++++++++++++++
+ 5 files changed, 640 insertions(+), 1 deletion(-)
+ create mode 100644 frontend/models/SceneTreeLayout.cpp
+ create mode 100644 frontend/models/SceneTreeLayout.hpp
+ create mode 100644 test/cmocka/test_scene_tree_layout.cpp
+
+diff --git a/frontend/cmake/ui-models.cmake b/frontend/cmake/ui-models.cmake
+index a03011a..969d974 100644
+--- a/frontend/cmake/ui-models.cmake
++++ b/frontend/cmake/ui-models.cmake
+@@ -1 +1,10 @@
+-target_sources(obs-studio PRIVATE models/Rect.cpp models/Rect.hpp models/SceneCollection.cpp models/SceneCollection.hpp)
++target_sources(
++  obs-studio
++  PRIVATE
++    models/Rect.cpp
++    models/Rect.hpp
++    models/SceneCollection.cpp
++    models/SceneCollection.hpp
++    models/SceneTreeLayout.cpp
++    models/SceneTreeLayout.hpp
++)
+diff --git a/frontend/models/SceneTreeLayout.cpp b/frontend/models/SceneTreeLayout.cpp
+new file mode 100644
+index 0000000..c0d0add
+--- /dev/null
++++ b/frontend/models/SceneTreeLayout.cpp
+@@ -0,0 +1,260 @@
++#include "SceneTreeLayout.hpp"
++
++#include <obs.hpp>
++
++#include <algorithm>
++#include <unordered_set>
++
++namespace OBS {
++
++namespace {
++constexpr const char *entryTypeScene = "scene";
++constexpr const char *entryTypeFolder = "folder";
++} // namespace
++
++SceneTreeLayout BuildSceneTreeLayout(const std::vector<std::string> &sceneOrder,
++				     const SceneFolderMembership &membership,
++				     const std::vector<SceneFolderInfo> &folders)
++{
++	/* Remove duplicate scene names, keeping the first occurrence */
++	std::vector<std::string> scenes;
++	std::unordered_set<std::string> knownScenes;
++	scenes.reserve(sceneOrder.size());
++
++	for (const std::string &scene : sceneOrder) {
++		if (knownScenes.insert(scene).second) {
++			scenes.push_back(scene);
++		}
++	}
++
++	/* Collect folder definitions, ignoring nameless and duplicate folders */
++	std::vector<SceneFolderInfo> folderList;
++	std::unordered_set<std::string> knownFolders;
++
++	for (const SceneFolderInfo &folder : folders) {
++		if (folder.name.empty() || !knownFolders.insert(folder.name).second) {
++			continue;
++		}
++
++		SceneFolderInfo info = folder;
++		info.position = std::min(info.position, scenes.size());
++		folderList.push_back(info);
++	}
++
++	/* Recreate folders that only exist in scene private settings, e.g.
++	 * after the collection was saved by a version of OBS without folders */
++	auto getFolderOfScene = [&membership](const std::string &scene) -> std::string {
++		auto it = membership.find(scene);
++		return it != membership.end() ? it->second : std::string();
++	};
++
++	for (size_t i = 0; i < scenes.size(); i++) {
++		std::string folder = getFolderOfScene(scenes[i]);
++
++		if (!folder.empty() && knownFolders.insert(folder).second) {
++			folderList.push_back({folder, false, i});
++		}
++	}
++
++	std::stable_sort(folderList.begin(), folderList.end(),
++			 [](const SceneFolderInfo &a, const SceneFolderInfo &b) { return a.position < b.position; });
++
++	/* Assign scenes to folders, keeping their relative order */
++	std::unordered_map<std::string, std::vector<std::string>> folderScenes;
++
++	for (const std::string &scene : scenes) {
++		std::string folder = getFolderOfScene(scene);
++
++		if (!folder.empty()) {
++			folderScenes[folder].push_back(scene);
++		}
++	}
++
++	SceneTreeLayout layout;
++	size_t nextFolder = 0;
++
++	auto addFolder = [&](const SceneFolderInfo &info) {
++		SceneTreeEntry entry;
++		entry.type = SceneTreeEntry::Type::Folder;
++		entry.name = info.name;
++		entry.isCollapsed = info.isCollapsed;
++		entry.scenes = std::move(folderScenes[info.name]);
++		layout.push_back(std::move(entry));
++	};
++
++	for (size_t i = 0; i < scenes.size(); i++) {
++		while (nextFolder < folderList.size() && folderList[nextFolder].position <= i) {
++			addFolder(folderList[nextFolder++]);
++		}
++
++		if (getFolderOfScene(scenes[i]).empty()) {
++			SceneTreeEntry entry;
++			entry.type = SceneTreeEntry::Type::Scene;
++			entry.name = scenes[i];
++			layout.push_back(std::move(entry));
++		}
++	}
++
++	while (nextFolder < folderList.size()) {
++		addFolder(folderList[nextFolder++]);
++	}
++
++	return layout;
++}
++
++std::vector<std::string> GetSceneOrder(const SceneTreeLayout &layout)
++{
++	std::vector<std::string> order;
++
++	for (const SceneTreeEntry &entry : layout) {
++		if (entry.type == SceneTreeEntry::Type::Scene) {
++			order.push_back(entry.name);
++		} else if (entry.type == SceneTreeEntry::Type::Folder) {
++			order.insert(order.end(), entry.scenes.begin(), entry.scenes.end());
++		}
++	}
++
++	return order;
++}
++
++std::vector<SceneFolderInfo> GetSceneFolders(const SceneTreeLayout &layout)
++{
++	std::vector<SceneFolderInfo> folders;
++	size_t sceneCount = 0;
++
++	for (const SceneTreeEntry &entry : layout) {
++		if (entry.type == SceneTreeEntry::Type::Scene) {
++			sceneCount++;
++		} else if (entry.type == SceneTreeEntry::Type::Folder) {
++			folders.push_back({entry.name, entry.isCollapsed, sceneCount});
++			sceneCount += entry.scenes.size();
++		}
++	}
++
++	return folders;
++}
++
++SceneFolderMembership GetSceneFolderMembership(const SceneTreeLayout &layout)
++{
++	SceneFolderMembership membership;
++
++	for (const SceneTreeEntry &entry : layout) {
++		if (entry.type != SceneTreeEntry::Type::Folder) {
++			continue;
++		}
++
++		for (const std::string &scene : entry.scenes) {
++			membership[scene] = entry.name;
++		}
++	}
++
++	return membership;
++}
++
++obs_data_array_t *SaveSceneFolders(const std::vector<SceneFolderInfo> &folders)
++{
++	obs_data_array_t *array = obs_data_array_create();
++
++	for (const SceneFolderInfo &folder : folders) {
++		OBSDataAutoRelease data = obs_data_create();
++		obs_data_set_string(data, "name", folder.name.c_str());
++		obs_data_set_bool(data, "collapsed", folder.isCollapsed);
++		obs_data_set_int(data, "position", (long long)folder.position);
++		obs_data_array_push_back(array, data);
++	}
++
++	return array;
++}
++
++std::vector<SceneFolderInfo> LoadSceneFolders(obs_data_array_t *array)
++{
++	std::vector<SceneFolderInfo> folders;
++	size_t count = obs_data_array_count(array);
++
++	for (size_t i = 0; i < count; i++) {
++		OBSDataAutoRelease data = obs_data_array_item(array, i);
++		long long position = obs_data_get_int(data, "position");
++
++		SceneFolderInfo folder;
++		folder.name = obs_data_get_string(data, "name");
++		folder.isCollapsed = obs_data_get_bool(data, "collapsed");
++		folder.position = position > 0 ? (size_t)position : 0;
++		folders.push_back(folder);
++	}
++
++	return folders;
++}
++
++std::string SerializeSceneTreeLayout(const SceneTreeLayout &layout)
++{
++	OBSDataAutoRelease data = obs_data_create();
++	OBSDataArrayAutoRelease entries = obs_data_array_create();
++
++	for (const SceneTreeEntry &entry : layout) {
++		OBSDataAutoRelease entryData = obs_data_create();
++
++		if (entry.type == SceneTreeEntry::Type::Scene) {
++			obs_data_set_string(entryData, "type", entryTypeScene);
++			obs_data_set_string(entryData, "name", entry.name.c_str());
++		} else if (entry.type == SceneTreeEntry::Type::Folder) {
++			OBSDataArrayAutoRelease scenes = obs_data_array_create();
++
++			for (const std::string &scene : entry.scenes) {
++				OBSDataAutoRelease sceneData = obs_data_create();
++				obs_data_set_string(sceneData, "name", scene.c_str());
++				obs_data_array_push_back(scenes, sceneData);
++			}
++
++			obs_data_set_string(entryData, "type", entryTypeFolder);
++			obs_data_set_string(entryData, "name", entry.name.c_str());
++			obs_data_set_bool(entryData, "collapsed", entry.isCollapsed);
++			obs_data_set_array(entryData, "scenes", scenes);
++		} else {
++			continue;
++		}
++
++		obs_data_array_push_back(entries, entryData);
++	}
++
++	obs_data_set_array(data, "entries", entries);
++	return obs_data_get_json(data);
++}
++
++SceneTreeLayout DeserializeSceneTreeLayout(const char *json)
++{
++	SceneTreeLayout layout;
++	OBSDataAutoRelease data = obs_data_create_from_json(json);
++	OBSDataArrayAutoRelease entries = obs_data_get_array(data, "entries");
++	size_t count = obs_data_array_count(entries);
++
++	for (size_t i = 0; i < count; i++) {
++		OBSDataAutoRelease entryData = obs_data_array_item(entries, i);
++		std::string type = obs_data_get_string(entryData, "type");
++
++		SceneTreeEntry entry;
++		entry.name = obs_data_get_string(entryData, "name");
++
++		if (type == entryTypeScene) {
++			entry.type = SceneTreeEntry::Type::Scene;
++		} else if (type == entryTypeFolder) {
++			OBSDataArrayAutoRelease scenes = obs_data_get_array(entryData, "scenes");
++			size_t sceneCount = obs_data_array_count(scenes);
++
++			for (size_t j = 0; j < sceneCount; j++) {
++				OBSDataAutoRelease sceneData = obs_data_array_item(scenes, j);
++				entry.scenes.push_back(obs_data_get_string(sceneData, "name"));
++			}
++
++			entry.type = SceneTreeEntry::Type::Folder;
++			entry.isCollapsed = obs_data_get_bool(entryData, "collapsed");
++		} else {
++			continue;
++		}
++
++		layout.push_back(std::move(entry));
++	}
++
++	return layout;
++}
++
++} // namespace OBS
+diff --git a/frontend/models/SceneTreeLayout.hpp b/frontend/models/SceneTreeLayout.hpp
+new file mode 100644
+index 0000000..3b379be
+--- /dev/null
++++ b/frontend/models/SceneTreeLayout.hpp
+@@ -0,0 +1,79 @@
++#pragma once
++
++#include <obs.h>
++
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace OBS {
++
++/* Top-level key of the scene collection that stores the folder list. Older
++ * versions of OBS do not know this key and simply ignore it. */
++inline constexpr const char *sceneFoldersKey = "scene_folders";
++
++/* Key in a scene's private settings that names the folder the scene belongs
++ * to. Private settings are preserved by every version of OBS, so folder
++ * membership survives a round trip through an older version. */
++inline constexpr const char *sceneFolderPrivateKey = "scene_folder";
++
++/* Folder metadata as stored in the scene collection. `position` is the number
++ * of scenes (in the flat "scene_order" array) that precede the folder header,
++ * which allows empty folders to keep their place in the list. */
++struct SceneFolderInfo {
++	std::string name;
++	bool isCollapsed = false;
++	size_t position = 0;
++};
++
++/* One top-level entry of the Scenes dock: either a scene that is not inside a
++ * folder, or a folder together with the scenes it contains. */
++struct SceneTreeEntry {
++	enum class Type { Invalid, Scene, Folder };
++
++	Type type = Type::Invalid;
++	std::string name;
++	bool isCollapsed = false;
++	std::vector<std::string> scenes;
++
++	bool operator==(const SceneTreeEntry &other) const
++	{
++		return type == other.type && name == other.name && isCollapsed == other.isCollapsed &&
++		       scenes == other.scenes;
++	}
++};
++
++using SceneTreeLayout = std::vector<SceneTreeEntry>;
++using SceneFolderMembership = std::unordered_map<std::string, std::string>;
++
++/* Builds the visual layout of the Scenes dock.
++ *
++ * - `sceneOrder` is the flat scene order ("scene_order" in the collection).
++ * - `membership` maps scene names to folder names (from private settings).
++ * - `folders` is the folder list ("scene_folders" in the collection); it may be
++ *   empty, for example when the collection was last saved by an older version
++ *   of OBS. Folders that are referenced by a scene but missing from the list are
++ *   recreated (expanded) at the position of their first scene.
++ *
++ * Every scene of `sceneOrder` appears exactly once in the result. */
++SceneTreeLayout BuildSceneTreeLayout(const std::vector<std::string> &sceneOrder,
++				     const SceneFolderMembership &membership,
++				     const std::vector<SceneFolderInfo> &folders);
++
++/* Flat scene order of a layout, as written to "scene_order". */
++std::vector<std::string> GetSceneOrder(const SceneTreeLayout &layout);
++
++/* Folder list of a layout, as written to "scene_folders". */
++std::vector<SceneFolderInfo> GetSceneFolders(const SceneTreeLayout &layout);
++
++/* Folder membership of every scene inside a folder. */
++SceneFolderMembership GetSceneFolderMembership(const SceneTreeLayout &layout);
++
++obs_data_array_t *SaveSceneFolders(const std::vector<SceneFolderInfo> &folders);
++std::vector<SceneFolderInfo> LoadSceneFolders(obs_data_array_t *array);
++
++/* JSON (de)serialization of a complete layout, used for undo/redo. */
++std::string SerializeSceneTreeLayout(const SceneTreeLayout &layout);
++SceneTreeLayout DeserializeSceneTreeLayout(const char *json);
++
++} // namespace OBS
+diff --git a/test/cmocka/CMakeLists.txt b/test/cmocka/CMakeLists.txt
+index 8b6a6f1..1517231 100644
+--- a/test/cmocka/CMakeLists.txt
++++ b/test/cmocka/CMakeLists.txt
+@@ -28,3 +28,14 @@ target_include_directories(test_os_path PRIVATE ${CMOCKA_INCLUDE_DIR})
+ target_link_libraries(test_os_path PRIVATE OBS::libobs ${CMOCKA_LIBRARIES})
+ 
+ add_test(test_os_path ${CMAKE_CURRENT_BINARY_DIR}/test_os_path)
++
++# Scene folder layout test
++add_executable(
++  test_scene_tree_layout
++  test_scene_tree_layout.cpp
++  ${CMAKE_SOURCE_DIR}/frontend/models/SceneTreeLayout.cpp
++)
++target_include_directories(test_scene_tree_layout PRIVATE ${CMOCKA_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/frontend)
++target_link_libraries(test_scene_tree_layout PRIVATE OBS::libobs ${CMOCKA_LIBRARIES})
++
++add_test(test_scene_tree_layout ${CMAKE_CURRENT_BINARY_DIR}/test_scene_tree_layout)
+diff --git a/test/cmocka/test_scene_tree_layout.cpp b/test/cmocka/test_scene_tree_layout.cpp
+new file mode 100644
+index 0000000..8586f97
+--- /dev/null
++++ b/test/cmocka/test_scene_tree_layout.cpp
+@@ -0,0 +1,280 @@
++#include <stdarg.h>
++#include <stddef.h>
++#include <setjmp.h>
++
++extern "C" {
++#include <cmocka.h>
++}
++
++#include <models/SceneTreeLayout.hpp>
++
++#include <obs.hpp>
++
++#include <string>
++#include <vector>
++
++using OBS::SceneFolderInfo;
++using OBS::SceneFolderMembership;
++using OBS::SceneTreeEntry;
++using OBS::SceneTreeLayout;
++
++static SceneTreeEntry Scene(const char *name)
++{
++	SceneTreeEntry entry;
++	entry.type = SceneTreeEntry::Type::Scene;
++	entry.name = name;
++	return entry;
++}
++
++static SceneTreeEntry Folder(const char *name, bool isCollapsed, std::vector<std::string> scenes)
++{
++	SceneTreeEntry entry;
++	entry.type = SceneTreeEntry::Type::Folder;
++	entry.name = name;
++	entry.isCollapsed = isCollapsed;
++	entry.scenes = std::move(scenes);
++	return entry;
++}
++
++/* Writes a layout the same way the frontend saves a scene collection: flat
++ * "scene_order", "scene_folders" and the folder name in each scene's private
++ * settings. Returns the collection JSON. */
++static std::string SaveCollection(const SceneTreeLayout &layout)
++{
++	OBSDataAutoRelease collection = obs_data_create();
++	OBSDataArrayAutoRelease sceneOrder = obs_data_array_create();
++	OBSDataArrayAutoRelease sources = obs_data_array_create();
++	SceneFolderMembership membership = OBS::GetSceneFolderMembership(layout);
++
++	for (const std::string &name : OBS::GetSceneOrder(layout)) {
++		OBSDataAutoRelease orderEntry = obs_data_create();
++		obs_data_set_string(orderEntry, "name", name.c_str());
++		obs_data_array_push_back(sceneOrder, orderEntry);
++
++		OBSDataAutoRelease source = obs_data_create();
++		OBSDataAutoRelease privateSettings = obs_data_create();
++		auto it = membership.find(name);
++
++		if (it != membership.end()) {
++			obs_data_set_string(privateSettings, OBS::sceneFolderPrivateKey, it->second.c_str());
++		}
++
++		obs_data_set_string(source, "name", name.c_str());
++		obs_data_set_string(source, "id", "scene");
++		obs_data_set_obj(source, "private_settings", privateSettings);
++		obs_data_array_push_back(sources, source);
++	}
++
++	OBSDataArrayAutoRelease folders = OBS::SaveSceneFolders(OBS::GetSceneFolders(layout));
++
++	obs_data_set_array(collection, "scene_order", sceneOrder);
++	obs_data_set_array(collection, "sources", sources);
++	obs_data_set_array(collection, OBS::sceneFoldersKey, folders);
++	return obs_data_get_json(collection);
++}
++
++/* Loads a collection JSON the same way the frontend does */
++static SceneTreeLayout LoadCollection(const std::string &json)
++{
++	OBSDataAutoRelease collection = obs_data_create_from_json(json.c_str());
++	OBSDataArrayAutoRelease sceneOrder = obs_data_get_array(collection, "scene_order");
++	OBSDataArrayAutoRelease sources = obs_data_get_array(collection, "sources");
++	OBSDataArrayAutoRelease folders = obs_data_get_array(collection, OBS::sceneFoldersKey);
++
++	std::vector<std::string> order;
++	SceneFolderMembership membership;
++
++	for (size_t i = 0; i < obs_data_array_count(sceneOrder); i++) {
++		OBSDataAutoRelease entry = obs_data_array_item(sceneOrder, i);
++		order.push_back(obs_data_get_string(entry, "name"));
++	}
++
++	for (size_t i = 0; i < obs_data_array_count(sources); i++) {
++		OBSDataAutoRelease source = obs_data_array_item(sources, i);
++		OBSDataAutoRelease privateSettings = obs_data_get_obj(source, "private_settings");
++		const char *folder = obs_data_get_string(privateSettings, OBS::sceneFolderPrivateKey);
++
++		if (*folder) {
++			membership[obs_data_get_string(source, "name")] = folder;
++		}
++	}
++
++	return OBS::BuildSceneTreeLayout(order, membership, OBS::LoadSceneFolders(folders));
++}
++
++/* Simulates an older version of OBS loading and re-saving the collection: it
++ * only knows "scene_order" and "sources" and writes everything else from
++ * scratch, so "scene_folders" is lost while private settings are kept. */
++static std::string ResaveWithOlderVersion(const std::string &json, std::vector<std::string> *loadedScenes)
++{
++	OBSDataAutoRelease collection = obs_data_create_from_json(json.c_str());
++	OBSDataArrayAutoRelease sceneOrder = obs_data_get_array(collection, "scene_order");
++	OBSDataArrayAutoRelease sources = obs_data_get_array(collection, "sources");
++
++	if (loadedScenes) {
++		for (size_t i = 0; i < obs_data_array_count(sceneOrder); i++) {
++			OBSDataAutoRelease entry = obs_data_array_item(sceneOrder, i);
++			loadedScenes->push_back(obs_data_get_string(entry, "name"));
++		}
++	}
++
++	OBSDataAutoRelease resaved = obs_data_create();
++	obs_data_set_array(resaved, "scene_order", sceneOrder);
++	obs_data_set_array(resaved, "sources", sources);
++	return obs_data_get_json(resaved);
++}
++
++static SceneTreeLayout ExampleLayout()
++{
++	return {
++		Scene("Starting Soon"),
++		Folder("Gameplay", false, {"Game", "Game + Cam"}),
++		Folder("Empty", true, {}),
++		Scene("BRB"),
++		Folder("Components", true, {"Webcam Frame", "Alerts"}),
++	};
++}
++
++static void assert_layout_equal(const SceneTreeLayout &actual, const SceneTreeLayout &expected)
++{
++	assert_int_equal(actual.size(), expected.size());
++
++	for (size_t i = 0; i < expected.size(); i++) {
++		assert_true(actual[i].type == expected[i].type);
++		assert_string_equal(actual[i].name.c_str(), expected[i].name.c_str());
++		assert_int_equal(actual[i].isCollapsed, expected[i].isCollapsed);
++		assert_int_equal(actual[i].scenes.size(), expected[i].scenes.size());
++
++		for (size_t j = 0; j < expected[i].scenes.size(); j++) {
++			assert_string_equal(actual[i].scenes[j].c_str(), expected[i].scenes[j].c_str());
++		}
++	}
++}
++
++static void flat_scene_order_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	std::vector<std::string> order = OBS::GetSceneOrder(ExampleLayout());
++	std::vector<std::string> expected = {"Starting Soon", "Game", "Game + Cam", "BRB", "Webcam Frame", "Alerts"};
++
++	assert_true(order == expected);
++
++	std::vector<SceneFolderInfo> folders = OBS::GetSceneFolders(ExampleLayout());
++	assert_int_equal(folders.size(), 3);
++	assert_string_equal(folders[0].name.c_str(), "Gameplay");
++	assert_int_equal(folders[0].position, 1);
++	assert_string_equal(folders[1].name.c_str(), "Empty");
++	assert_int_equal(folders[1].position, 3);
++	assert_true(folders[1].isCollapsed);
++	assert_string_equal(folders[2].name.c_str(), "Components");
++	assert_int_equal(folders[2].position, 4);
++}
++
++static void save_load_roundtrip_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	std::string json = SaveCollection(ExampleLayout());
++	assert_layout_equal(LoadCollection(json), ExampleLayout());
++}
++
++static void collection_without_folders_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	SceneTreeLayout layout = OBS::BuildSceneTreeLayout({"A", "B", "C"}, {}, {});
++	assert_layout_equal(layout, {Scene("A"), Scene("B"), Scene("C")});
++}
++
++static void older_version_loads_every_scene_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	std::vector<std::string> loadedScenes;
++	ResaveWithOlderVersion(SaveCollection(ExampleLayout()), &loadedScenes);
++
++	assert_true(loadedScenes == OBS::GetSceneOrder(ExampleLayout()));
++}
++
++static void older_version_roundtrip_keeps_folders_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	std::string json = ResaveWithOlderVersion(SaveCollection(ExampleLayout()), nullptr);
++
++	/* "scene_folders" was dropped: folders with scenes come back (expanded)
++	 * from the scenes' private settings, the empty folder is gone */
++	assert_layout_equal(LoadCollection(json), {
++							  Scene("Starting Soon"),
++							  Folder("Gameplay", false, {"Game", "Game + Cam"}),
++							  Scene("BRB"),
++							  Folder("Components", false, {"Webcam Frame", "Alerts"}),
++						  });
++}
++
++static void reordered_by_older_version_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	/* An older version moved "Alerts" to the top and "Game" to the bottom */
++	std::vector<std::string> order = {"Alerts", "Starting Soon", "Game + Cam", "BRB", "Webcam Frame", "Game"};
++	SceneFolderMembership membership = {
++		{"Game", "Gameplay"},
++		{"Game + Cam", "Gameplay"},
++		{"Webcam Frame", "Components"},
++		{"Alerts", "Components"},
++	};
++
++	SceneTreeLayout layout = OBS::BuildSceneTreeLayout(order, membership, {});
++
++	/* Folders are placed at their first scene, every scene exactly once */
++	assert_layout_equal(layout, {
++					    Folder("Components", false, {"Alerts", "Webcam Frame"}),
++					    Scene("Starting Soon"),
++					    Folder("Gameplay", false, {"Game + Cam", "Game"}),
++					    Scene("BRB"),
++				    });
++}
++
++static void invalid_folder_data_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	std::vector<SceneFolderInfo> folders = {
++		{"", false, 0},      /* nameless, ignored */
++		{"Late", true, 999}, /* position past the end, clamped */
++		{"Dup", false, 1},   /* duplicate name, first one wins */
++		{"Dup", true, 0},
++	};
++	SceneFolderMembership membership = {{"B", "Dup"}, {"Ghost", "Dup"}};
++
++	SceneTreeLayout layout = OBS::BuildSceneTreeLayout({"A", "B", "A"}, membership, folders);
++
++	assert_layout_equal(layout, {Scene("A"), Folder("Dup", false, {"B"}), Folder("Late", true, {})});
++}
++
++static void undo_serialization_test(void **state)
++{
++	UNUSED_PARAMETER(state);
++
++	std::string json = OBS::SerializeSceneTreeLayout(ExampleLayout());
++	assert_layout_equal(OBS::DeserializeSceneTreeLayout(json.c_str()), ExampleLayout());
++	assert_int_equal(OBS::DeserializeSceneTreeLayout("{}").size(), 0);
++}
++
++int main()
++{
++	const struct CMUnitTest tests[] = {
++		cmocka_unit_test(flat_scene_order_test),
++		cmocka_unit_test(save_load_roundtrip_test),
++		cmocka_unit_test(collection_without_folders_test),
++		cmocka_unit_test(older_version_loads_every_scene_test),
++		cmocka_unit_test(older_version_roundtrip_keeps_folders_test),
++		cmocka_unit_test(reordered_by_older_version_test),
++		cmocka_unit_test(invalid_folder_data_test),
++		cmocka_unit_test(undo_serialization_test),
++	};
++
++	return cmocka_run_group_tests(tests, NULL, NULL);
++}
+-- 
+2.43.0
+
+
+From 5ae89536c2107325fa0759031065361e963f6fab Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:40:55 +0000
+Subject: [PATCH 2/3] frontend: Add folders to the Scenes dock
+
+Large scene collections are hard to navigate, especially when many
+scenes only exist to be nested into other scenes. This adds collapsible
+folders to the Scenes dock, which are purely organizational: folders are
+not sources, have no hotkeys, and scene enumeration (multiview,
+obs_frontend_get_scenes, scene switching) keeps returning all scenes in
+the order of the dock.
+
+The SceneTree stays a QListWidget, so grid mode and existing code that
+walks the rows keep working. Folder headers are additional rows, and
+scenes directly following a folder header that are flagged as being in
+a folder belong to it. Folders cannot be nested.
+
+* Folders can be added, renamed (F2/inline editor) and removed from the
+  context menu. Removing a folder keeps its scenes at the same position.
+* Folders are expanded/collapsed with their indicator (the same theme
+  indicator the Sources dock uses for groups), by double-clicking them,
+  or with the Left/Right keys. Collapsed folders hide their scenes in
+  both list and grid mode.
+* Scenes are moved into and out of folders by drag and drop (drop onto
+  a folder, between its scenes, or below/above it) or with the new
+  "Move to Folder" context menu, which can also create a folder.
+* Move Up/Down/Top/Bottom move scenes within their folder, and move
+  folders together with their scenes.
+* A scene that becomes current while its folder is collapsed (hotkey,
+  studio mode, API) reveals it by expanding the folder.
+* "Show Folder Scenes in Multiview" toggles all scenes of a folder.
+* All folder edits and scene reordering by drag and drop can be undone.
+  Undoing the removal of a scene restores it into its folder.
+* Folder rows expose their state through accessibility descriptions.
+
+The layout is saved with the model added in the previous commit, so
+collections stay loadable by older versions of OBS and keep their folders
+when they are saved by an older version.
+---
+ frontend/OBSStudioAPI.cpp                     |   6 +
+ frontend/cmake/ui-widgets.cmake               |   1 +
+ frontend/components/SceneTree.cpp             | 913 +++++++++++++++++-
+ frontend/components/SceneTree.hpp             |  72 ++
+ frontend/data/locale/en-US.ini                |  23 +
+ frontend/dialogs/OBSBasicTransform.cpp        |   6 +
+ frontend/utility/SceneRenameDelegate.cpp      |  62 ++
+ frontend/utility/SceneRenameDelegate.hpp      |   4 +
+ frontend/widgets/OBSBasic.cpp                 |   2 +
+ frontend/widgets/OBSBasic.hpp                 |  19 +
+ .../widgets/OBSBasic_SceneCollections.cpp     |  18 +
+ frontend/widgets/OBSBasic_SceneFolders.cpp    | 442 +++++++++
+ frontend/widgets/OBSBasic_SceneItems.cpp      |   6 +-
+ frontend/widgets/OBSBasic_Scenes.cpp          | 100 +-
+ 14 files changed, 1612 insertions(+), 62 deletions(-)
+ create mode 100644 frontend/widgets/OBSBasic_SceneFolders.cpp
+
+diff --git a/frontend/OBSStudioAPI.cpp b/frontend/OBSStudioAPI.cpp
+index 5f5a1e7..ee4b327 100644
+--- a/frontend/OBSStudioAPI.cpp
++++ b/frontend/OBSStudioAPI.cpp
+@@ -45,6 +45,12 @@ void OBSStudioAPI::obs_frontend_get_scenes(struct obs_frontend_source_list *sour
+ {
+ 	for (int i = 0; i < main->ui->scenes->count(); i++) {
+ 		QListWidgetItem *item = main->ui->scenes->item(i);
++
++		/* Scene folders are not scenes and are never enumerated */
++		if (SceneTree::IsFolder(item)) {
++			continue;
++		}
++
+ 		OBSScene scene = GetOBSRef<OBSScene>(item);
+ 		obs_source_t *source = obs_scene_get_source(scene);
+ 
+diff --git a/frontend/cmake/ui-widgets.cmake b/frontend/cmake/ui-widgets.cmake
+index dd60fbe..926f622 100644
+--- a/frontend/cmake/ui-widgets.cmake
++++ b/frontend/cmake/ui-widgets.cmake
+@@ -32,6 +32,7 @@ target_sources(
+     widgets/OBSBasic_Recording.cpp
+     widgets/OBSBasic_ReplayBuffer.cpp
+     widgets/OBSBasic_SceneCollections.cpp
++    widgets/OBSBasic_SceneFolders.cpp
+     widgets/OBSBasic_SceneItems.cpp
+     widgets/OBSBasic_Scenes.cpp
+     widgets/OBSBasic_Screenshots.cpp
+diff --git a/frontend/components/SceneTree.cpp b/frontend/components/SceneTree.cpp
+index b0b17df..31bca67 100644
+--- a/frontend/components/SceneTree.cpp
++++ b/frontend/components/SceneTree.cpp
+@@ -1,8 +1,18 @@
+ #include "SceneTree.hpp"
+ 
++#include <OBSApp.hpp>
++
++#include <Idian/Utils.hpp>
++
++#include <QCheckBox>
++#include <QPainter>
+ #include <QScrollBar>
++#include <QSignalBlocker>
++#include <QStyleOptionButton>
+ #include <QTimer>
+ 
++#include <algorithm>
++
+ #include "moc_SceneTree.cpp"
+ 
+ SceneTree::SceneTree(QWidget *parent_) : QListWidget(parent_)
+@@ -10,6 +20,13 @@ SceneTree::SceneTree(QWidget *parent_) : QListWidget(parent_)
+ 	installEventFilter(this);
+ 	setDragDropMode(InternalMove);
+ 	setMovement(QListView::Snap);
++
++	/* Never shown, only used to draw the theme's expand/collapse indicator
++	 * (the same one the Sources dock uses for groups) for folder rows. */
++	folderIndicator = new QCheckBox(this);
++	folderIndicator->setVisible(false);
++	idian::Utils::addClass(folderIndicator, "checkbox-icon");
++	idian::Utils::addClass(folderIndicator, "indicator-expand");
+ }
+ 
+ void SceneTree::SetGridMode(bool grid)
+@@ -57,6 +74,650 @@ int SceneTree::GetGridItemHeight()
+ 	return itemHeight;
+ }
+ 
++bool SceneTree::IsFolder(const QListWidgetItem *item)
++{
++	return item && item->data(FolderRole).toBool();
++}
++
++bool SceneTree::IsFolder(const QModelIndex &index)
++{
++	return index.isValid() && index.data(FolderRole).toBool();
++}
++
++bool SceneTree::IsInFolder(const QListWidgetItem *item)
++{
++	return item && !IsFolder(item) && item->data(InFolderRole).toBool();
++}
++
++QString SceneTree::GetFolderName(const QListWidgetItem *folder)
++{
++	/* The name is kept separately from the display text, which already
++	 * contains the new name while the folder is being renamed */
++	return IsFolder(folder) ? folder->data(FolderNameRole).toString() : QString();
++}
++
++bool SceneTree::HasFolders() const
++{
++	for (int i = 0; i < count(); i++) {
++		if (IsFolder(item(i))) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
++int SceneTree::GetSceneCount() const
++{
++	int sceneCount = 0;
++
++	for (int i = 0; i < count(); i++) {
++		if (!IsFolder(item(i))) {
++			sceneCount++;
++		}
++	}
++
++	return sceneCount;
++}
++
++QList<QListWidgetItem *> SceneTree::GetFolders() const
++{
++	QList<QListWidgetItem *> folders;
++
++	for (int i = 0; i < count(); i++) {
++		if (IsFolder(item(i))) {
++			folders.append(item(i));
++		}
++	}
++
++	return folders;
++}
++
++QListWidgetItem *SceneTree::FindFolder(const QString &name) const
++{
++	for (int i = 0; i < count(); i++) {
++		QListWidgetItem *folder = item(i);
++
++		if (IsFolder(folder) && GetFolderName(folder) == name) {
++			return folder;
++		}
++	}
++
++	return nullptr;
++}
++
++QListWidgetItem *SceneTree::GetFolderOf(const QListWidgetItem *sceneItem) const
++{
++	if (!IsInFolder(sceneItem)) {
++		return nullptr;
++	}
++
++	for (int i = row(sceneItem) - 1; i >= 0; i--) {
++		QListWidgetItem *previous = item(i);
++
++		if (IsFolder(previous)) {
++			return previous;
++		} else if (!IsInFolder(previous)) {
++			break;
++		}
++	}
++
++	return nullptr;
++}
++
++QList<QListWidgetItem *> SceneTree::GetFolderScenes(const QListWidgetItem *folder) const
++{
++	QList<QListWidgetItem *> scenes;
++
++	if (!IsFolder(folder)) {
++		return scenes;
++	}
++
++	const int end = GetEntryEnd(row(folder));
++
++	for (int i = row(folder) + 1; i < end; i++) {
++		scenes.append(item(i));
++	}
++
++	return scenes;
++}
++
++QListWidgetItem *SceneTree::AddFolder(const QString &name, int row, bool collapsed)
++{
++	QListWidgetItem *folder = new QListWidgetItem(name);
++	folder->setData(FolderRole, true);
++	folder->setData(FolderNameRole, name);
++	folder->setData(FolderCollapsedRole, collapsed);
++	folder->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled);
++
++	QFont font = folder->font();
++	font.setBold(true);
++	folder->setFont(font);
++
++	if (row < 0 || row > count()) {
++		row = count();
++	}
++
++	/* Folders cannot be nested */
++	if (row < count() && IsInFolder(item(row))) {
++		row = GetEntryEnd(GetEntryStart(row));
++	}
++
++	insertItem(row, folder);
++	UpdateFolders();
++
++	return folder;
++}
++
++void SceneTree::RemoveFolder(QListWidgetItem *folder)
++{
++	if (!IsFolder(folder)) {
++		return;
++	}
++
++	/* Scenes of the folder become top-level scenes at the same position */
++	for (QListWidgetItem *scene : GetFolderScenes(folder)) {
++		scene->setData(InFolderRole, false);
++	}
++
++	{
++		QSignalBlocker blocker(this);
++		delete folder;
++	}
++
++	UpdateFolders();
++}
++
++void SceneTree::RenameFolder(QListWidgetItem *folder, const QString &name)
++{
++	if (!IsFolder(folder)) {
++		return;
++	}
++
++	folder->setData(FolderNameRole, name);
++	folder->setText(name);
++	UpdateFolders();
++}
++
++int SceneTree::GetNewFolderRow() const
++{
++	QListWidgetItem *current = currentItem();
++
++	if (!current) {
++		return count();
++	}
++
++	return GetEntryEnd(GetEntryStart(row(current)));
++}
++
++bool SceneTree::IsFolderCollapsed(const QListWidgetItem *folder) const
++{
++	return IsFolder(folder) && folder->data(FolderCollapsedRole).toBool();
++}
++
++void SceneTree::SetFolderCollapsed(QListWidgetItem *folder, bool collapsed)
++{
++	if (!IsFolder(folder) || IsFolderCollapsed(folder) == collapsed) {
++		return;
++	}
++
++	if (collapsed) {
++		/* Do not hide the current item, select its folder instead */
++		QListWidgetItem *current = currentItem();
++
++		if (current && GetFolderOf(current) == folder) {
++			QSignalBlocker blocker(this);
++			setCurrentItem(folder);
++		}
++	}
++
++	folder->setData(FolderCollapsedRole, collapsed);
++	UpdateFolders();
++
++	emit folderStateChanged();
++}
++
++void SceneTree::SetAllFoldersCollapsed(bool collapsed)
++{
++	for (QListWidgetItem *folder : GetFolders()) {
++		SetFolderCollapsed(folder, collapsed);
++	}
++}
++
++void SceneTree::InsertScene(QListWidgetItem *sceneItem)
++{
++	QListWidgetItem *current = currentItem();
++	int insertRow = currentRow() + 1;
++	bool inFolder = false;
++
++	if (IsFolder(current)) {
++		insertRow = GetEntryEnd(row(current));
++		inFolder = true;
++	} else if (current) {
++		inFolder = IsInFolder(current);
++	}
++
++	sceneItem->setData(InFolderRole, inFolder);
++	insertItem(insertRow, sceneItem);
++
++	if (HasFolders()) {
++		UpdateFolders();
++	}
++}
++
++void SceneTree::MoveSceneToFolder(QListWidgetItem *sceneItem, QListWidgetItem *folder)
++{
++	if (!sceneItem || IsFolder(sceneItem)) {
++		return;
++	}
++
++	QListWidgetItem *currentFolder = GetFolderOf(sceneItem);
++
++	if (currentFolder == folder) {
++		return;
++	}
++
++	if (folder) {
++		MoveEntryTo(sceneItem, GetEntryEnd(row(folder)), true);
++
++		if (currentItem() == sceneItem) {
++			SetFolderCollapsed(folder, false);
++		}
++	} else {
++		MoveEntryTo(sceneItem, GetEntryEnd(row(currentFolder)), false);
++	}
++
++	emit scenesReordered();
++}
++
++bool SceneTree::MoveEntry(QListWidgetItem *entry, int offset)
++{
++	if (!entry || offset == 0) {
++		return false;
++	}
++
++	const int entryRow = row(entry);
++	bool moved = false;
++
++	if (IsInFolder(entry)) {
++		/* Scenes inside a folder move within that folder */
++		QListWidgetItem *folder = GetFolderOf(entry);
++		const int firstRow = row(folder) + 1;
++		const int endRow = GetEntryEnd(row(folder));
++		const int targetRow = entryRow + (offset > 0 ? 1 : -1);
++
++		if (targetRow >= firstRow && targetRow < endRow) {
++			moved = MoveRows(entryRow, 1, offset > 0 ? targetRow + 1 : targetRow);
++		}
++	} else {
++		/* Top-level scenes and folders move past whole top-level entries */
++		const int endRow = GetEntryEnd(entryRow);
++
++		if (offset < 0 && entryRow > 0) {
++			moved = MoveRows(entryRow, endRow - entryRow, GetEntryStart(entryRow - 1));
++		} else if (offset > 0 && endRow < count()) {
++			moved = MoveRows(entryRow, endRow - entryRow, GetEntryEnd(endRow));
++		}
++	}
++
++	if (moved) {
++		UpdateFolders();
++		emit scenesReordered();
++	}
++
++	return moved;
++}
++
++bool SceneTree::MoveEntryToEdge(QListWidgetItem *entry, bool toTop)
++{
++	if (!entry) {
++		return false;
++	}
++
++	const int entryRow = row(entry);
++	bool moved = false;
++
++	if (IsInFolder(entry)) {
++		QListWidgetItem *folder = GetFolderOf(entry);
++		const int firstRow = row(folder) + 1;
++		const int endRow = GetEntryEnd(row(folder));
++
++		moved = MoveRows(entryRow, 1, toTop ? firstRow : endRow);
++	} else {
++		const int endRow = GetEntryEnd(entryRow);
++
++		moved = MoveRows(entryRow, endRow - entryRow, toTop ? 0 : count());
++	}
++
++	if (moved) {
++		UpdateFolders();
++		emit scenesReordered();
++	}
++
++	return moved;
++}
++
++OBS::SceneTreeLayout SceneTree::GetLayout() const
++{
++	OBS::SceneTreeLayout layout;
++	bool isInsideFolder = false;
++
++	for (int i = 0; i < count(); i++) {
++		QListWidgetItem *entryItem = item(i);
++		std::string name = entryItem->text().toStdString();
++
++		if (IsFolder(entryItem)) {
++			OBS::SceneTreeEntry entry;
++			entry.type = OBS::SceneTreeEntry::Type::Folder;
++			entry.name = GetFolderName(entryItem).toStdString();
++			entry.isCollapsed = IsFolderCollapsed(entryItem);
++			layout.push_back(std::move(entry));
++			isInsideFolder = true;
++		} else if (isInsideFolder && IsInFolder(entryItem)) {
++			layout.back().scenes.push_back(name);
++		} else {
++			OBS::SceneTreeEntry entry;
++			entry.type = OBS::SceneTreeEntry::Type::Scene;
++			entry.name = name;
++			layout.push_back(std::move(entry));
++			isInsideFolder = false;
++		}
++	}
++
++	return layout;
++}
++
++void SceneTree::ApplyLayout(const OBS::SceneTreeLayout &layout)
++{
++	QSignalBlocker blocker(this);
++	isApplyingLayout = true;
++
++	QListWidgetItem *current = currentItem();
++	QString currentFolderName;
++
++	if (IsFolder(current)) {
++		currentFolderName = GetFolderName(current);
++		current = nullptr;
++	}
++
++	std::vector<QListWidgetItem *> sceneItems;
++	sceneItems.reserve(count());
++
++	while (count() > 0) {
++		QListWidgetItem *entryItem = takeItem(0);
++
++		if (IsFolder(entryItem)) {
++			delete entryItem;
++		} else {
++			sceneItems.push_back(entryItem);
++		}
++	}
++
++	auto takeScene = [&sceneItems](const std::string &name) -> QListWidgetItem * {
++		for (auto it = sceneItems.begin(); it != sceneItems.end(); ++it) {
++			if ((*it)->text().toStdString() == name) {
++				QListWidgetItem *sceneItem = *it;
++				sceneItems.erase(it);
++				return sceneItem;
++			}
++		}
++
++		return nullptr;
++	};
++
++	auto addScene = [this](QListWidgetItem *sceneItem, bool inFolder) {
++		sceneItem->setData(InFolderRole, inFolder);
++		addItem(sceneItem);
++	};
++
++	for (const OBS::SceneTreeEntry &entry : layout) {
++		if (entry.type == OBS::SceneTreeEntry::Type::Scene) {
++			if (QListWidgetItem *sceneItem = takeScene(entry.name)) {
++				addScene(sceneItem, false);
++			}
++		} else if (entry.type == OBS::SceneTreeEntry::Type::Folder) {
++			QString name = QString::fromStdString(entry.name);
++
++			if (name.isEmpty() || FindFolder(name)) {
++				continue;
++			}
++
++			QListWidgetItem *folder = AddFolder(name, count(), entry.isCollapsed);
++
++			if (!currentFolderName.isEmpty() && name == currentFolderName) {
++				current = folder;
++			}
++
++			for (const std::string &sceneName : entry.scenes) {
++				if (QListWidgetItem *sceneItem = takeScene(sceneName)) {
++					addScene(sceneItem, true);
++				}
++			}
++		}
++	}
++
++	/* Scenes missing from the layout stay in the list as top-level scenes */
++	for (QListWidgetItem *sceneItem : sceneItems) {
++		addScene(sceneItem, false);
++	}
++
++	if (current) {
++		setCurrentItem(current);
++	}
++
++	isApplyingLayout = false;
++	UpdateFolders();
++}
++
++void SceneTree::UpdateFolders()
++{
++	QListWidgetItem *folder = nullptr;
++
++	for (int i = 0; i < count(); i++) {
++		QListWidgetItem *entryItem = item(i);
++
++		if (IsFolder(entryItem)) {
++			folder = entryItem;
++			continue;
++		}
++
++		const bool inFolder = folder && entryItem->data(InFolderRole).toBool();
++		if (!inFolder) {
++			folder = nullptr;
++		}
++
++		if (entryItem->data(InFolderRole).toBool() != inFolder) {
++			entryItem->setData(InFolderRole, inFolder);
++		}
++
++		const bool hidden = inFolder && IsFolderCollapsed(folder);
++		if (entryItem->isHidden() != hidden) {
++			entryItem->setHidden(hidden);
++		}
++
++		QString description =
++			inFolder ? QTStr("Basic.Main.SceneFolder.Accessible.Scene").arg(GetFolderName(folder))
++				 : QString();
++		if (entryItem->data(Qt::AccessibleDescriptionRole).toString() != description) {
++			entryItem->setData(Qt::AccessibleDescriptionRole, description);
++		}
++	}
++
++	for (QListWidgetItem *folderItem : GetFolders()) {
++		const char *lookup = IsFolderCollapsed(folderItem) ? "Basic.Main.SceneFolder.Accessible.Collapsed"
++								   : "Basic.Main.SceneFolder.Accessible.Expanded";
++		QString description = QTStr(lookup).arg(GetFolderScenes(folderItem).count());
++
++		if (folderItem->data(Qt::AccessibleDescriptionRole).toString() != description) {
++			folderItem->setData(Qt::AccessibleDescriptionRole, description);
++		}
++	}
++
++	if (gridMode) {
++		QResizeEvent event(size(), size());
++		SceneTree::resizeEvent(&event);
++	}
++
++	viewport()->update();
++}
++
++int SceneTree::GetIndentation() const
++{
++	int indicatorWidth = 10;
++
++	if (folderIndicator) {
++		folderIndicator->ensurePolished();
++		indicatorWidth =
++			folderIndicator->style()->pixelMetric(QStyle::PM_IndicatorWidth, nullptr, folderIndicator);
++	}
++
++	return std::max(16, indicatorWidth + 8);
++}
++
++QRect SceneTree::GetFolderIndicatorRect(const QRect &itemRect) const
++{
++	return QRect(itemRect.left(), itemRect.top(), GetIndentation(), itemRect.height());
++}
++
++void SceneTree::PaintFolderIndicator(QPainter *painter, const QRect &rect, bool collapsed) const
++{
++	if (!folderIndicator) {
++		return;
++	}
++
++	folderIndicator->ensurePolished();
++
++	QStyle *indicatorStyle = folderIndicator->style();
++
++	QStyleOptionButton option;
++	option.initFrom(folderIndicator);
++	option.state &= ~(QStyle::State_On | QStyle::State_Off);
++	option.state |= QStyle::State_Enabled | (collapsed ? QStyle::State_On : QStyle::State_Off);
++
++	const int width = indicatorStyle->pixelMetric(QStyle::PM_IndicatorWidth, &option, folderIndicator);
++	const int height = indicatorStyle->pixelMetric(QStyle::PM_IndicatorHeight, &option, folderIndicator);
++	option.rect = QRect(0, 0, width, height);
++	option.rect.moveCenter(rect.center());
++
++	indicatorStyle->drawPrimitive(QStyle::PE_IndicatorCheckBox, &option, painter, folderIndicator);
++}
++
++int SceneTree::GetEntryEnd(int entryRow) const
++{
++	if (!IsFolder(item(entryRow))) {
++		return entryRow + 1;
++	}
++
++	int endRow = entryRow + 1;
++
++	while (endRow < count() && IsInFolder(item(endRow))) {
++		endRow++;
++	}
++
++	return endRow;
++}
++
++int SceneTree::GetEntryStart(int entryRow) const
++{
++	QListWidgetItem *entryItem = item(entryRow);
++
++	if (!IsInFolder(entryItem)) {
++		return entryRow;
++	}
++
++	QListWidgetItem *folder = GetFolderOf(entryItem);
++	return folder ? row(folder) : entryRow;
++}
++
++bool SceneTree::MoveRows(int first, int rowCount, int destination)
++{
++	if (rowCount <= 0 || first < 0 || first + rowCount > count() || destination < 0 || destination > count()) {
++		return false;
++	}
++
++	if (destination >= first && destination <= first + rowCount) {
++		return false;
++	}
++
++	QListWidgetItem *current = currentItem();
++	QSignalBlocker blocker(this);
++
++	QList<QListWidgetItem *> moving;
++	for (int i = 0; i < rowCount; i++) {
++		moving.append(takeItem(first));
++	}
++
++	if (destination > first) {
++		destination -= rowCount;
++	}
++
++	for (int i = 0; i < moving.count(); i++) {
++		insertItem(destination + i, moving[i]);
++	}
++
++	if (current) {
++		setCurrentItem(current);
++	}
++
++	return true;
++}
++
++void SceneTree::MoveEntryTo(QListWidgetItem *entry, int destination, bool destinationInFolder)
++{
++	const int first = row(entry);
++	const int end = GetEntryEnd(first);
++
++	if (IsFolder(entry)) {
++		/* Folders cannot be nested, keep them at the top level */
++		destinationInFolder = false;
++
++		if (destination < count() && IsInFolder(item(destination))) {
++			destination = GetEntryEnd(GetEntryStart(destination));
++		}
++	}
++
++	MoveRows(first, end - first, destination);
++
++	if (!IsFolder(entry)) {
++		entry->setData(InFolderRole, destinationInFolder);
++	}
++
++	UpdateFolders();
++}
++
++QList<QListWidgetItem *> SceneTree::GetVisibleItems(const QListWidgetItem *exclude) const
++{
++	QList<QListWidgetItem *> visibleItems;
++	const QListWidgetItem *excludedFolder = IsFolder(exclude) ? exclude : nullptr;
++
++	for (int i = 0; i < count(); i++) {
++		QListWidgetItem *entryItem = item(i);
++
++		if (entryItem->isHidden() || entryItem == exclude) {
++			continue;
++		}
++
++		if (excludedFolder && GetFolderOf(entryItem) == excludedFolder) {
++			continue;
++		}
++
++		visibleItems.append(entryItem);
++	}
++
++	return visibleItems;
++}
++
++QListWidgetItem *SceneTree::GetLastVisibleItem() const
++{
++	for (int i = count() - 1; i >= 0; i--) {
++		if (!item(i)->isHidden()) {
++			return item(i);
++		}
++	}
++
++	return nullptr;
++}
++
+ bool SceneTree::eventFilter(QObject *obj, QEvent *event)
+ {
+ 	return QObject::eventFilter(obj, event);
+@@ -66,7 +727,7 @@ void SceneTree::resizeEvent(QResizeEvent *event)
+ {
+ 	if (gridMode) {
+ 		int scrollWid = verticalScrollBar()->sizeHint().width();
+-		const QRect lastItem = visualItemRect(item(count() - 1));
++		const QRect lastItem = visualItemRect(GetLastVisibleItem());
+ 		const int h = lastItem.y() + lastItem.height();
+ 
+ 		if (h < height()) {
+@@ -100,42 +761,120 @@ void SceneTree::startDrag(Qt::DropActions supportedActions)
+ 	QListWidget::startDrag(supportedActions);
+ }
+ 
+-void SceneTree::dropEvent(QDropEvent *event)
++void SceneTree::ListDrop(QDropEvent *event, QListWidgetItem *dragged)
+ {
+-	if (event->source() != this) {
+-		QListWidget::dropEvent(event);
++	QListWidgetItem *target = itemAt(event->position().toPoint());
++	DropIndicatorPosition indicator = target ? dropIndicatorPosition() : QAbstractItemView::OnViewport;
++
++	if (target == dragged) {
+ 		return;
+ 	}
+ 
+-	if (gridMode) {
+-		int scrollWid = verticalScrollBar()->sizeHint().width();
+-		const QRect firstItem = visualItemRect(item(0));
+-		const QRect lastItem = visualItemRect(item(count() - 1));
+-		const int h = lastItem.y() + lastItem.height();
+-		const int firstItemY = abs(firstItem.y());
++	int destination = count();
++	bool destinationInFolder = false;
++	QListWidgetItem *folderToExpand = nullptr;
+ 
+-		if (h < height()) {
+-			setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+-			scrollWid = 0;
++	if (!target || indicator == QAbstractItemView::OnViewport) {
++		destination = count();
++	} else if (IsFolder(target)) {
++		const int targetRow = row(target);
++
++		if (indicator == QAbstractItemView::AboveItem) {
++			destination = targetRow;
++		} else if (indicator == QAbstractItemView::OnItem || IsFolder(dragged)) {
++			destination = GetEntryEnd(targetRow);
++			destinationInFolder = true;
++			folderToExpand = target;
++		} else if (IsFolderCollapsed(target)) {
++			destination = GetEntryEnd(targetRow);
+ 		} else {
+-			setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
++			destination = targetRow + 1;
++			destinationInFolder = true;
+ 		}
++	} else {
++		destination = row(target) + (indicator == QAbstractItemView::AboveItem ? 0 : 1);
++		destinationInFolder = IsInFolder(target);
++	}
+ 
+-		float wid = contentsRect().width() - scrollWid - 1;
++	MoveEntryTo(dragged, destination, destinationInFolder);
+ 
+-		QPoint point = event->position().toPoint();
++	if (folderToExpand && !IsFolder(dragged)) {
++		SetFolderCollapsed(folderToExpand, false);
++	}
++}
+ 
+-		int x = (float)point.x() / wid * std::ceil(wid / maxWidth);
+-		int y = (point.y() + firstItemY) / itemHeight;
++void SceneTree::GridDrop(QDropEvent *event, QListWidgetItem *dragged)
++{
++	QList<QListWidgetItem *> visibleItems = GetVisibleItems();
++	if (visibleItems.isEmpty()) {
++		return;
++	}
++
++	int scrollWid = verticalScrollBar()->sizeHint().width();
++	const QRect firstItem = visualItemRect(visibleItems.first());
++	const QRect lastItem = visualItemRect(visibleItems.last());
++	const int h = lastItem.y() + lastItem.height();
++	const int firstItemY = abs(firstItem.y());
++
++	if (h < height()) {
++		setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
++		scrollWid = 0;
++	} else {
++		setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
++	}
++
++	float wid = contentsRect().width() - scrollWid - 1;
++	int columns = std::max(1, (int)std::ceil(wid / maxWidth));
++
++	QPoint point = event->position().toPoint();
++
++	int x = (float)point.x() / wid * columns;
++	int y = (point.y() + firstItemY) / itemHeight;
++
++	/* Position among the visible items, without the dragged entry */
++	QList<QListWidgetItem *> otherItems = GetVisibleItems(dragged);
++	int slot = std::clamp(x + y * columns, 0, (int)otherItems.count());
++
++	int destination = slot < otherItems.count() ? row(otherItems[slot]) : count();
++	bool destinationInFolder = false;
++
++	if (slot > 0 && !IsFolder(dragged)) {
++		QListWidgetItem *previous = otherItems[slot - 1];
++		destinationInFolder = IsInFolder(previous) || (IsFolder(previous) && !IsFolderCollapsed(previous));
++	}
++
++	MoveEntryTo(dragged, destination, destinationInFolder);
++}
++
++void SceneTree::dropEvent(QDropEvent *event)
++{
++	if (event->source() != this) {
++		QListWidget::dropEvent(event);
++		return;
++	}
++
++	QList<QListWidgetItem *> selection = selectedItems();
++	QListWidgetItem *dragged = selection.isEmpty() ? nullptr : selection.first();
++
++	if (!dragged) {
++		QListWidget::dropEvent(event);
++		return;
++	}
+ 
+-		int r = x + y * std::ceil(wid / maxWidth);
++	const std::string undoLayout = OBS::SerializeSceneTreeLayout(GetLayout());
+ 
+-		QListWidgetItem *item = takeItem(selectedIndexes()[0].row());
+-		insertItem(r, item);
+-		setCurrentItem(item);
+-		resize(size());
++	if (gridMode) {
++		GridDrop(event, dragged);
++	} else {
++		ListDrop(event, dragged);
+ 	}
+ 
++	setCurrentItem(dragged);
++
++	/* The entry has already been moved, prevent Qt from moving it again */
++	event->accept();
++	event->setDropAction(Qt::CopyAction);
++
+ 	QListWidget::dropEvent(event);
+ 
+ 	// We must call resizeEvent to correctly place all grid items.
+@@ -143,14 +882,25 @@ void SceneTree::dropEvent(QDropEvent *event)
+ 	QResizeEvent resEvent(size(), size());
+ 	SceneTree::resizeEvent(&resEvent);
+ 
++	const std::string redoLayout = OBS::SerializeSceneTreeLayout(GetLayout());
++
++	if (undoLayout != redoLayout) {
++		emit sceneTreeEdited(QString::fromStdString(undoLayout), QString::fromStdString(redoLayout));
++	}
++
+ 	QTimer::singleShot(100, [this]() { emit scenesReordered(); });
+ }
+ 
+ void SceneTree::RepositionGrid(QDragMoveEvent *event)
+ {
++	QList<QListWidgetItem *> visibleItems = GetVisibleItems();
++	if (visibleItems.isEmpty()) {
++		return;
++	}
++
+ 	int scrollWid = verticalScrollBar()->sizeHint().width();
+-	const QRect firstItem = visualItemRect(item(0));
+-	const QRect lastItem = visualItemRect(item(count() - 1));
++	const QRect firstItem = visualItemRect(visibleItems.first());
++	const QRect lastItem = visualItemRect(visibleItems.last());
+ 	const int h = lastItem.y() + lastItem.height();
+ 	const int firstItemY = abs(firstItem.y());
+ 
+@@ -162,18 +912,21 @@ void SceneTree::RepositionGrid(QDragMoveEvent *event)
+ 	}
+ 
+ 	float wid = contentsRect().width() - scrollWid - 1;
++	const int columns = std::max(1, (int)std::ceil(wid / maxWidth));
+ 
+ 	if (event) {
+ 		QPoint point = event->position().toPoint();
+ 
+-		int x = (float)point.x() / wid * std::ceil(wid / maxWidth);
++		int x = (float)point.x() / wid * columns;
+ 		int y = (point.y() + firstItemY) / itemHeight;
+ 
+-		int r = x + y * std::ceil(wid / maxWidth);
+-		int orig = selectedIndexes()[0].row();
++		int r = x + y * columns;
+ 
+-		for (int i = 0; i < count(); i++) {
+-			auto *wItem = item(i);
++		QList<QListWidgetItem *> selection = selectedItems();
++		int orig = selection.isEmpty() ? -1 : visibleItems.indexOf(selection.first());
++
++		for (int i = 0; i < visibleItems.count(); i++) {
++			auto *wItem = visibleItems[i];
+ 
+ 			if (wItem->isSelected()) {
+ 				continue;
+@@ -183,16 +936,16 @@ void SceneTree::RepositionGrid(QDragMoveEvent *event)
+ 
+ 			int off = (i >= r ? 1 : 0) - (i > orig && i > r ? 1 : 0) - (i > orig && i == r ? 2 : 0);
+ 
+-			int xPos = (i + off) % (int)std::ceil(wid / maxWidth);
+-			int yPos = (i + off) / (int)std::ceil(wid / maxWidth);
++			int xPos = (i + off) % columns;
++			int yPos = (i + off) / columns;
+ 			QSize g = gridSize();
+ 
+ 			QPoint position(xPos * g.width(), yPos * g.height());
+ 			setPositionForIndex(position, index);
+ 		}
+ 	} else {
+-		for (int i = 0; i < count(); i++) {
+-			auto *wItem = item(i);
++		for (int i = 0; i < visibleItems.count(); i++) {
++			auto *wItem = visibleItems[i];
+ 
+ 			if (wItem->isSelected()) {
+ 				continue;
+@@ -200,8 +953,8 @@ void SceneTree::RepositionGrid(QDragMoveEvent *event)
+ 
+ 			QModelIndex index = indexFromItem(wItem);
+ 
+-			int xPos = i % (int)std::ceil(wid / maxWidth);
+-			int yPos = i / (int)std::ceil(wid / maxWidth);
++			int xPos = i % columns;
++			int yPos = i / columns;
+ 			QSize g = gridSize();
+ 
+ 			QPoint position(xPos * g.width(), yPos * g.height());
+@@ -235,3 +988,91 @@ void SceneTree::rowsInserted(const QModelIndex &parent, int start, int end)
+ 
+ 	QListWidget::rowsInserted(parent, start, end);
+ }
++
++void SceneTree::mousePressEvent(QMouseEvent *event)
++{
++	const QPoint position = event->position().toPoint();
++	QListWidgetItem *folder = itemAt(position);
++
++	if (event->button() == Qt::LeftButton && IsFolder(folder) &&
++	    GetFolderIndicatorRect(visualItemRect(folder)).contains(position)) {
++		isFolderIndicatorPressed = true;
++		SetFolderCollapsed(folder, !IsFolderCollapsed(folder));
++		event->accept();
++		return;
++	}
++
++	QListWidget::mousePressEvent(event);
++}
++
++void SceneTree::mouseReleaseEvent(QMouseEvent *event)
++{
++	/* Clicking the expand/collapse indicator must not change the selection */
++	if (isFolderIndicatorPressed) {
++		isFolderIndicatorPressed = false;
++		event->accept();
++		return;
++	}
++
++	QListWidget::mouseReleaseEvent(event);
++}
++
++void SceneTree::mouseDoubleClickEvent(QMouseEvent *event)
++{
++	QListWidgetItem *folder = itemAt(event->position().toPoint());
++
++	if (event->button() == Qt::LeftButton && IsFolder(folder)) {
++		isFolderIndicatorPressed =
++			GetFolderIndicatorRect(visualItemRect(folder)).contains(event->position().toPoint());
++		SetFolderCollapsed(folder, !IsFolderCollapsed(folder));
++		event->accept();
++		return;
++	}
++
++	QListWidget::mouseDoubleClickEvent(event);
++}
++
++void SceneTree::keyPressEvent(QKeyEvent *event)
++{
++	QListWidgetItem *current = currentItem();
++
++	if (!gridMode && current && event->modifiers() == Qt::NoModifier) {
++		if (event->key() == Qt::Key_Left) {
++			if (IsFolder(current) && !IsFolderCollapsed(current)) {
++				SetFolderCollapsed(current, true);
++				return;
++			} else if (IsInFolder(current)) {
++				setCurrentItem(GetFolderOf(current));
++				return;
++			}
++		} else if (event->key() == Qt::Key_Right && IsFolder(current)) {
++			if (IsFolderCollapsed(current)) {
++				SetFolderCollapsed(current, false);
++			} else if (!GetFolderScenes(current).isEmpty()) {
++				setCurrentItem(GetFolderScenes(current).first());
++			}
++			return;
++		}
++	}
++
++	QListWidget::keyPressEvent(event);
++}
++
++void SceneTree::currentChanged(const QModelIndex &current, const QModelIndex &previous)
++{
++	/* Reveal scenes that become current while their folder is collapsed,
++	 * e.g. when switching scenes with a hotkey */
++	QListWidgetItem *currentEntry = itemFromIndex(current);
++
++	if (!isApplyingLayout && IsInFolder(currentEntry)) {
++		QListWidgetItem *folder = GetFolderOf(currentEntry);
++
++		if (IsFolderCollapsed(folder)) {
++			folder->setData(FolderCollapsedRole, false);
++			UpdateFolders();
++			emit folderStateChanged();
++		}
++	}
++
++	QListWidget::currentChanged(current, previous);
++}
+diff --git a/frontend/components/SceneTree.hpp b/frontend/components/SceneTree.hpp
+index 608906d..ad86fef 100644
+--- a/frontend/components/SceneTree.hpp
++++ b/frontend/components/SceneTree.hpp
+@@ -1,10 +1,22 @@
+ #pragma once
+ 
++#include <models/SceneTreeLayout.hpp>
++
+ #include <QListWidget>
+ #include <QObject>
++#include <QPointer>
+ #include <QResizeEvent>
+ #include <QWidget>
+ 
++class QCheckBox;
++
++/* The Scenes dock list.
++ *
++ * Besides scenes, the list can contain folder header rows. A folder owns the
++ * scene rows that directly follow it and are flagged with InFolderRole, so the
++ * list order always is the visual tree order and code that walks the rows
++ * keeps working. Folders are purely organizational: they are not sources and
++ * are never returned by scene enumeration functions. */
+ class SceneTree : public QListWidget {
+ 	Q_OBJECT
+ 	Q_PROPERTY(int gridItemWidth READ GetGridItemWidth WRITE SetGridItemWidth DESIGNABLE true)
+@@ -14,7 +26,16 @@ class SceneTree : public QListWidget {
+ 	int maxWidth = 150;
+ 	int itemHeight = 24;
+ 
++	bool isApplyingLayout = false;
++	bool isFolderIndicatorPressed = false;
++	QPointer<QCheckBox> folderIndicator;
++
+ public:
++	static constexpr int FolderRole = Qt::UserRole + 256;
++	static constexpr int InFolderRole = Qt::UserRole + 257;
++	static constexpr int FolderCollapsedRole = Qt::UserRole + 258;
++	static constexpr int FolderNameRole = Qt::UserRole + 259;
++
+ 	void SetGridMode(bool grid);
+ 	bool GetGridMode();
+ 
+@@ -25,7 +46,51 @@ public:
+ 
+ 	explicit SceneTree(QWidget *parent = nullptr);
+ 
++	static bool IsFolder(const QListWidgetItem *item);
++	static bool IsFolder(const QModelIndex &index);
++	static bool IsInFolder(const QListWidgetItem *item);
++	static QString GetFolderName(const QListWidgetItem *folder);
++
++	bool HasFolders() const;
++	int GetSceneCount() const;
++	QList<QListWidgetItem *> GetFolders() const;
++	QListWidgetItem *FindFolder(const QString &name) const;
++	QListWidgetItem *GetFolderOf(const QListWidgetItem *item) const;
++	QList<QListWidgetItem *> GetFolderScenes(const QListWidgetItem *folder) const;
++
++	QListWidgetItem *AddFolder(const QString &name, int row = -1, bool collapsed = false);
++	void RemoveFolder(QListWidgetItem *folder);
++	void RenameFolder(QListWidgetItem *folder, const QString &name);
++	int GetNewFolderRow() const;
++
++	bool IsFolderCollapsed(const QListWidgetItem *folder) const;
++	void SetFolderCollapsed(QListWidgetItem *folder, bool collapsed);
++	void SetAllFoldersCollapsed(bool collapsed);
++
++	void InsertScene(QListWidgetItem *item);
++	void MoveSceneToFolder(QListWidgetItem *scene, QListWidgetItem *folder);
++	bool MoveEntry(QListWidgetItem *item, int offset);
++	bool MoveEntryToEdge(QListWidgetItem *item, bool toTop);
++
++	OBS::SceneTreeLayout GetLayout() const;
++	void ApplyLayout(const OBS::SceneTreeLayout &layout);
++	void UpdateFolders();
++
++	int GetIndentation() const;
++	QRect GetFolderIndicatorRect(const QRect &itemRect) const;
++	void PaintFolderIndicator(QPainter *painter, const QRect &rect, bool collapsed) const;
++
+ private:
++	int GetEntryEnd(int row) const;
++	int GetEntryStart(int row) const;
++	bool MoveRows(int first, int rowCount, int destination);
++	void MoveEntryTo(QListWidgetItem *item, int destination, bool destinationInFolder);
++	QList<QListWidgetItem *> GetVisibleItems(const QListWidgetItem *exclude = nullptr) const;
++	QListWidgetItem *GetLastVisibleItem() const;
++
++	void ListDrop(QDropEvent *event, QListWidgetItem *dragged);
++	void GridDrop(QDropEvent *event, QListWidgetItem *dragged);
++
+ 	void RepositionGrid(QDragMoveEvent *event = nullptr);
+ 
+ protected:
+@@ -36,7 +101,14 @@ protected:
+ 	virtual void dragMoveEvent(QDragMoveEvent *event) override;
+ 	virtual void dragLeaveEvent(QDragLeaveEvent *event) override;
+ 	virtual void rowsInserted(const QModelIndex &parent, int start, int end) override;
++	virtual void mousePressEvent(QMouseEvent *event) override;
++	virtual void mouseReleaseEvent(QMouseEvent *event) override;
++	virtual void mouseDoubleClickEvent(QMouseEvent *event) override;
++	virtual void keyPressEvent(QKeyEvent *event) override;
++	virtual void currentChanged(const QModelIndex &current, const QModelIndex &previous) override;
+ 
+ signals:
+ 	void scenesReordered();
++	void sceneTreeEdited(const QString &undoLayout, const QString &redoLayout);
++	void folderStateChanged();
+ };
+diff --git a/frontend/data/locale/en-US.ini b/frontend/data/locale/en-US.ini
+index 3046ec3..8d9b378 100644
+--- a/frontend/data/locale/en-US.ini
++++ b/frontend/data/locale/en-US.ini
+@@ -358,6 +358,9 @@ Undo.ForceMono.On="Enable Force Mono on '%1'"
+ Undo.ForceMono.Off="Disable Force Mono on '%1'"
+ Undo.Properties="Property Change on '%1'"
+ Undo.Scene.Duplicate="Duplicate Scene '%1'"
++Undo.Scenes.Reorder="Reorder Scenes"
++Undo.SceneFolder.Move="Move '%1' to Folder '%2'"
++Undo.SceneFolder.MoveOut="Move '%1' out of Folder '%2'"
+ Undo.ShowTransition="Show Transition on '%1'"
+ Undo.HideTransition="Hide Transition on '%1'"
+ Undo.ShowSceneItem="Show '%1' in '%2'"
+@@ -616,6 +619,26 @@ Basic.Main.AddSceneDlg.Text="Please enter the name of the scene"
+ # add scene suggested name
+ Basic.Main.DefaultSceneName.Text="Scene %1"
+ 
++# scene folders
++Basic.Main.SceneFolder.Add="Add Folder"
++Basic.Main.SceneFolder.AddDlg.Title="Add Folder"
++Basic.Main.SceneFolder.AddDlg.Text="Please enter the name of the folder"
++Basic.Main.SceneFolder.DefaultName="Folder %1"
++Basic.Main.SceneFolder.Remove="Remove Folder"
++Basic.Main.SceneFolder.MoveTo="Move to Folder"
++Basic.Main.SceneFolder.MoveTo.None="No Folder"
++Basic.Main.SceneFolder.MoveTo.New="New Folder..."
++Basic.Main.SceneFolder.Expand="Expand"
++Basic.Main.SceneFolder.Collapse="Collapse"
++Basic.Main.SceneFolder.ExpandAll="Expand All Folders"
++Basic.Main.SceneFolder.CollapseAll="Collapse All Folders"
++Basic.Main.SceneFolder.ShowInMultiview="Show Folder Scenes in Multiview"
++Basic.Main.SceneFolder.ConfirmRemove.Text="Are you sure you wish to remove the folder '%1'?\nThe scenes inside it will not be removed."
++Basic.Main.SceneFolder.NameExists.Text="A folder with this name already exists."
++Basic.Main.SceneFolder.Accessible.Expanded="Folder, expanded, %1 scene(s)"
++Basic.Main.SceneFolder.Accessible.Collapsed="Folder, collapsed, %1 scene(s)"
++Basic.Main.SceneFolder.Accessible.Scene="In folder '%1'"
++
+ # add scene collection dialog
+ Basic.Main.AddSceneCollection.Title="Add Scene Collection"
+ Basic.Main.AddSceneCollection.Text="Please enter the name of the scene collection"
+diff --git a/frontend/dialogs/OBSBasicTransform.cpp b/frontend/dialogs/OBSBasicTransform.cpp
+index 49a3686..be6d79a 100644
+--- a/frontend/dialogs/OBSBasicTransform.cpp
++++ b/frontend/dialogs/OBSBasicTransform.cpp
+@@ -469,5 +469,11 @@ void OBSBasicTransform::onSceneChanged(QListWidgetItem *current, QListWidgetItem
+ 	}
+ 
+ 	OBSScene scene = GetOBSRef<OBSScene>(current);
++
++	/* Scene folders have no scene */
++	if (!scene) {
++		return;
++	}
++
+ 	this->setScene(scene);
+ }
+diff --git a/frontend/utility/SceneRenameDelegate.cpp b/frontend/utility/SceneRenameDelegate.cpp
+index 3d3c8d1..5b3eadd 100644
+--- a/frontend/utility/SceneRenameDelegate.cpp
++++ b/frontend/utility/SceneRenameDelegate.cpp
+@@ -19,6 +19,8 @@
+ 
+ #include "SceneRenameDelegate.hpp"
+ 
++#include <components/SceneTree.hpp>
++
+ #include <QKeyEvent>
+ #include <QLineEdit>
+ 
+@@ -26,6 +28,66 @@
+ 
+ SceneRenameDelegate::SceneRenameDelegate(QObject *parent) : QStyledItemDelegate(parent) {}
+ 
++/* Folder rows get an expand/collapse indicator, scenes inside a folder are
++ * indented (in list mode) so that they line up with the folder name. */
++static bool GetContentRect(QObject *parent, const QStyleOptionViewItem &option, const QModelIndex &index,
++			   QRect &indicatorRect, QRect &contentRect)
++{
++	SceneTree *tree = qobject_cast<SceneTree *>(parent);
++
++	if (!tree) {
++		return false;
++	}
++
++	const bool isFolder = SceneTree::IsFolder(index);
++	const bool isInFolder = !isFolder && index.data(SceneTree::InFolderRole).toBool();
++
++	if (!isFolder && (!isInFolder || tree->GetGridMode())) {
++		return false;
++	}
++
++	indicatorRect = tree->GetFolderIndicatorRect(option.rect);
++	contentRect = option.rect;
++	contentRect.setLeft(indicatorRect.right() + 1);
++	return true;
++}
++
++void SceneRenameDelegate::paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const
++{
++	QRect indicatorRect;
++	QRect contentRect;
++
++	if (!GetContentRect(parent(), option, index, indicatorRect, contentRect)) {
++		QStyledItemDelegate::paint(painter, option, index);
++		return;
++	}
++
++	QStyleOptionViewItem contentOption(option);
++	contentOption.rect = contentRect;
++	QStyledItemDelegate::paint(painter, contentOption, index);
++
++	if (SceneTree::IsFolder(index)) {
++		SceneTree *tree = qobject_cast<SceneTree *>(parent());
++		tree->PaintFolderIndicator(painter, indicatorRect, index.data(SceneTree::FolderCollapsedRole).toBool());
++	}
++}
++
++void SceneRenameDelegate::updateEditorGeometry(QWidget *editor, const QStyleOptionViewItem &option,
++					       const QModelIndex &index) const
++{
++	QRect indicatorRect;
++	QRect contentRect;
++
++	if (!GetContentRect(parent(), option, index, indicatorRect, contentRect)) {
++		QStyledItemDelegate::updateEditorGeometry(editor, option, index);
++		return;
++	}
++
++	QStyleOptionViewItem contentOption(option);
++	contentOption.rect = contentRect;
++	QStyledItemDelegate::updateEditorGeometry(editor, contentOption, index);
++}
++
+ void SceneRenameDelegate::setEditorData(QWidget *editor, const QModelIndex &index) const
+ {
+ 	QStyledItemDelegate::setEditorData(editor, index);
+diff --git a/frontend/utility/SceneRenameDelegate.hpp b/frontend/utility/SceneRenameDelegate.hpp
+index d5212f3..cafdb69 100644
+--- a/frontend/utility/SceneRenameDelegate.hpp
++++ b/frontend/utility/SceneRenameDelegate.hpp
+@@ -25,6 +25,10 @@ class SceneRenameDelegate : public QStyledItemDelegate {
+ public:
+ 	SceneRenameDelegate(QObject *parent);
+ 	virtual void setEditorData(QWidget *editor, const QModelIndex &index) const override;
++	virtual void paint(QPainter *painter, const QStyleOptionViewItem &option,
++			   const QModelIndex &index) const override;
++	virtual void updateEditorGeometry(QWidget *editor, const QStyleOptionViewItem &option,
++					  const QModelIndex &index) const override;
+ 
+ protected:
+ 	virtual bool eventFilter(QObject *editor, QEvent *event) override;
+diff --git a/frontend/widgets/OBSBasic.cpp b/frontend/widgets/OBSBasic.cpp
+index 049a8b8..901f516 100644
+--- a/frontend/widgets/OBSBasic.cpp
++++ b/frontend/widgets/OBSBasic.cpp
+@@ -464,6 +464,8 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new
+ 
+ 	connect(ui->scenes, &SceneTree::scenesReordered, ui->scenes,
+ 		[]() { OBSProjector::UpdateMultiviewProjectors(); });
++	connect(ui->scenes, &SceneTree::sceneTreeEdited, this, &OBSBasic::SceneTreeEdited);
++	connect(ui->scenes, &SceneTree::folderStateChanged, this, &OBSBasic::SaveProject);
+ 
+ 	connect(App(), &OBSApp::StyleChanged, this, [this]() { OnEvent(OBS_FRONTEND_EVENT_THEME_CHANGED); });
+ #ifndef __APPLE__
+diff --git a/frontend/widgets/OBSBasic.hpp b/frontend/widgets/OBSBasic.hpp
+index 571de9f..305aace 100644
+--- a/frontend/widgets/OBSBasic.hpp
++++ b/frontend/widgets/OBSBasic.hpp
+@@ -1272,6 +1272,22 @@ private:
+ 	obs_data_array_t *SaveSceneListOrder();
+ 	void ChangeSceneIndex(bool relative, int idx, int invalidIdx);
+ 
++	void LoadSceneFolders(obs_data_t *data);
++	obs_data_array_t *SaveSceneFolders();
++	void UpdateSceneFolderSettings();
++	void ApplySceneTreeLayout(const std::string &layoutJson);
++	void AddSceneTreeUndoAction(const QString &actionName, const std::string &undoLayout,
++				    const std::string &redoLayout);
++	void SceneTreeChanged(bool sceneOrderChanged);
++	void SelectCurrentSceneItem();
++	void AddSceneFolderMenu(QMenu &popup, QListWidgetItem *sceneItem);
++	void AddSceneFolderContextMenu(QMenu &popup, QListWidgetItem *folder);
++	bool QuerySceneFolderName(const QString &title, const QString &text, QString &name, const QString &placeHolder);
++	QString GetNewSceneFolderPlaceHolder() const;
++	void RemoveSceneFolder(QListWidgetItem *folder, bool askForConfirmation);
++	void SceneFolderNameEdited(QListWidgetItem *folder, const QString &name);
++	bool MoveSceneToFolder(obs_source_t *scene, const QString &folderName, bool addUndoAction);
++
+ 	void MoveSceneItem(enum obs_order_movement movement, const QString &action_name);
+ 
+ 	/* OBS Callbacks */
+@@ -1315,6 +1331,9 @@ private slots:
+ 	void SceneNameEdited(QWidget *editor);
+ 	void OpenSceneFilters();
+ 
++	void AddSceneFolder();
++	void SceneTreeEdited(const QString &undoLayout, const QString &redoLayout);
++
+ public:
+ 	static OBSData BackupScene(obs_scene_t *scene, std::vector<obs_source_t *> *sources = nullptr);
+ 	static inline OBSData BackupScene(obs_source_t *scene_source, std::vector<obs_source_t *> *sources = nullptr)
+diff --git a/frontend/widgets/OBSBasic_SceneCollections.cpp b/frontend/widgets/OBSBasic_SceneCollections.cpp
+index 8885dd7..1e3850f 100644
+--- a/frontend/widgets/OBSBasic_SceneCollections.cpp
++++ b/frontend/widgets/OBSBasic_SceneCollections.cpp
+@@ -20,6 +20,7 @@
+ #include <dialogs/OBSMissingFiles.hpp>
+ #include <importer/OBSImporter.hpp>
+ #include <models/SceneCollection.hpp>
++#include <models/SceneTreeLayout.hpp>
+ #include <utility/item-widget-helpers.hpp>
+ 
+ #include <qt-wrappers.hpp>
+@@ -807,6 +808,9 @@ void OBSBasic::Save(SceneCollection &collection)
+ {
+ 	OBSDataAutoRelease saveData = obs_data_create();
+ 
++	// Scene folder membership is stored in scene private settings, update it before saving sources
++	UpdateSceneFolderSettings();
++
+ 	// Scene collection name
+ 	const char *sceneCollection = config_get_string(App()->GetUserConfig(), "Basic", "SceneCollection");
+ 	obs_data_set_string(saveData, "name", sceneCollection);
+@@ -887,6 +891,12 @@ void OBSBasic::Save(SceneCollection &collection)
+ 	OBSDataArrayAutoRelease sceneOrder = SaveSceneListOrder();
+ 	obs_data_set_array(saveData, "scene_order", sceneOrder);
+ 
++	// UI scene folders (ignored by versions of OBS without scene folders)
++	if (ui->scenes->HasFolders()) {
++		OBSDataArrayAutoRelease sceneFolders = SaveSceneFolders();
++		obs_data_set_array(saveData, OBS::sceneFoldersKey, sceneFolders);
++	}
++
+ 	// Current preview/program scenes
+ 	OBSScene scene = GetCurrentScene();
+ 	OBSSource curProgramScene = OBSGetStrongRef(programScene);
+@@ -1112,6 +1122,12 @@ void OBSBasic::LogScenes()
+ 
+ 	for (int i = 0; i < ui->scenes->count(); i++) {
+ 		QListWidgetItem *item = ui->scenes->item(i);
++
++		if (SceneTree::IsFolder(item)) {
++			blog(LOG_INFO, "- folder '%s'", QT_TO_UTF8(SceneTree::GetFolderName(item)));
++			continue;
++		}
++
+ 		OBSScene scene = GetOBSRef<OBSScene>(item);
+ 
+ 		obs_source_t *source = obs_scene_get_source(scene);
+@@ -1357,6 +1373,8 @@ void OBSBasic::LoadData(obs_data_t *data, SceneCollection &collection)
+ 		LoadSceneListOrder(sceneOrder);
+ 	}
+ 
++	LoadSceneFolders(data);
++
+ 	curTransition = FindTransition(transitionName);
+ 	if (!curTransition) {
+ 		curTransition = fadeTransition;
+diff --git a/frontend/widgets/OBSBasic_SceneFolders.cpp b/frontend/widgets/OBSBasic_SceneFolders.cpp
+new file mode 100644
+index 0000000..e942a32
+--- /dev/null
++++ b/frontend/widgets/OBSBasic_SceneFolders.cpp
+@@ -0,0 +1,442 @@
++#include "OBSBasic.hpp"
++#include "OBSProjector.hpp"
++
++#include <components/SceneTree.hpp>
++#include <dialogs/NameDialog.hpp>
++#include <models/SceneTreeLayout.hpp>
++
++#include <qt-wrappers.hpp>
++
++#include <QMessageBox>
++
++using namespace std;
++
++namespace {
++
++QListWidgetItem *FindSceneItem(SceneTree *tree, obs_source_t *source)
++{
++	obs_scene_t *scene = obs_scene_from_source(source);
++
++	if (!scene) {
++		return nullptr;
++	}
++
++	for (int i = 0; i < tree->count(); i++) {
++		QListWidgetItem *item = tree->item(i);
++
++		if (!SceneTree::IsFolder(item) && GetOBSRef<OBSScene>(item) == scene) {
++			return item;
++		}
++	}
++
++	return nullptr;
++}
++
++std::string GetSerializedLayout(SceneTree *tree)
++{
++	return OBS::SerializeSceneTreeLayout(tree->GetLayout());
++}
++
++} // namespace
++
++void OBSBasic::LoadSceneFolders(obs_data_t *data)
++{
++	OBSDataArrayAutoRelease folderArray = obs_data_get_array(data, OBS::sceneFoldersKey);
++	vector<OBS::SceneFolderInfo> folders = OBS::LoadSceneFolders(folderArray);
++
++	vector<string> sceneOrder;
++	OBS::SceneFolderMembership membership;
++
++	for (int i = 0; i < ui->scenes->count(); i++) {
++		QListWidgetItem *item = ui->scenes->item(i);
++
++		if (SceneTree::IsFolder(item)) {
++			continue;
++		}
++
++		OBSScene scene = GetOBSRef<OBSScene>(item);
++		obs_source_t *source = obs_scene_get_source(scene);
++		string name = QT_TO_UTF8(item->text());
++		sceneOrder.push_back(name);
++
++		OBSDataAutoRelease privateSettings = obs_source_get_private_settings(source);
++		const char *folder = obs_data_get_string(privateSettings, OBS::sceneFolderPrivateKey);
++
++		if (folder && *folder) {
++			membership[name] = folder;
++		}
++	}
++
++	/* Collections without folders keep their list exactly as it is */
++	if (folders.empty() && membership.empty()) {
++		return;
++	}
++
++	ui->scenes->ApplyLayout(OBS::BuildSceneTreeLayout(sceneOrder, membership, folders));
++}
++
++obs_data_array_t *OBSBasic::SaveSceneFolders()
++{
++	return OBS::SaveSceneFolders(OBS::GetSceneFolders(ui->scenes->GetLayout()));
++}
++
++void OBSBasic::UpdateSceneFolderSettings()
++{
++	/* Folder membership is mirrored to each scene's private settings so that
++	 * it survives being saved by versions of OBS without scene folders, and
++	 * travels with the scene through undo/redo of scene removal. */
++	QString folderName;
++
++	for (int i = 0; i < ui->scenes->count(); i++) {
++		QListWidgetItem *item = ui->scenes->item(i);
++
++		if (SceneTree::IsFolder(item)) {
++			folderName = SceneTree::GetFolderName(item);
++			continue;
++		}
++
++		OBSScene scene = GetOBSRef<OBSScene>(item);
++		OBSDataAutoRelease privateSettings = obs_source_get_private_settings(obs_scene_get_source(scene));
++
++		if (!privateSettings) {
++			continue;
++		}
++
++		if (SceneTree::IsInFolder(item) && !folderName.isEmpty()) {
++			obs_data_set_string(privateSettings, OBS::sceneFolderPrivateKey, QT_TO_UTF8(folderName));
++		} else if (obs_data_has_user_value(privateSettings, OBS::sceneFolderPrivateKey)) {
++			obs_data_erase(privateSettings, OBS::sceneFolderPrivateKey);
++		}
++	}
++}
++
++void OBSBasic::SceneTreeChanged(bool sceneOrderChanged)
++{
++	UpdateSceneFolderSettings();
++	SaveProject();
++
++	if (sceneOrderChanged) {
++		OBSProjector::UpdateMultiviewProjectors();
++		OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
++	}
++}
++
++void OBSBasic::SelectCurrentSceneItem()
++{
++	QListWidgetItem *item = FindSceneItem(ui->scenes, GetCurrentSceneSource());
++
++	if (item) {
++		QSignalBlocker blocker(ui->scenes);
++		ui->scenes->setCurrentItem(item);
++	}
++}
++
++void OBSBasic::ApplySceneTreeLayout(const std::string &layoutJson)
++{
++	OBS::SceneTreeLayout layout = OBS::DeserializeSceneTreeLayout(layoutJson.c_str());
++
++	/* Expanding or collapsing folders is not an undoable action, so keep
++	 * the current state of folders that still exist */
++	for (OBS::SceneTreeEntry &entry : layout) {
++		QListWidgetItem *folder = entry.type == OBS::SceneTreeEntry::Type::Folder
++						  ? ui->scenes->FindFolder(QString::fromStdString(entry.name))
++						  : nullptr;
++
++		if (folder) {
++			entry.isCollapsed = ui->scenes->IsFolderCollapsed(folder);
++		}
++	}
++
++	ui->scenes->ApplyLayout(layout);
++
++	if (!ui->scenes->currentItem()) {
++		SelectCurrentSceneItem();
++	}
++
++	SceneTreeChanged(true);
++}
++
++void OBSBasic::AddSceneTreeUndoAction(const QString &actionName, const std::string &undoLayout,
++				      const std::string &redoLayout)
++{
++	if (undoLayout == redoLayout) {
++		return;
++	}
++
++	auto applyLayout = [this](const std::string &layout) {
++		ApplySceneTreeLayout(layout);
++	};
++
++	undo_s.add_action(actionName, applyLayout, applyLayout, undoLayout, redoLayout);
++}
++
++void OBSBasic::SceneTreeEdited(const QString &undoLayout, const QString &redoLayout)
++{
++	AddSceneTreeUndoAction(QTStr("Undo.Scenes.Reorder"), undoLayout.toStdString(), redoLayout.toStdString());
++	SceneTreeChanged(true);
++}
++
++bool OBSBasic::QuerySceneFolderName(const QString &title, const QString &text, QString &name,
++				    const QString &placeHolder)
++{
++	for (;;) {
++		string userInput;
++
++		if (!NameDialog::AskForName(this, title, text, userInput, placeHolder)) {
++			return false;
++		}
++
++		name = QT_UTF8(userInput.c_str()).trimmed();
++
++		if (name.isEmpty()) {
++			OBSMessageBox::warning(this, QTStr("NoNameEntered.Title"), QTStr("NoNameEntered.Text"));
++			continue;
++		}
++
++		if (ui->scenes->FindFolder(name)) {
++			OBSMessageBox::warning(this, QTStr("NameExists.Title"),
++					       QTStr("Basic.Main.SceneFolder.NameExists.Text"));
++			continue;
++		}
++
++		return true;
++	}
++}
++
++QString OBSBasic::GetNewSceneFolderPlaceHolder() const
++{
++	QString format = QTStr("Basic.Main.SceneFolder.DefaultName");
++	int i = 1;
++
++	while (ui->scenes->FindFolder(format.arg(i))) {
++		i++;
++	}
++
++	return format.arg(i);
++}
++
++void OBSBasic::AddSceneFolder()
++{
++	QString name;
++
++	if (!QuerySceneFolderName(QTStr("Basic.Main.SceneFolder.AddDlg.Title"),
++				  QTStr("Basic.Main.SceneFolder.AddDlg.Text"), name, GetNewSceneFolderPlaceHolder())) {
++		return;
++	}
++
++	const string undoLayout = GetSerializedLayout(ui->scenes);
++	ui->scenes->AddFolder(name, ui->scenes->GetNewFolderRow());
++	const string redoLayout = GetSerializedLayout(ui->scenes);
++
++	AddSceneTreeUndoAction(QTStr("Undo.Add").arg(name), undoLayout, redoLayout);
++	SceneTreeChanged(false);
++
++	blog(LOG_INFO, "User added scene folder '%s'", QT_TO_UTF8(name));
++}
++
++void OBSBasic::RemoveSceneFolder(QListWidgetItem *folder, bool askForConfirmation)
++{
++	if (!SceneTree::IsFolder(folder)) {
++		return;
++	}
++
++	const QString name = SceneTree::GetFolderName(folder);
++
++	if (askForConfirmation && !ui->scenes->GetFolderScenes(folder).isEmpty()) {
++		QMessageBox::StandardButton button =
++			OBSMessageBox::question(this, QTStr("ConfirmRemove.Title"),
++						QTStr("Basic.Main.SceneFolder.ConfirmRemove.Text").arg(name));
++
++		if (button != QMessageBox::Yes) {
++			return;
++		}
++	}
++
++	const bool wasCurrent = ui->scenes->currentItem() == folder;
++	const string undoLayout = GetSerializedLayout(ui->scenes);
++	ui->scenes->RemoveFolder(folder);
++	const string redoLayout = GetSerializedLayout(ui->scenes);
++
++	if (wasCurrent) {
++		SelectCurrentSceneItem();
++	}
++
++	AddSceneTreeUndoAction(QTStr("Undo.Delete").arg(name), undoLayout, redoLayout);
++	SceneTreeChanged(false);
++
++	blog(LOG_INFO, "User removed scene folder '%s'", QT_TO_UTF8(name));
++}
++
++void OBSBasic::SceneFolderNameEdited(QListWidgetItem *folder, const QString &name)
++{
++	const QString previousName = SceneTree::GetFolderName(folder);
++
++	if (name == previousName) {
++		folder->setText(previousName);
++		return;
++	}
++
++	if (name.isEmpty() || ui->scenes->FindFolder(name)) {
++		folder->setText(previousName);
++
++		if (name.isEmpty()) {
++			OBSMessageBox::warning(this, QTStr("NoNameEntered.Title"), QTStr("NoNameEntered.Text"));
++		} else {
++			OBSMessageBox::warning(this, QTStr("NameExists.Title"),
++					       QTStr("Basic.Main.SceneFolder.NameExists.Text"));
++		}
++		return;
++	}
++
++	const string undoLayout = GetSerializedLayout(ui->scenes);
++	ui->scenes->RenameFolder(folder, name);
++	const string redoLayout = GetSerializedLayout(ui->scenes);
++
++	AddSceneTreeUndoAction(QTStr("Undo.Rename").arg(name), undoLayout, redoLayout);
++	SceneTreeChanged(false);
++}
++
++bool OBSBasic::MoveSceneToFolder(obs_source_t *scene, const QString &folderName, bool addUndoAction)
++{
++	QListWidgetItem *sceneItem = FindSceneItem(ui->scenes, scene);
++
++	if (!sceneItem) {
++		return false;
++	}
++
++	QListWidgetItem *previousFolder = ui->scenes->GetFolderOf(sceneItem);
++	QListWidgetItem *folder = folderName.isEmpty() ? nullptr : ui->scenes->FindFolder(folderName);
++
++	if (folder && folder == previousFolder) {
++		return true;
++	} else if (!folder && !previousFolder && folderName.isEmpty()) {
++		return true;
++	}
++
++	const string undoLayout = GetSerializedLayout(ui->scenes);
++
++	if (!folderName.isEmpty() && !folder) {
++		folder = ui->scenes->AddFolder(folderName, ui->scenes->GetNewFolderRow());
++	}
++
++	ui->scenes->MoveSceneToFolder(sceneItem, folder);
++
++	const string redoLayout = GetSerializedLayout(ui->scenes);
++
++	if (addUndoAction) {
++		const QString sceneName = QT_UTF8(obs_source_get_name(scene));
++		QString actionName = folder ? QTStr("Undo.SceneFolder.Move").arg(sceneName, folderName)
++					    : QTStr("Undo.SceneFolder.MoveOut")
++						      .arg(sceneName, SceneTree::GetFolderName(previousFolder));
++
++		AddSceneTreeUndoAction(actionName, undoLayout, redoLayout);
++	}
++
++	SceneTreeChanged(true);
++	return true;
++}
++
++void OBSBasic::AddSceneFolderMenu(QMenu &popup, QListWidgetItem *sceneItem)
++{
++	QMenu *moveMenu = popup.addMenu(QTStr("Basic.Main.SceneFolder.MoveTo"));
++	QListWidgetItem *currentFolder = ui->scenes->GetFolderOf(sceneItem);
++	OBSSource scene = obs_scene_get_source(GetOBSRef<OBSScene>(sceneItem));
++
++	QAction *noFolder = moveMenu->addAction(QTStr("Basic.Main.SceneFolder.MoveTo.None"), this,
++						[this, scene]() { MoveSceneToFolder(scene, QString(), true); });
++	noFolder->setCheckable(true);
++	noFolder->setChecked(!currentFolder);
++
++	QList<QListWidgetItem *> folders = ui->scenes->GetFolders();
++
++	if (!folders.isEmpty()) {
++		moveMenu->addSeparator();
++	}
++
++	for (QListWidgetItem *folder : folders) {
++		QString folderName = SceneTree::GetFolderName(folder);
++		QAction *action = moveMenu->addAction(folderName, this, [this, scene, folderName]() {
++			MoveSceneToFolder(scene, folderName, true);
++		});
++		action->setCheckable(true);
++		action->setChecked(folder == currentFolder);
++	}
++
++	moveMenu->addSeparator();
++	moveMenu->addAction(QTStr("Basic.Main.SceneFolder.MoveTo.New"), this, [this, scene]() {
++		QString name;
++
++		if (QuerySceneFolderName(QTStr("Basic.Main.SceneFolder.AddDlg.Title"),
++					 QTStr("Basic.Main.SceneFolder.AddDlg.Text"), name,
++					 GetNewSceneFolderPlaceHolder())) {
++			MoveSceneToFolder(scene, name, true);
++		}
++	});
++}
++
++void OBSBasic::AddSceneFolderContextMenu(QMenu &popup, QListWidgetItem *folder)
++{
++	popup.addAction(QTStr("AddScene") + "...", this, &OBSBasic::on_actionAddScene_triggered);
++	popup.addAction(QTStr("Basic.Main.SceneFolder.Add") + "...", this, &OBSBasic::AddSceneFolder);
++	popup.addSeparator();
++
++	const bool isCollapsed = ui->scenes->IsFolderCollapsed(folder);
++	popup.addAction(QTStr(isCollapsed ? "Basic.Main.SceneFolder.Expand" : "Basic.Main.SceneFolder.Collapse"), this,
++			[this, isCollapsed]() {
++				QListWidgetItem *current = ui->scenes->currentItem();
++
++				if (SceneTree::IsFolder(current)) {
++					ui->scenes->SetFolderCollapsed(current, !isCollapsed);
++				}
++			});
++	popup.addAction(QTStr("Basic.Main.SceneFolder.ExpandAll"), this,
++			[this]() { ui->scenes->SetAllFoldersCollapsed(false); });
++	popup.addAction(QTStr("Basic.Main.SceneFolder.CollapseAll"), this,
++			[this]() { ui->scenes->SetAllFoldersCollapsed(true); });
++	popup.addSeparator();
++
++	popup.addAction(renameScene);
++	popup.addAction(QTStr("Basic.Main.SceneFolder.Remove"), this, [this]() {
++		QListWidgetItem *current = ui->scenes->currentItem();
++
++		if (SceneTree::IsFolder(current)) {
++			RemoveSceneFolder(current, true);
++		}
++	});
++	popup.addSeparator();
++
++	QMenu *order = popup.addMenu(QTStr("Basic.MainMenu.Edit.Order"));
++	order->addAction(QTStr("Basic.MainMenu.Edit.Order.MoveUp"), this, &OBSBasic::on_actionSceneUp_triggered);
++	order->addAction(QTStr("Basic.MainMenu.Edit.Order.MoveDown"), this, &OBSBasic::on_actionSceneDown_triggered);
++	order->addSeparator();
++	order->addAction(QTStr("Basic.MainMenu.Edit.Order.MoveToTop"), this, &OBSBasic::MoveSceneToTop);
++	order->addAction(QTStr("Basic.MainMenu.Edit.Order.MoveToBottom"), this, &OBSBasic::MoveSceneToBottom);
++	popup.addSeparator();
++
++	/* Toggle "Show in Multiview" for every scene of the folder at once */
++	vector<OBSSource> scenes;
++	bool isAllShown = true;
++
++	for (QListWidgetItem *sceneItem : ui->scenes->GetFolderScenes(folder)) {
++		OBSSource source = obs_scene_get_source(GetOBSRef<OBSScene>(sceneItem));
++		OBSDataAutoRelease privateSettings = obs_source_get_private_settings(source);
++
++		obs_data_set_default_bool(privateSettings, "show_in_multiview", true);
++		isAllShown = isAllShown && obs_data_get_bool(privateSettings, "show_in_multiview");
++		scenes.push_back(source);
++	}
++
++	QAction *multiviewAction = popup.addAction(QTStr("Basic.Main.SceneFolder.ShowInMultiview"));
++	multiviewAction->setCheckable(true);
++	multiviewAction->setChecked(!scenes.empty() && isAllShown);
++	multiviewAction->setEnabled(!scenes.empty());
++
++	connect(multiviewAction, &QAction::triggered, this, [scenes, isAllShown]() {
++		for (const OBSSource &source : scenes) {
++			OBSDataAutoRelease privateSettings = obs_source_get_private_settings(source);
++			obs_data_set_bool(privateSettings, "show_in_multiview", !isAllShown);
++		}
++
++		OBSProjector::UpdateMultiviewProjectors();
++	});
++}
+diff --git a/frontend/widgets/OBSBasic_SceneItems.cpp b/frontend/widgets/OBSBasic_SceneItems.cpp
+index 14229d5..d3a4998 100644
+--- a/frontend/widgets/OBSBasic_SceneItems.cpp
++++ b/frontend/widgets/OBSBasic_SceneItems.cpp
+@@ -124,7 +124,9 @@ static void RenameListValues(QListWidget *listWidget, const QString &newName, co
+ 	QList<QListWidgetItem *> items = listWidget->findItems(prevName, Qt::MatchExactly);
+ 
+ 	for (int i = 0; i < items.count(); i++) {
+-		items[i]->setText(newName);
++		if (!SceneTree::IsFolder(items[i])) {
++			items[i]->setText(newName);
++		}
+ 	}
+ }
+ 
+@@ -153,7 +155,7 @@ void OBSBasic::RenameSources(OBSSource source, QString newName, QString prevName
+ bool OBSBasic::QueryRemoveSource(obs_source_t *source)
+ {
+ 	if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE && !obs_source_is_group(source)) {
+-		int count = ui->scenes->count();
++		int count = ui->scenes->GetSceneCount();
+ 
+ 		if (count == 1) {
+ 			OBSMessageBox::information(this, QTStr("FinalScene.Title"), QTStr("FinalScene.Text"));
+diff --git a/frontend/widgets/OBSBasic_Scenes.cpp b/frontend/widgets/OBSBasic_Scenes.cpp
+index fdc1c34..7227af6 100644
+--- a/frontend/widgets/OBSBasic_Scenes.cpp
++++ b/frontend/widgets/OBSBasic_Scenes.cpp
+@@ -20,7 +20,9 @@
+ #include "OBSBasic.hpp"
+ #include "OBSProjector.hpp"
+ 
++#include <components/SceneTree.hpp>
+ #include <dialogs/NameDialog.hpp>
++#include <models/SceneTreeLayout.hpp>
+ 
+ #include <qt-wrappers.hpp>
+ 
+@@ -62,6 +64,10 @@ obs_data_array_t *OBSBasic::SaveSceneListOrder()
+ 	obs_data_array_t *sceneOrder = obs_data_array_create();
+ 
+ 	for (int i = 0; i < ui->scenes->count(); i++) {
++		if (SceneTree::IsFolder(ui->scenes->item(i))) {
++			continue;
++		}
++
+ 		OBSDataAutoRelease data = obs_data_create();
+ 		obs_data_set_string(data, "name", QT_TO_UTF8(ui->scenes->item(i)->text()));
+ 		obs_data_array_push_back(sceneOrder, data);
+@@ -109,7 +115,7 @@ void OBSBasic::AddScene(OBSSource source)
+ 
+ 	QListWidgetItem *item = new QListWidgetItem(QT_UTF8(name));
+ 	SetOBSRef(item, OBSScene(scene));
+-	ui->scenes->insertItem(ui->scenes->currentRow() + 1, item);
++	ui->scenes->InsertScene(item);
+ 
+ 	obs_hotkey_register_source(
+ 		source, "OBSBasic.SelectScene", Str("Basic.Hotkeys.SelectScene"),
+@@ -188,6 +194,26 @@ void OBSBasic::RemoveScene(OBSSource source)
+ 	if (sel != nullptr) {
+ 		if (sel == ui->scenes->currentItem()) {
+ 			ui->sources->Clear();
++
++			/* Select the closest scene ourselves, Qt could pick a folder */
++			QListWidgetItem *next = nullptr;
++			const int row = ui->scenes->row(sel);
++
++			for (int i = row + 1; i < count && !next; i++) {
++				if (!SceneTree::IsFolder(ui->scenes->item(i))) {
++					next = ui->scenes->item(i);
++				}
++			}
++
++			for (int i = row - 1; i >= 0 && !next; i--) {
++				if (!SceneTree::IsFolder(ui->scenes->item(i))) {
++					next = ui->scenes->item(i);
++				}
++			}
++
++			if (next) {
++				ui->scenes->setCurrentItem(next);
++			}
+ 		}
+ 		delete sel;
+ 	}
+@@ -343,6 +369,13 @@ static inline void RemoveSceneAndReleaseNested(obs_source_t *source)
+ 
+ void OBSBasic::RemoveSelectedScene()
+ {
++	QListWidgetItem *currentItem = ui->scenes->currentItem();
++
++	if (SceneTree::IsFolder(currentItem)) {
++		RemoveSceneFolder(currentItem, true);
++		return;
++	}
++
+ 	OBSScene scene = GetCurrentScene();
+ 	obs_source_t *source = obs_scene_get_source(scene);
+ 
+@@ -396,7 +429,7 @@ void OBSBasic::RemoveSelectedScene()
+ 		OBSDataArrayAutoRelease sources_in_deleted_scene = obs_data_get_array(base, "sources_in_deleted_scene");
+ 		OBSDataArrayAutoRelease scene_used_in_other_scenes =
+ 			obs_data_get_array(base, "scene_used_in_other_scenes");
+-		int savedIndex = (int)obs_data_get_int(base, "index");
++		const char *savedLayout = obs_data_get_string(base, "scene_tree_layout");
+ 		std::vector<OBSSource> sources;
+ 
+ 		/* create missing sources */
+@@ -447,14 +480,13 @@ void OBSBasic::RemoveSelectedScene()
+ 		OBSScene scene = obs_scene_from_source(scene_source);
+ 		SetCurrentScene(scene, true);
+ 
+-		/* set original index in list box */
++		/* restore original position (and folder) in list box */
+ 		ui->scenes->blockSignals(true);
+-		int curIndex = ui->scenes->currentRow();
+-		QListWidgetItem *item = ui->scenes->takeItem(curIndex);
+-		ui->scenes->insertItem(savedIndex, item);
+-		ui->scenes->setCurrentRow(savedIndex);
++		ui->scenes->ApplyLayout(OBS::DeserializeSceneTreeLayout(savedLayout));
+ 		currentScene = scene.Get();
+ 		ui->scenes->blockSignals(false);
++
++		UpdateSceneFolderSettings();
+ 	};
+ 
+ 	auto redo = [](const std::string &name) {
+@@ -465,7 +497,7 @@ void OBSBasic::RemoveSelectedScene()
+ 	OBSDataAutoRelease data = obs_data_create();
+ 	obs_data_set_array(data, "sources_in_deleted_scene", sources_in_deleted_scene);
+ 	obs_data_set_array(data, "scene_used_in_other_scenes", scene_used_in_other_scenes);
+-	obs_data_set_int(data, "index", ui->scenes->currentRow());
++	obs_data_set_string(data, "scene_tree_layout", OBS::SerializeSceneTreeLayout(ui->scenes->GetLayout()).c_str());
+ 
+ 	const char *scene_name = obs_source_get_name(source);
+ 	undo_s.add_action(QTStr("Undo.Delete").arg(scene_name), undo, redo, obs_data_get_json(data), scene_name);
+@@ -511,6 +543,11 @@ void OBSBasic::on_scenes_currentItemChanged(QListWidgetItem *current, QListWidge
+ 
+ 	bool forceSceneChange = false;
+ 
++	if (SceneTree::IsFolder(current)) {
++		/* Folders are not scenes, keep the current scene */
++		return;
++	}
++
+ 	if (current) {
+ 		OBSScene scene = GetOBSRef<OBSScene>(current);
+ 		source = obs_scene_get_source(scene);
+@@ -552,9 +589,14 @@ void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
+ 	QMenu popup(this);
+ 	QMenu order(QTStr("Basic.MainMenu.Edit.Order"), this);
+ 
+-	popup.addAction(QTStr("AddScene") + "...", this, &OBSBasic::on_actionAddScene_triggered);
++	if (SceneTree::IsFolder(item)) {
++		AddSceneFolderContextMenu(popup, item);
++	} else {
++		popup.addAction(QTStr("AddScene") + "...", this, &OBSBasic::on_actionAddScene_triggered);
++		popup.addAction(QTStr("Basic.Main.SceneFolder.Add") + "...", this, &OBSBasic::AddSceneFolder);
++	}
+ 
+-	if (item) {
++	if (item && !SceneTree::IsFolder(item)) {
+ 		QAction *copyFilters = new QAction(QTStr("Copy.Filters"), this);
+ 		copyFilters->setEnabled(false);
+ 		connect(copyFilters, &QAction::triggered, this, &OBSBasic::SceneCopyFilters);
+@@ -578,6 +620,7 @@ void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
+ 		order.addAction(QTStr("Basic.MainMenu.Edit.Order.MoveToTop"), this, &OBSBasic::MoveSceneToTop);
+ 		order.addAction(QTStr("Basic.MainMenu.Edit.Order.MoveToBottom"), this, &OBSBasic::MoveSceneToBottom);
+ 		popup.addMenu(&order);
++		AddSceneFolderMenu(popup, item);
+ 
+ 		popup.addSeparator();
+ 
+@@ -626,6 +669,14 @@ void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
+ 
+ 	popup.addSeparator();
+ 
++	if (!SceneTree::IsFolder(item) && ui->scenes->HasFolders()) {
++		popup.addAction(QTStr("Basic.Main.SceneFolder.ExpandAll"), this,
++				[this]() { ui->scenes->SetAllFoldersCollapsed(false); });
++		popup.addAction(QTStr("Basic.Main.SceneFolder.CollapseAll"), this,
++				[this]() { ui->scenes->SetAllFoldersCollapsed(true); });
++		popup.addSeparator();
++	}
++
+ 	bool grid = ui->scenes->GetGridMode();
+ 
+ 	QAction *gridAction = new QAction(grid ? QTStr("Basic.Main.ListMode") : QTStr("Basic.Main.GridMode"), this);
+@@ -719,25 +770,19 @@ void OBSBasic::on_actionRemoveScene_triggered()
+ 
+ void OBSBasic::ChangeSceneIndex(bool relative, int offset, int invalidIdx)
+ {
++	QListWidgetItem *item = ui->scenes->currentItem();
+ 	int idx = ui->scenes->currentRow();
+-	if (idx == -1 || idx == invalidIdx) {
++	if (!item || idx == invalidIdx) {
+ 		return;
+ 	}
+ 
+-	ui->scenes->blockSignals(true);
+-	QListWidgetItem *item = ui->scenes->takeItem(idx);
++	/* Scenes inside a folder move within that folder, folders and
++	 * top-level scenes move past whole folders */
++	bool moved = relative ? ui->scenes->MoveEntry(item, offset) : ui->scenes->MoveEntryToEdge(item, offset == 0);
+ 
+-	if (!relative) {
+-		idx = 0;
++	if (moved) {
++		SaveProject();
+ 	}
+-
+-	ui->scenes->insertItem(idx + offset, item);
+-	ui->scenes->setCurrentRow(idx + offset);
+-	item->setSelected(true);
+-	currentScene = GetOBSRef<OBSScene>(item).Get();
+-	ui->scenes->blockSignals(false);
+-
+-	OBSProjector::UpdateMultiviewProjectors();
+ }
+ 
+ void OBSBasic::on_actionSceneUp_triggered()
+@@ -768,7 +813,7 @@ void OBSBasic::EditSceneItemName()
+ 
+ void OBSBasic::on_scenes_itemDoubleClicked(QListWidgetItem *witem)
+ {
+-	if (!witem) {
++	if (!witem || SceneTree::IsFolder(witem)) {
+ 		return;
+ 	}
+ 
+@@ -929,6 +974,13 @@ void OBSBasic::SceneNameEdited(QWidget *editor)
+ 	QLineEdit *edit = qobject_cast<QLineEdit *>(editor);
+ 	string text = edit->text().trimmed().toStdString();
+ 
++	QListWidgetItem *currentItem = ui->scenes->currentItem();
++	if (SceneTree::IsFolder(currentItem)) {
++		SceneFolderNameEdited(currentItem, edit->text().trimmed());
++		ui->scenesDock->addAction(renameScene);
++		return;
++	}
++
+ 	if (!scene) {
+ 		return;
+ 	}
+-- 
+2.43.0
+
+
+From e94d78cca9637ef8201ec734c4d3544d8c813a6e Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:43:57 +0000
+Subject: [PATCH 3/3] obs-frontend-api: Add scene folder functions
+
+Plugins (e.g. remote control or scene switching tools) need to know how
+scenes are organized in the Scenes dock and should be able to organize
+them as well. As the existing scene functions keep returning every
+scene regardless of folders, folders are exposed through separate
+functions instead:
+
+* obs_frontend_get_scene_folder_names
+* obs_frontend_get_scene_folder
+* obs_frontend_get_scene_folder_scenes
+* obs_frontend_add_scene_folder
+* obs_frontend_remove_scene_folder
+* obs_frontend_set_scene_folder
+
+OBS_FRONTEND_EVENT_SCENE_FOLDERS_CHANGED is emitted whenever folders are
+added, removed or renamed, or scenes are moved into or out of a folder.
+---
+ docs/sphinx/reference-frontend-api.rst     | 85 ++++++++++++++++++++++
+ frontend/OBSStudioAPI.cpp                  | 66 +++++++++++++++++
+ frontend/OBSStudioAPI.hpp                  |  7 ++
+ frontend/api/obs-frontend-api.cpp          | 38 ++++++++++
+ frontend/api/obs-frontend-api.h            | 11 +++
+ frontend/api/obs-frontend-internal.hpp     |  8 ++
+ frontend/widgets/OBSBasic.hpp              |  7 ++
+ frontend/widgets/OBSBasic_SceneFolders.cpp | 70 ++++++++++++++++++
+ 8 files changed, 292 insertions(+)
+
+diff --git a/docs/sphinx/reference-frontend-api.rst b/docs/sphinx/reference-frontend-api.rst
+index d1be586..816b928 100644
+--- a/docs/sphinx/reference-frontend-api.rst
++++ b/docs/sphinx/reference-frontend-api.rst
+@@ -64,6 +64,14 @@ Structures/Enumerations
+      Triggered when a scenes has been added/removed/reordered by the
+      user.
+ 
++   - **OBS_FRONTEND_EVENT_SCENE_FOLDERS_CHANGED**
++
++     Triggered when scene folders of the Scenes dock have been added,
++     removed or renamed, or when scenes have been moved into or out of a
++     folder.
++
++     .. versionadded:: 33.1
++
+    - **OBS_FRONTEND_EVENT_TRANSITION_CHANGED**
+ 
+      Triggered when the current transition has changed by the user.
+@@ -313,6 +321,83 @@ Functions
+ 
+ ---------------------------------------
+ 
++.. function:: char **obs_frontend_get_scene_folder_names(void)
++
++   Scene folders only organize the Scenes dock. They are not sources,
++   and scene enumeration functions like :c:func:`obs_frontend_get_scenes`
++   and :c:func:`obs_frontend_get_scene_names` keep returning every scene
++   (in the order of the Scenes dock) regardless of folders.
++
++   :return: The list of scene folder names, ending with NULL, in the order
++            of the Scenes dock.  The list is stored within one contiguous
++            segment of memory, so freeing the returned pointer with
++            :c:func:`bfree()` will free the entire list.
++
++   .. versionadded:: 33.1
++
++---------------------------------------
++
++.. function:: char *obs_frontend_get_scene_folder(obs_source_t *scene)
++
++   :param scene: A scene
++   :return: The name of the folder containing the scene, or NULL if the
++            scene is not inside a folder.  Free with :c:func:`bfree()`.
++
++   .. versionadded:: 33.1
++
++---------------------------------------
++
++.. function:: void obs_frontend_get_scene_folder_scenes(const char *folder, struct obs_frontend_source_list *sources)
++
++   :param folder:  Name of the scene folder
++   :param sources: Pointer to a :c:type:`obs_frontend_source_list`
++                   structure to receive the list of reference-incremented
++                   scenes inside the folder, in the order of the Scenes
++                   dock.  Release with :c:func:`obs_frontend_source_list_free`
++
++   .. versionadded:: 33.1
++
++---------------------------------------
++
++.. function:: bool obs_frontend_add_scene_folder(const char *name)
++
++   Adds an empty scene folder at the end of the Scenes dock.
++
++   :param name: Name of the folder
++   :return:     *false* if the name is empty or a folder with that name
++                already exists, *true* otherwise
++
++   .. versionadded:: 33.1
++
++---------------------------------------
++
++.. function:: bool obs_frontend_remove_scene_folder(const char *name)
++
++   Removes a scene folder. The scenes inside the folder are not removed,
++   they are moved out of the folder at the same position.
++
++   :param name: Name of the folder
++   :return:     *false* if the folder does not exist, *true* otherwise
++
++   .. versionadded:: 33.1
++
++---------------------------------------
++
++.. function:: bool obs_frontend_set_scene_folder(obs_source_t *scene, const char *folder)
++
++   Moves a scene into a scene folder (as its last scene), creating the
++   folder if it does not exist yet.
++
++   :param scene:  The scene to move
++   :param folder: Name of the folder, or NULL/empty to move the scene out
++                  of its folder
++   :return:       *false* if the scene is not in the Scenes dock, *true*
++                  otherwise
++
++   .. versionadded:: 33.1
++
++---------------------------------------
++
+ .. function:: void obs_frontend_get_transitions(struct obs_frontend_source_list *sources)
+ 
+    :param sources: Pointer to a :c:type:`obs_frontend_source_list`
+diff --git a/frontend/OBSStudioAPI.cpp b/frontend/OBSStudioAPI.cpp
+index ee4b327..06c04a4 100644
+--- a/frontend/OBSStudioAPI.cpp
++++ b/frontend/OBSStudioAPI.cpp
+@@ -60,6 +60,72 @@ void OBSStudioAPI::obs_frontend_get_scenes(struct obs_frontend_source_list *sour
+ 	}
+ }
+ 
++void OBSStudioAPI::obs_frontend_get_scene_folder_names(std::vector<std::string> &strings)
++{
++	QStringList names;
++	QMetaObject::invokeMethod(main, [this, &names]() { names = main->GetSceneFolderNames(); }, WaitConnection());
++
++	for (const QString &name : names) {
++		strings.emplace_back(name.toStdString());
++	}
++}
++
++char *OBSStudioAPI::obs_frontend_get_scene_folder(obs_source_t *scene)
++{
++	QString name;
++	QMetaObject::invokeMethod(
++		main, [this, &name, scene = OBSSource(scene)]() { name = main->GetSceneFolderName(scene); },
++		WaitConnection());
++
++	return name.isEmpty() ? nullptr : bstrdup(QT_TO_UTF8(name));
++}
++
++void OBSStudioAPI::obs_frontend_get_scene_folder_scenes(const char *folder, struct obs_frontend_source_list *sources)
++{
++	QList<OBSSource> scenes;
++	QMetaObject::invokeMethod(
++		main, [this, &scenes, folder = QT_UTF8(folder)]() { scenes = main->GetSceneFolderScenes(folder); },
++		WaitConnection());
++
++	for (const OBSSource &scene : scenes) {
++		obs_source_t *source = scene.Get();
++
++		if (obs_source_get_ref(source) != nullptr) {
++			da_push_back(sources->sources, &source);
++		}
++	}
++}
++
++bool OBSStudioAPI::obs_frontend_add_scene_folder(const char *name)
++{
++	bool success = false;
++	QMetaObject::invokeMethod(
++		main, [this, &success, name = QT_UTF8(name)]() { success = main->CreateSceneFolder(name); },
++		WaitConnection());
++	return success;
++}
++
++bool OBSStudioAPI::obs_frontend_remove_scene_folder(const char *name)
++{
++	bool success = false;
++	QMetaObject::invokeMethod(
++		main, [this, &success, name = QT_UTF8(name)]() { success = main->DeleteSceneFolder(name); },
++		WaitConnection());
++	return success;
++}
++
++bool OBSStudioAPI::obs_frontend_set_scene_folder(obs_source_t *scene, const char *folder)
++{
++	bool success = false;
++	QMetaObject::invokeMethod(
++		main,
++		[this, &success, scene = OBSSource(scene), folder = QT_UTF8(folder)]() {
++			success = main->SetSceneFolder(scene, folder);
++		},
++		WaitConnection());
++	return success;
++}
++
+ obs_source_t *OBSStudioAPI::obs_frontend_get_current_scene()
+ {
+ 	if (main->IsPreviewProgramMode()) {
+diff --git a/frontend/OBSStudioAPI.hpp b/frontend/OBSStudioAPI.hpp
+index a058920..ce4193c 100644
+--- a/frontend/OBSStudioAPI.hpp
++++ b/frontend/OBSStudioAPI.hpp
+@@ -43,6 +43,13 @@ struct OBSStudioAPI : obs_frontend_callbacks {
+ 	void *obs_frontend_get_system_tray(void) override;
+ 
+ 	void obs_frontend_get_scenes(struct obs_frontend_source_list *sources) override;
++	void obs_frontend_get_scene_folder_names(std::vector<std::string> &strings) override;
++	char *obs_frontend_get_scene_folder(obs_source_t *scene) override;
++	void obs_frontend_get_scene_folder_scenes(const char *folder,
++						  struct obs_frontend_source_list *sources) override;
++	bool obs_frontend_add_scene_folder(const char *name) override;
++	bool obs_frontend_remove_scene_folder(const char *name) override;
++	bool obs_frontend_set_scene_folder(obs_source_t *scene, const char *folder) override;
+ 
+ 	obs_source_t *obs_frontend_get_current_scene(void) override;
+ 
+diff --git a/frontend/api/obs-frontend-api.cpp b/frontend/api/obs-frontend-api.cpp
+index 48e4ecf..ce690d2 100644
+--- a/frontend/api/obs-frontend-api.cpp
++++ b/frontend/api/obs-frontend-api.cpp
+@@ -100,6 +100,44 @@ void obs_frontend_get_scenes(struct obs_frontend_source_list *sources)
+ 	}
+ }
+ 
++char **obs_frontend_get_scene_folder_names(void)
++{
++	if (!callbacks_valid()) {
++		return nullptr;
++	}
++
++	vector<string> strings;
++	c->obs_frontend_get_scene_folder_names(strings);
++	return convert_string_list(strings);
++}
++
++char *obs_frontend_get_scene_folder(obs_source_t *scene)
++{
++	return !!callbacks_valid() && scene ? c->obs_frontend_get_scene_folder(scene) : nullptr;
++}
++
++void obs_frontend_get_scene_folder_scenes(const char *folder, struct obs_frontend_source_list *sources)
++{
++	if (callbacks_valid() && folder && *folder) {
++		c->obs_frontend_get_scene_folder_scenes(folder, sources);
++	}
++}
++
++bool obs_frontend_add_scene_folder(const char *name)
++{
++	return callbacks_valid() && name && *name ? c->obs_frontend_add_scene_folder(name) : false;
++}
++
++bool obs_frontend_remove_scene_folder(const char *name)
++{
++	return callbacks_valid() && name && *name ? c->obs_frontend_remove_scene_folder(name) : false;
++}
++
++bool obs_frontend_set_scene_folder(obs_source_t *scene, const char *folder)
++{
++	return callbacks_valid() && scene ? c->obs_frontend_set_scene_folder(scene, folder ? folder : "") : false;
++}
++
+ obs_source_t *obs_frontend_get_current_scene(void)
+ {
+ 	return !!callbacks_valid() ? c->obs_frontend_get_current_scene() : nullptr;
+diff --git a/frontend/api/obs-frontend-api.h b/frontend/api/obs-frontend-api.h
+index aedfd33..bf0842e 100644
+--- a/frontend/api/obs-frontend-api.h
++++ b/frontend/api/obs-frontend-api.h
+@@ -67,6 +67,8 @@ enum obs_frontend_event {
+ 	OBS_FRONTEND_EVENT_CANVAS_REMOVED,
+ 
+ 	OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVING,
++
++	OBS_FRONTEND_EVENT_SCENE_FOLDERS_CHANGED,
+ };
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -126,6 +128,15 @@ EXPORT void obs_frontend_get_scenes(struct obs_frontend_source_list *sources);
+ EXPORT obs_source_t *obs_frontend_get_current_scene(void);
+ EXPORT void obs_frontend_set_current_scene(obs_source_t *scene);
+ 
++/* Scene folders only organize the Scenes dock, the scene functions above are
++ * not affected by them. */
++EXPORT char **obs_frontend_get_scene_folder_names(void);
++EXPORT char *obs_frontend_get_scene_folder(obs_source_t *scene);
++EXPORT void obs_frontend_get_scene_folder_scenes(const char *folder, struct obs_frontend_source_list *sources);
++EXPORT bool obs_frontend_add_scene_folder(const char *name);
++EXPORT bool obs_frontend_remove_scene_folder(const char *name);
++EXPORT bool obs_frontend_set_scene_folder(obs_source_t *scene, const char *folder);
++
+ EXPORT void obs_frontend_get_transitions(struct obs_frontend_source_list *sources);
+ EXPORT obs_source_t *obs_frontend_get_current_transition(void);
+ EXPORT void obs_frontend_set_current_transition(obs_source_t *transition);
+diff --git a/frontend/api/obs-frontend-internal.hpp b/frontend/api/obs-frontend-internal.hpp
+index 9b7858c..426a727 100644
+--- a/frontend/api/obs-frontend-internal.hpp
++++ b/frontend/api/obs-frontend-internal.hpp
+@@ -143,6 +143,14 @@ struct obs_frontend_callbacks {
+ 	virtual bool obs_frontend_can_paste_sceneitem(bool duplicate) = 0;
+ 	virtual void obs_frontend_paste_sceneitem(obs_scene_t *scene, bool duplicate) = 0;
+ 	virtual bool obs_frontend_is_safe_mode_enabled(void) = 0;
++
++	virtual void obs_frontend_get_scene_folder_names(std::vector<std::string> &strings) = 0;
++	virtual char *obs_frontend_get_scene_folder(obs_source_t *scene) = 0;
++	virtual void obs_frontend_get_scene_folder_scenes(const char *folder,
++							  struct obs_frontend_source_list *sources) = 0;
++	virtual bool obs_frontend_add_scene_folder(const char *name) = 0;
++	virtual bool obs_frontend_remove_scene_folder(const char *name) = 0;
++	virtual bool obs_frontend_set_scene_folder(obs_source_t *scene, const char *folder) = 0;
+ };
+ 
+ EXPORT void obs_frontend_set_callbacks_internal(obs_frontend_callbacks *callbacks);
+diff --git a/frontend/widgets/OBSBasic.hpp b/frontend/widgets/OBSBasic.hpp
+index 305aace..6e65366 100644
+--- a/frontend/widgets/OBSBasic.hpp
++++ b/frontend/widgets/OBSBasic.hpp
+@@ -1352,6 +1352,13 @@ public:
+ 
+ 	void CreateSceneUndoRedoAction(const QString &action_name, OBSData undo_data, OBSData redo_data);
+ 
++	QStringList GetSceneFolderNames() const;
++	QString GetSceneFolderName(obs_source_t *scene) const;
++	QList<OBSSource> GetSceneFolderScenes(const QString &folderName) const;
++	bool CreateSceneFolder(const QString &folderName);
++	bool DeleteSceneFolder(const QString &folderName);
++	bool SetSceneFolder(obs_source_t *scene, const QString &folderName);
++
+ 	/* -------------------------------------
+ 	 * MARK: - OBSBasic_Screenshots
+ 	 * -------------------------------------
+diff --git a/frontend/widgets/OBSBasic_SceneFolders.cpp b/frontend/widgets/OBSBasic_SceneFolders.cpp
+index e942a32..961397a 100644
+--- a/frontend/widgets/OBSBasic_SceneFolders.cpp
++++ b/frontend/widgets/OBSBasic_SceneFolders.cpp
+@@ -119,6 +119,8 @@ void OBSBasic::SceneTreeChanged(bool sceneOrderChanged)
+ 		OBSProjector::UpdateMultiviewProjectors();
+ 		OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+ 	}
++
++	OnEvent(OBS_FRONTEND_EVENT_SCENE_FOLDERS_CHANGED);
+ }
+ 
+ void OBSBasic::SelectCurrentSceneItem()
+@@ -440,3 +442,71 @@ void OBSBasic::AddSceneFolderContextMenu(QMenu &popup, QListWidgetItem *folder)
+ 		OBSProjector::UpdateMultiviewProjectors();
+ 	});
+ }
++
++QStringList OBSBasic::GetSceneFolderNames() const
++{
++	QStringList names;
++
++	for (QListWidgetItem *folder : ui->scenes->GetFolders()) {
++		names.append(SceneTree::GetFolderName(folder));
++	}
++
++	return names;
++}
++
++QString OBSBasic::GetSceneFolderName(obs_source_t *scene) const
++{
++	QListWidgetItem *sceneItem = FindSceneItem(ui->scenes, scene);
++	QListWidgetItem *folder = ui->scenes->GetFolderOf(sceneItem);
++
++	return folder ? SceneTree::GetFolderName(folder) : QString();
++}
++
++QList<OBSSource> OBSBasic::GetSceneFolderScenes(const QString &folderName) const
++{
++	QList<OBSSource> scenes;
++	QListWidgetItem *folder = ui->scenes->FindFolder(folderName);
++
++	for (QListWidgetItem *sceneItem : ui->scenes->GetFolderScenes(folder)) {
++		scenes.append(OBSSource(obs_scene_get_source(GetOBSRef<OBSScene>(sceneItem))));
++	}
++
++	return scenes;
++}
++
++bool OBSBasic::CreateSceneFolder(const QString &folderName)
++{
++	QString name = folderName.trimmed();
++
++	if (name.isEmpty() || ui->scenes->FindFolder(name)) {
++		return false;
++	}
++
++	ui->scenes->AddFolder(name);
++	SceneTreeChanged(false);
++	return true;
++}
++
++bool OBSBasic::DeleteSceneFolder(const QString &folderName)
++{
++	QListWidgetItem *folder = ui->scenes->FindFolder(folderName);
++
++	if (!folder) {
++		return false;
++	}
++
++	const bool wasCurrent = ui->scenes->currentItem() == folder;
++	ui->scenes->RemoveFolder(folder);
++
++	if (wasCurrent) {
++		SelectCurrentSceneItem();
++	}
++
++	SceneTreeChanged(false);
++	return true;
++}
++
++bool OBSBasic::SetSceneFolder(obs_source_t *scene, const QString &folderName)
++{
++	return MoveSceneToFolder(scene, folderName.trimmed(), false);
++}
+-- 
+2.43.0
+

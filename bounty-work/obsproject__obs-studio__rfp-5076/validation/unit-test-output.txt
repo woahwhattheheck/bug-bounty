@@ -1,0 +1,19 @@
+[==========] tests: Running 8 test(s).
+[ RUN      ] flat_scene_order_test
+[       OK ] flat_scene_order_test
+[ RUN      ] save_load_roundtrip_test
+[       OK ] save_load_roundtrip_test
+[ RUN      ] collection_without_folders_test
+[       OK ] collection_without_folders_test
+[ RUN      ] older_version_loads_every_scene_test
+[       OK ] older_version_loads_every_scene_test
+[ RUN      ] older_version_roundtrip_keeps_folders_test
+[       OK ] older_version_roundtrip_keeps_folders_test
+[ RUN      ] reordered_by_older_version_test
+[       OK ] reordered_by_older_version_test
+[ RUN      ] invalid_folder_data_test
+[       OK ] invalid_folder_data_test
+[ RUN      ] undo_serialization_test
+[       OK ] undo_serialization_test
+[==========] tests: 8 test(s) run.
+[  PASSED  ] 8 test(s).

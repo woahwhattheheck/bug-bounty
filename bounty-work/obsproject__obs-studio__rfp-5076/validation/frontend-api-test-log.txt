@@ -1,0 +1,32 @@
+[api-test] initial folders:
+[api-test]   'Gameplay'
+[api-test]   'Empty Folder'
+[api-test]   'Components'
+[api-test] folder of 'Game' = Gameplay
+[api-test] folder of 'Starting Soon' = (none)
+[api-test] Components contains 'Webcam Frame'
+[api-test] Components contains 'Alerts'
+[api-test] add 'API Folder' = 1
+[api-test] add duplicate 'API Folder' = 0
+[api-test] set 'Game' -> 'API Folder' = 1
+[api-test] folder of 'Game' = API Folder
+[api-test] set 'Ending' -> 'Created By Set' = 1
+[api-test] folder of 'Ending' = Created By Set
+[api-test] set 'Ending' -> NULL = 1
+[api-test] folder of 'Ending' = (none)
+[api-test] remove 'Empty Folder' = 1
+[api-test] remove missing folder = 0
+[api-test] final folders:
+[api-test]   'Gameplay'
+[api-test]   'Components'
+[api-test]   'API Folder'
+[api-test]   'Created By Set'
+[api-test] obs_frontend_get_scene_names: 'Starting Soon'
+[api-test] obs_frontend_get_scene_names: 'Game + Cam'
+[api-test] obs_frontend_get_scene_names: 'BRB'
+[api-test] obs_frontend_get_scene_names: 'Webcam Frame'
+[api-test] obs_frontend_get_scene_names: 'Alerts'
+[api-test] obs_frontend_get_scene_names: 'Game'
+[api-test] obs_frontend_get_scene_names: 'Ending'
+[api-test] OBS_FRONTEND_EVENT_SCENE_FOLDERS_CHANGED received 5 times
+[api-test] current scene after switch = 'Alerts'

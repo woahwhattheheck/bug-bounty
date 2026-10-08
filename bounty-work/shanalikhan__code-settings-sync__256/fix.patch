@@ -1,0 +1,350 @@
+From ec3223cad00f2def60a81c60c87b30a771c6f9c7 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:06:17 +0000
+Subject: [PATCH] feat(sync): add file system sync method for a settings folder
+ (#256)
+
+Add a FileSystem sync method next to GitHubGist. When fileSystemPath is
+set in syncLocalSettings.json, upload exports the syncable user settings
+files into that folder and download imports them back. The gist path is
+unchanged when no folder is configured.
+
+Export and import reuse FileService.ListFiles and the existing
+ignoreUploadFiles/ignoreUploadFolders/supportedFileExtensions rules, so
+lock files, state files and History are skipped in both directions.
+---
+ src/enums/syncMethod.enum.ts                  |   3 +-
+ src/models/customConfig.model.ts              |   1 +
+ src/service/factory.service.ts                |   4 +-
+ src/service/filesystem/filesystem.service.ts  | 121 ++++++++++++++++++
+ src/sync.ts                                   |  13 +-
+ .../filesystem/filesystem.service.test.ts     | 110 ++++++++++++++++
+ 6 files changed, 248 insertions(+), 4 deletions(-)
+ create mode 100644 src/service/filesystem/filesystem.service.ts
+ create mode 100644 test/service/filesystem/filesystem.service.test.ts
+
+diff --git a/src/enums/syncMethod.enum.ts b/src/enums/syncMethod.enum.ts
+index d562ba8..f1a8b67 100644
+--- a/src/enums/syncMethod.enum.ts
++++ b/src/enums/syncMethod.enum.ts
+@@ -1,3 +1,4 @@
+ export enum SyncMethod {
+-  GitHubGist = "GitHubGist"
++  GitHubGist = "GitHubGist",
++  FileSystem = "FileSystem"
+ }
+diff --git a/src/models/customConfig.model.ts b/src/models/customConfig.model.ts
+index 4b7be46..195c302 100644
+--- a/src/models/customConfig.model.ts
++++ b/src/models/customConfig.model.ts
+@@ -37,4 +37,5 @@ export class CustomConfig {
+   public universalKeybindings: boolean = false;
+   public autoUploadDelay: number = 20;
+   public sortAlphabetically: boolean = false;
++  public fileSystemPath: string = "";
+ }
+diff --git a/src/service/factory.service.ts b/src/service/factory.service.ts
+index eb4ec83..fb95a41 100644
+--- a/src/service/factory.service.ts
++++ b/src/service/factory.service.ts
+@@ -1,6 +1,7 @@
+ import { SyncMethod } from "../enums/syncMethod.enum";
+ import { ISyncService } from "../models/ISyncService.model";
+ import { IExtensionState } from "../models/state.model";
++import { FileSystemService } from "./filesystem/filesystem.service";
+ import { GistService } from "./github/gist.service";
+ 
+ export class FactoryService {
+@@ -12,6 +13,7 @@ export class FactoryService {
+     return new this.syncMethods[method](state);
+   }
+   private static syncMethods = {
+-    [SyncMethod.GitHubGist]: GistService
++    [SyncMethod.GitHubGist]: GistService,
++    [SyncMethod.FileSystem]: FileSystemService
+   };
+ }
+diff --git a/src/service/filesystem/filesystem.service.ts b/src/service/filesystem/filesystem.service.ts
+new file mode 100644
+index 0000000..5967a4d
+--- /dev/null
++++ b/src/service/filesystem/filesystem.service.ts
+@@ -0,0 +1,121 @@
++import * as fs from "fs-extra";
++import * as path from "path";
++import * as recursiveRead from "recursive-readdir";
++
++import { CustomConfig } from "../../models/customConfig.model";
++import { ISyncService } from "../../models/ISyncService.model";
++import { LocalConfig } from "../../models/localConfig.model";
++import { IExtensionState } from "../../models/state.model";
++import { FileService } from "../file.service";
++
++/**
++ * Syncs the VS Code user settings folder to a plain folder (for example a
++ * folder inside OneDrive, Dropbox or a git checkout) instead of a GitHub gist.
++ * The target folder is read from `fileSystemPath` in syncLocalSettings.json.
++ */
++export class FileSystemService implements ISyncService {
++  constructor(private state: IExtensionState) {}
++
++  public async IsConfigured(): Promise<boolean> {
++    const localConfig = await this.state.commons.InitalizeSettings();
++    const folder = FileSystemService.ResolveFolder(localConfig);
++    return folder !== "" && (await fs.pathExists(folder));
++  }
++
++  /**
++   * Copies the syncable user settings files into the configured folder
++   */
++  public async Export(): Promise<void> {
++    const localConfig = await this.state.commons.InitalizeSettings();
++    const folder = FileSystemService.ResolveFolder(localConfig);
++    if (folder === "") {
++      return;
++    }
++    await this.state.watcher.HandleStopWatching();
++
++    const userFolder = this.state.environment.USER_FOLDER;
++    const files = await FileService.ListFiles(
++      userFolder,
++      localConfig.customConfig
++    );
++    await fs.ensureDir(folder);
++    for (const file of files) {
++      const relative = path.relative(userFolder, file.filePath);
++      if (!FileSystemService.IsInside(relative)) {
++        continue;
++      }
++      const target = path.join(folder, relative);
++      await fs.ensureDir(path.dirname(target));
++      await fs.writeFile(target, file.content);
++    }
++  }
++
++  /**
++   * Copies the files from the configured folder back into the user settings folder
++   */
++  public async Import(): Promise<void> {
++    const localConfig = await this.state.commons.InitalizeSettings();
++    const folder = FileSystemService.ResolveFolder(localConfig);
++    if (folder === "" || !(await fs.pathExists(folder))) {
++      return;
++    }
++    await this.state.watcher.HandleStopWatching();
++
++    const customConfig = localConfig.customConfig;
++    const userFolder = this.state.environment.USER_FOLDER;
++    const sources: string[] = await recursiveRead(folder, [
++      (file: string, stats: fs.Stats) =>
++        !stats.isDirectory() && FileSystemService.IsSkipped(file, customConfig)
++    ]);
++    for (const source of sources) {
++      const relative = path.relative(folder, source);
++      if (!FileSystemService.IsInside(relative)) {
++        continue;
++      }
++      const target = path.join(userFolder, relative);
++      await fs.ensureDir(path.dirname(target));
++      await fs.copy(source, target, { overwrite: true });
++    }
++  }
++
++  // Nothing to reset on a folder: the files stay where the user put them
++  public Reset(): Promise<void> {
++    return Promise.resolve();
++  }
++
++  public static ResolveFolder(localConfig: LocalConfig): string {
++    const folder =
++      localConfig && localConfig.customConfig
++        ? localConfig.customConfig.fileSystemPath
++        : "";
++    return folder ? folder.trim() : "";
++  }
++
++  public static IsInside(relativePath: string): boolean {
++    return (
++      relativePath !== "" &&
++      !path.isAbsolute(relativePath) &&
++      relativePath !== ".." &&
++      !relativePath.startsWith(".." + path.sep)
++    );
++  }
++
++  public static IsSkipped(file: string, customConfig: CustomConfig): boolean {
++    const extension = path.extname(file).slice(1);
++    if (!customConfig.supportedFileExtensions.includes(extension)) {
++      return true;
++    }
++    const fileName = path.basename(file);
++    const ignoredByName = customConfig.ignoreUploadFiles.some(pattern =>
++      pattern.endsWith(".*")
++        ? fileName.startsWith(pattern.slice(0, -1))
++        : pattern === fileName
++    );
++    if (ignoredByName) {
++      return true;
++    }
++    return file
++      .split(path.sep)
++      .some(segment => customConfig.ignoreUploadFolders.includes(segment));
++  }
++}
+diff --git a/src/sync.ts b/src/sync.ts
+index c8e2ccb..d9a0fe1 100644
+--- a/src/sync.ts
++++ b/src/sync.ts
+@@ -67,6 +67,15 @@ export class Sync {
+       }
+     }
+   }
++  /**
++   * GitHub gist is the default. A fileSystemPath in syncLocalSettings.json switches to a plain folder.
++   */
++  private async selectSyncMethod(): Promise<SyncMethod> {
++    const localConfig = await state.commons.InitalizeSettings();
++    return localConfig.customConfig.fileSystemPath
++      ? SyncMethod.FileSystem
++      : SyncMethod.GitHubGist;
++  }
+   /**
+    * Upload setting to github gist
+    */
+@@ -75,7 +84,7 @@ export class Sync {
+     try {
+       const service: ISyncService = FactoryService.CreateSyncService(
+         state,
+-        SyncMethod.GitHubGist
++        await this.selectSyncMethod()
+       );
+       const args = new Array<string>();
+       if (optArgument && optArgument === "publicGIST") {
+@@ -94,7 +103,7 @@ export class Sync {
+     try {
+       const service: ISyncService = FactoryService.CreateSyncService(
+         state,
+-        SyncMethod.GitHubGist
++        await this.selectSyncMethod()
+       );
+       await service.Import();
+     } catch (err) {
+diff --git a/test/service/filesystem/filesystem.service.test.ts b/test/service/filesystem/filesystem.service.test.ts
+new file mode 100644
+index 0000000..99085ad
+--- /dev/null
++++ b/test/service/filesystem/filesystem.service.test.ts
+@@ -0,0 +1,110 @@
++import { expect } from "chai";
++import * as fs from "fs-extra";
++import * as os from "os";
++import * as path from "path";
++
++import { CustomConfig } from "../../../src/models/customConfig.model";
++import { IExtensionState } from "../../../src/models/state.model";
++import { FileSystemService } from "../../../src/service/filesystem/filesystem.service";
++
++function createState(
++  userFolder: string,
++  customConfig: Partial<CustomConfig>
++): IExtensionState {
++  const defaults = {
++    ignoreUploadFiles: ["state.*", "syncLocalSettings.json", "sync.lock"],
++    ignoreUploadFolders: ["workspaceStorage", "globalStorage", "History"],
++    supportedFileExtensions: ["json", "code-snippets"],
++    fileSystemPath: ""
++  };
++  const settings = Object.assign({}, defaults, customConfig);
++  return ({
++    commons: {
++      InitalizeSettings: async () => ({ customConfig: settings })
++    },
++    environment: { USER_FOLDER: userFolder + path.sep },
++    instanceID: "test",
++    watcher: { HandleStopWatching: async () => undefined }
++  } as unknown) as IExtensionState;
++}
++
++describe("FileSystemService", () => {
++  let root: string;
++  let userA: string;
++  let userB: string;
++  let folder: string;
++
++  beforeEach(async () => {
++    root = await fs.mkdtemp(path.join(os.tmpdir(), "css-filesystem-"));
++    userA = path.join(root, "userA");
++    userB = path.join(root, "userB");
++    folder = path.join(root, "shared");
++    await fs.outputFile(path.join(userA, "settings.json"), '{"a": 1}');
++    await fs.outputFile(path.join(userA, "keybindings.json"), "[]");
++    await fs.outputFile(
++      path.join(userA, "snippets", "javascript.json"),
++      '{"log": {}}'
++    );
++    await fs.outputFile(path.join(userA, "sync.lock"), "");
++    await fs.outputFile(path.join(userA, "state.vscdb"), "binary");
++    await fs.outputFile(path.join(userA, "History", "entries.json"), "{}");
++  });
++
++  afterEach(async () => {
++    await fs.remove(root);
++  });
++
++  it("exports supported settings files and skips ignored ones", async () => {
++    const service = new FileSystemService(
++      createState(userA, { fileSystemPath: folder })
++    );
++    await service.Export();
++
++    expect(
++      await fs.readFile(path.join(folder, "settings.json"), "utf8")
++    ).to.equal('{"a": 1}');
++    expect(
++      await fs.readFile(
++        path.join(folder, "snippets", "javascript.json"),
++        "utf8"
++      )
++    ).to.equal('{"log": {}}');
++    expect(await fs.pathExists(path.join(folder, "sync.lock"))).to.equal(false);
++    expect(await fs.pathExists(path.join(folder, "state.vscdb"))).to.equal(
++      false
++    );
++    expect(await fs.pathExists(path.join(folder, "History"))).to.equal(false);
++  });
++
++  it("imports exported files into another user folder", async () => {
++    const config = { fileSystemPath: folder };
++    await new FileSystemService(createState(userA, config)).Export();
++    await new FileSystemService(createState(userB, config)).Import();
++
++    expect(
++      await fs.readFile(path.join(userB, "settings.json"), "utf8")
++    ).to.equal('{"a": 1}');
++    expect(
++      await fs.readFile(path.join(userB, "keybindings.json"), "utf8")
++    ).to.equal("[]");
++    expect(
++      await fs.readFile(path.join(userB, "snippets", "javascript.json"), "utf8")
++    ).to.equal('{"log": {}}');
++  });
++
++  it("does nothing when no folder is configured", async () => {
++    const service = new FileSystemService(createState(userA, {}));
++    expect(await service.IsConfigured()).to.equal(false);
++    await service.Export();
++    expect(await fs.pathExists(folder)).to.equal(false);
++  });
++
++  it("reports configured only when the folder exists", async () => {
++    const service = new FileSystemService(
++      createState(userA, { fileSystemPath: folder })
++    );
++    expect(await service.IsConfigured()).to.equal(false);
++    await fs.ensureDir(folder);
++    expect(await service.IsConfigured()).to.equal(true);
++  });
++});
+-- 
+2.43.0
+

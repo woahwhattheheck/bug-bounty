@@ -1,0 +1,572 @@
+From 291e784eb18b1b2e934f02f829ea9f86932528a4 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:47:30 +0000
+Subject: [PATCH] Show drawings in the viewport as they print
+
+Checking how annotations, styles, symbols, hatches and text sizes come
+out required opening the generated SVG outside of Bonsai after every
+change. The new Print Preview toggle in the Active Drawing panel
+renders the generated drawing SVG to an image and shows it in front of
+the drawing camera view, matching the camera frame, with an adjustable
+opacity. The preview is refreshed whenever the drawing is created and
+restored when a drawing is activated.
+
+Rendering uses the new "SVG to PNG Command" preference, falling back
+to Inkscape or rsvg-convert when found.
+
+Closes #6422.
+
+Generated with the assistance of an AI coding tool.
+---
+ .../bonsai/bim/module/drawing/__init__.py     |   1 +
+ .../bonsai/bim/module/drawing/operator.py     |  53 +++++
+ src/bonsai/bonsai/bim/module/drawing/prop.py  |  23 ++
+ src/bonsai/bonsai/bim/module/drawing/ui.py    |   9 +
+ src/bonsai/bonsai/bim/ui.py                   |  11 +
+ src/bonsai/bonsai/tool/drawing.py             | 118 ++++++++++
+ .../test/tool/test_drawing_print_preview.py   | 210 ++++++++++++++++++
+ 7 files changed, 425 insertions(+)
+ create mode 100644 src/bonsai/test/tool/test_drawing_print_preview.py
+
+diff --git a/src/bonsai/bonsai/bim/module/drawing/__init__.py b/src/bonsai/bonsai/bim/module/drawing/__init__.py
+index 1bca9ea..1aa5696 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/__init__.py
++++ b/src/bonsai/bonsai/bim/module/drawing/__init__.py
+@@ -50,6 +50,7 @@ classes = (
+     operator.CopyAnnotationToDrawing,
+     operator.CopyTextToSelection,
+     operator.CreateDrawing,
++    operator.TogglePrintPreview,
+     operator.CreateSheets,
+     operator.DisableAddAnnotationType,
+     operator.DisableEditingAssignedProduct,
+diff --git a/src/bonsai/bonsai/bim/module/drawing/operator.py b/src/bonsai/bonsai/bim/module/drawing/operator.py
+index ee95603..e17c6cd 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/operator.py
++++ b/src/bonsai/bonsai/bim/module/drawing/operator.py
+@@ -482,6 +482,9 @@ class CreateDrawing(bpy.types.Operator):
+                 with profile("Combine SVG layers"):
+                     svg_path = self.combine_svgs(context, underlay_svg, linework_svg, annotation_svg)
+ 
++            if self.props.should_show_print_preview and not tool.Drawing.update_print_preview(self.drawing):
++                self.report({"WARNING"}, f"Failed to refresh print preview of drawing '{self.drawing_name}'.")
++
+             if self.open_viewer:
+                 drawing_uri = tool.Drawing.get_document_uri(tool.Drawing.get_drawing_document(self.drawing))
+                 tool.Drawing.open_with_user_command(tool.Blender.get_addon_preferences().svg_command, drawing_uri)
+@@ -1867,6 +1870,55 @@ class CreateDrawing(bpy.types.Operator):
+         return drawing_path
+ 
+ 
++class TogglePrintPreview(bpy.types.Operator):
++    bl_idname = "bim.toggle_print_preview"
++    bl_label = "Toggle Print Preview"
++    bl_options = {"REGISTER", "UNDO"}
++    bl_description = (
++        "Show the active drawing in its camera view as it prints, with line weights, hatches, text and symbols.\n\n"
++        "The preview is refreshed every time the drawing is created. It is rendered using the "
++        '"svg2png_command" from the Bonsai preferences, or Inkscape or rsvg-convert if found'
++    )
++
++    @classmethod
++    def poll(cls, context):
++        if not tool.Ifc.get() or not tool.Drawing.is_drawing_active():
++            cls.poll_message_set("No active drawing.")
++            return False
++        return True
++
++    def execute(self, context):
++        dprops = tool.Drawing.get_document_props()
++        if dprops.should_show_print_preview:
++            dprops.should_show_print_preview = False
++            for drawing in tool.Ifc.get().by_type("IfcAnnotation"):
++                if drawing.ObjectType == "DRAWING" and (camera := tool.Ifc.get_object(drawing)):
++                    tool.Drawing.remove_print_preview(camera)
++            return {"FINISHED"}
++
++        assert context.scene and (camera := context.scene.camera)
++        drawing = tool.Ifc.get_entity(camera)
++        assert drawing
++        dprops.should_show_print_preview = True
++        svg = tool.Drawing.get_document_uri(tool.Drawing.get_drawing_document(drawing))
++        if svg and os.path.isfile(svg):
++            tool.Drawing.update_print_preview(drawing)
++        else:
++            # Creating the drawing also shows the preview.
++            bpy.ops.bim.create_drawing()
++
++        assert (camera := context.scene.camera) and isinstance(camera.data, bpy.types.Camera)
++        if not tool.Drawing.get_print_preview_background(camera.data):
++            dprops.should_show_print_preview = False
++            self.report(
++                {"ERROR"},
++                "Failed to render the drawing preview. Install Inkscape or rsvg-convert "
++                'or set "SVG to PNG Command" in the Bonsai preferences.',
++            )
++            return {"CANCELLED"}
++        return {"FINISHED"}
++
++
+ class AddAnnotation(bpy.types.Operator, tool.Ifc.Operator):
+     bl_idname = "bim.add_annotation"
+     bl_label = "Add Annotation"
+@@ -2624,6 +2676,7 @@ class ActivateDrawingBase(tool.Ifc.Operator):
+             if is_reflected:
+                 camera.scale = (-1, -1, -1)
+ 
++        tool.Drawing.sync_print_preview(drawing)
+         return {"FINISHED"}
+ 
+ 
+diff --git a/src/bonsai/bonsai/bim/module/drawing/prop.py b/src/bonsai/bonsai/bim/module/drawing/prop.py
+index c80f6e8..8be3763 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/prop.py
++++ b/src/bonsai/bonsai/bim/module/drawing/prop.py
+@@ -221,6 +221,13 @@ def update_has_underlay(self: "BIMCameraProperties", context: bpy.types.Context)
+         bpy.ops.bim.activate_drawing_style()
+ 
+ 
++def update_print_preview_opacity(self: "DocProperties", context: bpy.types.Context) -> None:
++    assert context.scene
++    if (camera := context.scene.camera) and isinstance(camera.data, bpy.types.Camera):
++        if background := tool.Drawing.get_print_preview_background(camera.data):
++            background.alpha = self.print_preview_opacity
++
++
+ def get_update_layer_callback(
+     camera_prop_name: str, pset_prop_name: str
+ ) -> Callable[["BIMCameraProperties", bpy.types.Context], None]:
+@@ -438,6 +445,20 @@ class DocProperties(PropertyGroup):
+     active_sheet_index: IntProperty(name="Active Sheet Index")
+     drawing_styles: CollectionProperty(name="Drawing Styles", type=DrawingStyle)
+     should_draw_decorations: BoolProperty(name="Should Draw Decorations", update=update_should_draw_decorations)
++    should_show_print_preview: BoolProperty(
++        name="Show Print Preview",
++        description="Show the active drawing in its camera view as it prints. Global option for all drawings.",
++        default=False,
++    )
++    print_preview_opacity: FloatProperty(
++        name="Print Preview Opacity",
++        description="Global option for all drawings.",
++        min=0.0,
++        max=1.0,
++        default=1.0,
++        subtype="FACTOR",
++        update=update_print_preview_opacity,
++    )
+ 
+     if TYPE_CHECKING:
+         should_use_underlay_cache: bool
+@@ -464,6 +485,8 @@ class DocProperties(PropertyGroup):
+         active_sheet_index: int
+         drawing_styles: bpy.types.bpy_prop_collection_idprop[DrawingStyle]
+         should_draw_decorations: bool
++        should_show_print_preview: bool
++        print_preview_opacity: float
+ 
+     def get_active_drawing(self) -> Union[ifcopenshell.entity_instance, None]:
+         drawing_id = self.active_drawing_id
+diff --git a/src/bonsai/bonsai/bim/module/drawing/ui.py b/src/bonsai/bonsai/bim/module/drawing/ui.py
+index 42cb737..fdd00b1 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/ui.py
++++ b/src/bonsai/bonsai/bim/module/drawing/ui.py
+@@ -73,6 +73,15 @@ class BIM_PT_camera(Panel):
+         row = col.row(align=True)
+         row.prop(props, "has_annotation", icon="MOD_EDGESPLIT")
+         row.prop(dprops, "should_use_annotation_cache", text="", icon="FILE_REFRESH")
++        row = col.row(align=True)
++        row.operator(
++            "bim.toggle_print_preview",
++            text="Print Preview",
++            icon="IMAGE_BACKGROUND",
++            depress=dprops.should_show_print_preview,
++        )
++        if dprops.should_show_print_preview:
++            row.prop(dprops, "print_preview_opacity", text="")
+ 
+         # Drawing linked projects.
+         row = col.row(align=True)
+diff --git a/src/bonsai/bonsai/bim/ui.py b/src/bonsai/bonsai/bim/ui.py
+index 82dc624..7e7096e 100644
+--- a/src/bonsai/bonsai/bim/ui.py
++++ b/src/bonsai/bonsai/bim/ui.py
+@@ -417,6 +417,15 @@ class BIM_ADDON_preferences(bpy.types.AddonPreferences):
+             '\n `"svg"`, `"pdf"` will be replaced automatically.'
+         ),
+     )
++    svg2png_command: StringProperty(
++        name="SVG to PNG Command",
++        description=(
++            "Used to show drawings in the viewport as they print. Leave blank to use Inkscape or rsvg-convert, if found. "
++            'E.g. [["path to application eg. /Applications/Inkscape.app/Contents/MacOS/inkscape", "svg", '
++            '"--export-type=png", "--export-dpi", "dpi", "--export-filename", "png"]]'
++            '\n `"svg"`, `"png"`, `"dpi"` will be replaced automatically.'
++        ),
++    )
+     svg2dxf_command: StringProperty(
+         name="SVG to DXF Command",
+         description=(
+@@ -700,6 +709,7 @@ class BIM_ADDON_preferences(bpy.types.AddonPreferences):
+ 
+     if TYPE_CHECKING:
+         svg2pdf_command: str
++        svg2png_command: str
+         svg2dxf_command: str
+         svg_command: str
+         layout_svg_command: str
+@@ -770,6 +780,7 @@ class BIM_ADDON_preferences(bpy.types.AddonPreferences):
+ 
+     def draw_commands(self, layout: bpy.types.UILayout, context: bpy.types.Context) -> None:
+         layout.prop(self, "svg2pdf_command")
++        layout.prop(self, "svg2png_command")
+         layout.prop(self, "svg2dxf_command")
+         layout.prop(self, "svg_command")
+         layout.prop(self, "layout_svg_command")
+diff --git a/src/bonsai/bonsai/tool/drawing.py b/src/bonsai/bonsai/tool/drawing.py
+index 3c54e53..dabbc09 100644
+--- a/src/bonsai/bonsai/tool/drawing.py
++++ b/src/bonsai/bonsai/tool/drawing.py
+@@ -1343,6 +1343,124 @@ class Drawing(bonsai.core.tool.Drawing):
+     def open_layout_svg(cls, uri: str) -> None:
+         cls.open_with_user_command(tool.Blender.get_addon_preferences().layout_svg_command, uri)
+ 
++    PRINT_PREVIEW_IMAGE_PROP = "BIMPrintPreview"
++    PRINT_PREVIEW_MAX_SIZE_PX = 4096
++
++    @classmethod
++    def get_svg2png_commands(cls) -> Union[list[list[str]], None]:
++        if command := tool.Blender.get_addon_preferences().svg2png_command:
++            return json.loads(command)
++        if inkscape := shutil.which("inkscape"):
++            return [[inkscape, "svg", "--export-type=png", "--export-dpi", "dpi", "--export-filename", "png"]]
++        if rsvg_convert := shutil.which("rsvg-convert"):
++            return [[rsvg_convert, "--dpi-x", "dpi", "--dpi-y", "dpi", "--output", "png", "svg"]]
++        return None
++
++    @classmethod
++    def get_print_preview_dpi(cls, svg: str) -> int:
++        """Get the resolution to render the drawing at, keeping big drawings to a reasonable image size."""
++        root = etree.parse(svg).getroot()
++        try:
++            size_mm = max(float(re.match(r"[\d.]+", root.attrib[a]).group()) for a in ("width", "height"))
++        except (KeyError, AttributeError, ValueError):
++            return 96
++        dpi = cls.PRINT_PREVIEW_MAX_SIZE_PX / (size_mm / 25.4) if size_mm else 96
++        return round(max(36, min(300, dpi)))
++
++    @classmethod
++    def rasterize_svg(cls, svg: str, png: str, dpi: int) -> bool:
++        if not (commands := cls.get_svg2png_commands()):
++            return False
++        if os.path.exists(png):
++            os.remove(png)
++        os.makedirs(os.path.dirname(png), exist_ok=True)
++        replacements = {"svg": svg, "png": png, "dpi": str(dpi)}
++        for command in commands:
++            try:
++                subprocess.run([replacements.get(c, c) for c in command])
++            except OSError as e:
++                print(f"Failed to run SVG to PNG command: {e}")
++                return False
++        return os.path.isfile(png)
++
++    @classmethod
++    def get_print_preview_background(cls, camera: bpy.types.Camera) -> Union[bpy.types.CameraBackgroundImage, None]:
++        for background in camera.background_images:
++            if background.image and background.image.get(cls.PRINT_PREVIEW_IMAGE_PROP):
++                return background
++
++    @classmethod
++    def get_print_preview_path(cls, drawing: ifcopenshell.entity_instance) -> str:
++        return os.path.join(bpy.app.tempdir, "print_previews", f"{drawing.GlobalId}.png")
++
++    @classmethod
++    def update_print_preview(cls, drawing: ifcopenshell.entity_instance) -> bool:
++        """Render the drawing's generated SVG and show it in the drawing camera view, as it prints.
++
++        :return: False if there is no SVG to show or it couldn't be rendered.
++        """
++        svg = cls.get_document_uri(cls.get_drawing_document(drawing))
++        if not svg or not os.path.isfile(svg):
++            return False
++        png = cls.get_print_preview_path(drawing)
++        if not cls.rasterize_svg(svg, png, cls.get_print_preview_dpi(svg)):
++            return False
++        camera = tool.Ifc.get_object(drawing)
++        assert isinstance(camera, bpy.types.Object)
++        cls.show_print_preview(camera, png)
++        return True
++
++    @classmethod
++    def show_print_preview(cls, camera: bpy.types.Object, png: str) -> None:
++        assert isinstance(camera.data, bpy.types.Camera)
++        if background := cls.get_print_preview_background(camera.data):
++            image = background.image
++            image.filepath = png
++            image.reload()
++        else:
++            image = bpy.data.images.load(png, check_existing=True)
++            image.reload()
++            image[cls.PRINT_PREVIEW_IMAGE_PROP] = True
++            background = camera.data.background_images.new()
++            background.image = image
++        image.name = f"{camera.name} Print Preview"
++        background.display_depth = "FRONT"
++        # Drawing SVG covers exactly the camera frame.
++        background.frame_method = "STRETCH"
++        background.alpha = cls.get_document_props().print_preview_opacity
++        background.show_background_image = True
++        camera.data.show_background_images = True
++
++    @classmethod
++    def sync_print_preview(cls, drawing: ifcopenshell.entity_instance) -> None:
++        """Make sure the activated drawing shows its print preview, if enabled.
++
++        Camera data can be recreated (e.g. if drawing size has changed), which loses the preview.
++        """
++        if not cls.get_document_props().should_show_print_preview:
++            return
++        camera = tool.Ifc.get_object(drawing)
++        assert isinstance(camera, bpy.types.Object) and isinstance(camera.data, bpy.types.Camera)
++        if cls.get_print_preview_background(camera.data):
++            return
++        if os.path.isfile(png := cls.get_print_preview_path(drawing)):
++            cls.show_print_preview(camera, png)
++        else:
++            cls.update_print_preview(drawing)
++
++    @classmethod
++    def remove_print_preview(cls, camera: bpy.types.Object) -> None:
++        assert isinstance(camera.data, bpy.types.Camera)
++        if not (background := cls.get_print_preview_background(camera.data)):
++            return
++        image = background.image
++        camera.data.background_images.remove(background)
++        if image:
++            # The image is only used for the preview.
++            bpy.data.images.remove(image)
++        if not len(camera.data.background_images):
++            camera.data.show_background_images = False
++
+     @classmethod
+     def run_root_assign_class(
+         cls,
+diff --git a/src/bonsai/test/tool/test_drawing_print_preview.py b/src/bonsai/test/tool/test_drawing_print_preview.py
+new file mode 100644
+index 0000000..798d76a
+--- /dev/null
++++ b/src/bonsai/test/tool/test_drawing_print_preview.py
+@@ -0,0 +1,210 @@
++# This file was generated with the assistance of an AI coding tool.
++# Bonsai - OpenBIM Blender Add-on
++# Copyright (C) 2026 Bonsai contributors
++#
++# This file is part of Bonsai.
++#
++# Bonsai is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Bonsai is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
++
++import json
++import os
++import sys
++
++import bpy
++import pytest
++
++import bonsai.tool as tool
++from bonsai.tool.drawing import Drawing as subject
++from test.bim.bootstrap import NewFile
++
++# Stands in for Inkscape: writes a small PNG and logs each call next to it.
++FAKE_SVG2PNG = (
++    "import sys; from PIL import Image; Image.new('RGBA', (8, 8)).save(sys.argv[2]); "
++    "open(sys.argv[2] + '.log', 'a').write(sys.argv[1] + ' ' + sys.argv[3] + chr(10))"
++)
++
++
++class PrintPreviewFile(NewFile):
++    @pytest.fixture(autouse=True)
++    def setup_print_preview(self, setup, monkeypatch):
++        prefs = tool.Blender.get_addon_preferences()
++        monkeypatch.setattr(
++            prefs, "svg2png_command", json.dumps([[sys.executable, "-c", FAKE_SVG2PNG, "svg", "png", "dpi"]])
++        )
++        bpy.ops.bim.create_project()
++        tool.Project.save_test_project()
++        bpy.ops.bim.load_drawings()
++        bpy.ops.bim.add_drawing()
++        self.drawing = next(e for e in tool.Ifc.get().by_type("IfcAnnotation") if e.ObjectType == "DRAWING")
++        bpy.ops.bim.activate_drawing(drawing=self.drawing.id())
++        self.camera = tool.Ifc.get_object(self.drawing)
++        self.svg = tool.Drawing.get_document_uri(tool.Drawing.get_drawing_document(self.drawing))
++
++    def get_render_calls(self) -> list[str]:
++        background = subject.get_print_preview_background(self.camera.data)
++        log = bpy.path.abspath(background.image.filepath) + ".log"
++        with open(log) as f:
++            return f.read().splitlines()
++
++
++class TestGetPrintPreviewDpi(NewFile):
++    @pytest.mark.parametrize(
++        "width, height, dpi",
++        [("500.0mm", "300.0mm", 208), ("2000mm", "1000mm", 52), ("50mm", "50mm", 300), ("100000mm", "10mm", 36)],
++    )
++    def test_run(self, tmp_path, width, height, dpi):
++        svg = tmp_path / "drawing.svg"
++        svg.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"></svg>')
++        assert subject.get_print_preview_dpi(str(svg)) == dpi
++
++    def test_missing_size(self, tmp_path):
++        svg = tmp_path / "drawing.svg"
++        svg.write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>')
++        assert subject.get_print_preview_dpi(str(svg)) == 96
++
++
++class TestGetSvg2PngCommands(NewFile):
++    def test_using_the_command_from_preferences(self, monkeypatch):
++        prefs = tool.Blender.get_addon_preferences()
++        monkeypatch.setattr(prefs, "svg2png_command", '[["converter", "svg", "png"]]')
++        assert subject.get_svg2png_commands() == [["converter", "svg", "png"]]
++
++    def test_falling_back_to_inkscape_or_rsvg_convert(self, monkeypatch):
++        prefs = tool.Blender.get_addon_preferences()
++        monkeypatch.setattr(prefs, "svg2png_command", "")
++        monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}" if name == "rsvg-convert" else None)
++        assert subject.get_svg2png_commands() == [
++            ["/bin/rsvg-convert", "--dpi-x", "dpi", "--dpi-y", "dpi", "--output", "png", "svg"]
++        ]
++        monkeypatch.setattr("shutil.which", lambda name: f"/bin/{name}")
++        assert subject.get_svg2png_commands()[0][0] == "/bin/inkscape"
++        monkeypatch.setattr("shutil.which", lambda name: None)
++        assert subject.get_svg2png_commands() is None
++
++
++class TestUpdatePrintPreview(PrintPreviewFile):
++    def test_run(self):
++        bpy.ops.bim.create_drawing()
++        assert subject.update_print_preview(self.drawing) is True
++
++        camera_data = self.camera.data
++        assert camera_data.show_background_images
++        assert len(camera_data.background_images) == 1
++        background = subject.get_print_preview_background(camera_data)
++        assert background.display_depth == "FRONT"
++        assert background.frame_method == "STRETCH"
++        assert background.alpha == 1.0
++        assert background.image.size[:] == (8, 8)
++        assert self.get_render_calls() == [f"{self.svg} 208"]
++
++    def test_refreshing_the_existing_preview(self):
++        bpy.ops.bim.create_drawing()
++        subject.update_print_preview(self.drawing)
++        image = subject.get_print_preview_background(self.camera.data).image
++        subject.update_print_preview(self.drawing)
++        assert len(self.camera.data.background_images) == 1
++        assert subject.get_print_preview_background(self.camera.data).image == image
++        assert len(self.get_render_calls()) == 2
++
++    def test_converter_not_found(self, monkeypatch):
++        bpy.ops.bim.create_drawing()
++        prefs = tool.Blender.get_addon_preferences()
++        monkeypatch.setattr(prefs, "svg2png_command", '[["/nonexistent/inkscape", "svg", "png"]]')
++        assert subject.update_print_preview(self.drawing) is False
++
++    def test_no_drawing_created_yet(self):
++        assert subject.update_print_preview(self.drawing) is False
++        assert not self.camera.data.background_images
++
++    def test_failing_to_render(self, monkeypatch):
++        bpy.ops.bim.create_drawing()
++        prefs = tool.Blender.get_addon_preferences()
++        monkeypatch.setattr(prefs, "svg2png_command", json.dumps([[sys.executable, "-c", "pass"]]))
++        assert subject.update_print_preview(self.drawing) is False
++        assert not self.camera.data.background_images
++
++
++class TestRemovePrintPreview(PrintPreviewFile):
++    def test_run(self):
++        bpy.ops.bim.create_drawing()
++        subject.update_print_preview(self.drawing)
++        image_name = subject.get_print_preview_background(self.camera.data).image.name
++        other_background = self.camera.data.background_images.new()
++
++        subject.remove_print_preview(self.camera)
++
++        assert list(self.camera.data.background_images) == [other_background]
++        assert self.camera.data.show_background_images
++        assert image_name not in bpy.data.images
++
++
++class TestTogglePrintPreview(PrintPreviewFile):
++    def test_run(self):
++        dprops = tool.Drawing.get_document_props()
++        # Drawing wasn't created yet, so it's created to show the preview.
++        bpy.ops.bim.toggle_print_preview()
++        assert dprops.should_show_print_preview
++        assert os.path.isfile(self.svg)
++        assert subject.get_print_preview_background(self.camera.data)
++
++        bpy.ops.bim.toggle_print_preview()
++        assert not dprops.should_show_print_preview
++        assert not self.camera.data.background_images
++        assert not self.camera.data.show_background_images
++
++    def test_creating_the_drawing_refreshes_the_preview(self):
++        bpy.ops.bim.toggle_print_preview()
++        assert len(self.get_render_calls()) == 1
++        bpy.ops.bim.create_drawing()
++        assert len(self.get_render_calls()) == 2
++
++    def test_changing_opacity(self):
++        bpy.ops.bim.toggle_print_preview()
++        tool.Drawing.get_document_props().print_preview_opacity = 0.25
++        assert subject.get_print_preview_background(self.camera.data).alpha == 0.25
++
++    def test_failing_to_render(self, monkeypatch):
++        prefs = tool.Blender.get_addon_preferences()
++        monkeypatch.setattr(prefs, "svg2png_command", json.dumps([[sys.executable, "-c", "pass"]]))
++        with pytest.raises(RuntimeError, match="Failed to render the drawing preview"):
++            bpy.ops.bim.toggle_print_preview()
++        assert not tool.Drawing.get_document_props().should_show_print_preview
++
++
++class TestSyncPrintPreview(PrintPreviewFile):
++    def test_activating_another_drawing_shows_its_preview(self):
++        bpy.ops.bim.toggle_print_preview()
++        bpy.ops.bim.add_drawing()
++        other_drawing = [e for e in tool.Ifc.get().by_type("IfcAnnotation") if e.ObjectType == "DRAWING"][1]
++        bpy.ops.bim.activate_drawing(drawing=other_drawing.id())
++        bpy.ops.bim.create_drawing()
++
++        other_camera = tool.Ifc.get_object(other_drawing)
++        assert subject.get_print_preview_background(other_camera.data)
++        # Previous drawing keeps its preview too.
++        assert subject.get_print_preview_background(self.camera.data)
++
++    def test_restoring_the_preview_when_camera_data_is_recreated(self):
++        bpy.ops.bim.toggle_print_preview()
++        tool.Drawing.get_camera_props(self.camera).width = 20
++        # Activating the drawing saves its new size, which recreates the camera data.
++        bpy.ops.bim.activate_drawing(drawing=self.drawing.id())
++        assert subject.get_print_preview_background(self.camera.data)
++        # Already rendered preview is reused.
++        assert len(self.get_render_calls()) == 1
++
++    def test_print_preview_is_disabled(self):
++        bpy.ops.bim.create_drawing()
++        subject.sync_print_preview(self.drawing)
++        assert not self.camera.data.background_images
+-- 
+2.43.0
+

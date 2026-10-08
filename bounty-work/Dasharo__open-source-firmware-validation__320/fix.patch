@@ -1,0 +1,139 @@
+From 8dfcac3d536f0ec420f0c99b18f9417e496b5ba5 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 06:03:57 +0000
+Subject: [PATCH] scripts: Run QEMU regression through regression.sh
+
+Fold the QEMU suite list from scripts/regression-qemu.sh into
+scripts/regression.sh behind CONFIG=qemu and remove the separate script,
+so every platform is run through one regression entry point (#320).
+
+The QEMU path runs the same eight suites in the same order, keeps the
+previous defaults (RTE_IP=127.0.0.1, SNIPEIT_NO=no), and needs neither
+FW_FILE nor DEVICE_IP. Other CONFIG values take the unchanged full path.
+Extra arguments are forwarded to each robot run.
+
+Document the unified command in docs/qemu.md.
+
+Closes #320
+---
+ docs/qemu.md               |  8 ++++++++
+ scripts/regression-qemu.sh | 38 --------------------------------------
+ scripts/regression.sh      | 38 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 46 insertions(+), 38 deletions(-)
+ delete mode 100755 scripts/regression-qemu.sh
+
+diff --git a/docs/qemu.md b/docs/qemu.md
+index 6f8373f..67b59f6 100644
+--- a/docs/qemu.md
++++ b/docs/qemu.md
+@@ -67,6 +67,14 @@ robot -b command_log.txt -v snipeit:no -L TRACE -v config:qemu -v rte_ip:127.0.0
+ > is being used. Use QEMU config `-v config:qemu`, and, as a RTE IP, use
+ > `127.0.0.1`. Test suite `dts/dts-tests.robot` is shown here as an example.
+ 
++To run the QEMU-capable compatibility and security suites in one command, set
++`CONFIG=qemu` and use the shared regression wrapper. It needs no firmware file
++or device IP, and it sets `RTE_IP=127.0.0.1` itself:
++
++```bash
++CONFIG=qemu ./scripts/regression.sh
++```
++
+ ## Connecting to the machine
+ 
+ The machine's serial port is available over Telnet on `127.0.0.1:1234`.
+diff --git a/scripts/regression-qemu.sh b/scripts/regression-qemu.sh
+deleted file mode 100755
+index 7c73c17..0000000
+--- a/scripts/regression-qemu.sh
++++ /dev/null
+@@ -1,38 +0,0 @@
+-#!/usr/bin/env bash
+-
+-# SPDX-FileCopyrightText: 2024 3mdeb <contact@3mdeb.com>
+-#
+-# SPDX-License-Identifier: Apache-2.0
+-
+-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+-source "${SCRIPT_DIR}/lib/robot.sh"
+-
+-export RTE_IP=127.0.0.1
+-export CONFIG="qemu"
+-export SNIPEIT_NO="no"
+-
+-compatibility_tests=(
+-  "dasharo-compatibility/custom-boot-menu-key.robot"
+-  "dasharo-compatibility/uefi-shell.robot"
+-  "dasharo-compatibility/network-boot.robot"
+-  "dasharo-compatibility/dmidecode.robot"
+-  # FIXME: unsafe to enable https://github.com/Dasharo/dasharo-issues/issues/887
+-  #"dasharo-compatibility/reset-to-defaults.robot"
+-)
+-
+-security_tests=(
+-  "dasharo-security/network-stack.robot"
+-  "dasharo-security/secure-boot.robot"
+-  "dasharo-security/measured-boot.robot"
+-  "dasharo-security/uefi-password.robot"
+-)
+-
+-# Compatibility tests
+-for test in "${compatibility_tests[@]}"; do
+-    execute_robot "$test"
+-done
+-
+-# Security tests
+-for test in "${security_tests[@]}"; do
+-    execute_robot "$test"
+-done
+diff --git a/scripts/regression.sh b/scripts/regression.sh
+index 6b1e32b..ca396ce 100755
+--- a/scripts/regression.sh
++++ b/scripts/regression.sh
+@@ -7,6 +7,44 @@
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ source "${SCRIPT_DIR}/lib/robot.sh"
+ 
++# QEMU regression (CONFIG=qemu) runs the QEMU-capable compatibility and
++# security suites against the local QEMU instance. It needs neither FW_FILE
++# nor DEVICE_IP. This replaces the former scripts/regression-qemu.sh.
++run_qemu_regression() {
++    export RTE_IP=127.0.0.1
++    export SNIPEIT_NO="no"
++
++    local compatibility_tests=(
++        "dasharo-compatibility/custom-boot-menu-key.robot"
++        "dasharo-compatibility/uefi-shell.robot"
++        "dasharo-compatibility/network-boot.robot"
++        "dasharo-compatibility/dmidecode.robot"
++        # FIXME: unsafe to enable https://github.com/Dasharo/dasharo-issues/issues/887
++        #"dasharo-compatibility/reset-to-defaults.robot"
++    )
++
++    local security_tests=(
++        "dasharo-security/network-stack.robot"
++        "dasharo-security/secure-boot.robot"
++        "dasharo-security/measured-boot.robot"
++        "dasharo-security/uefi-password.robot"
++    )
++
++    local test
++    for test in "${compatibility_tests[@]}"; do
++        execute_robot "$test" "${@}"
++    done
++
++    for test in "${security_tests[@]}"; do
++        execute_robot "$test" "${@}"
++    done
++}
++
++if [ "$CONFIG" = "qemu" ]; then
++    run_qemu_regression "${@}"
++    exit $?
++fi
++
+ # FW_FILE and DEVICE_IP are required for full regression
+ check_env_variable "FW_FILE"
+ check_env_variable "DEVICE_IP"
+-- 
+2.43.0
+

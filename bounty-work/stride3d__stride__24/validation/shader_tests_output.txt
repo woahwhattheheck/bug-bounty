@@ -1,0 +1,7 @@
+  Passed Stride.Shaders.Parsers.Tests.StrideShaderTests.DecalProjectionForwardShadingCompiles(normalMap: True, vulkan: True) [11 s]
+  Passed Stride.Shaders.Parsers.Tests.StrideShaderTests.DecalProjectionForwardShadingCompiles(normalMap: False, vulkan: False) [3 s]
+  Passed Stride.Shaders.Parsers.Tests.StrideShaderTests.DecalProjectionForwardShadingCompiles(normalMap: False, vulkan: True) [2 s]
+  Passed Stride.Shaders.Parsers.Tests.StrideShaderTests.DecalProjectionForwardShadingCompiles(normalMap: True, vulkan: False) [2 s]
+Test Run Successful.
+Total tests: 4
+     Passed: 4

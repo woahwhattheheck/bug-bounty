@@ -1,0 +1,522 @@
+From 97ef28ff5a7eb8ef2a4820b781286f37fac7f2c8 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:39:38 +0000
+Subject: [PATCH 1/3] style(cei): apply rustfmt to the CEI model and rule
+
+CI runs `cargo fmt --all --check`; the CEI model, the cei_violation
+rule and the `pub mod` ordering in rules/mod.rs were not rustfmt-clean.
+Formatting only, no behaviour change.
+
+Refs #336, #310, #325
+---
+ tooling/sanctifier-core/src/reentrancy.rs     | 127 +++++++++++++-----
+ .../src/rules/cei_violation.rs                |  16 ++-
+ tooling/sanctifier-core/src/rules/mod.rs      |   2 +-
+ 3 files changed, 103 insertions(+), 42 deletions(-)
+
+diff --git a/tooling/sanctifier-core/src/reentrancy.rs b/tooling/sanctifier-core/src/reentrancy.rs
+index 9b32c7a..99bb2d6 100644
+--- a/tooling/sanctifier-core/src/reentrancy.rs
++++ b/tooling/sanctifier-core/src/reentrancy.rs
+@@ -64,13 +64,19 @@ impl CeiModel {
+     }
+ 
+     pub fn effects(&self) -> Vec<&CeiEvent> {
+-        self.paths.iter().flat_map(|p| p.events.iter())
+-            .filter(|event| event.kind == CeiKind::Effect).collect()
++        self.paths
++            .iter()
++            .flat_map(|p| p.events.iter())
++            .filter(|event| event.kind == CeiKind::Effect)
++            .collect()
+     }
+ 
+     pub fn interactions(&self) -> Vec<&CeiEvent> {
+-        self.paths.iter().flat_map(|p| p.events.iter())
+-            .filter(|event| event.kind == CeiKind::Interaction).collect()
++        self.paths
++            .iter()
++            .flat_map(|p| p.events.iter())
++            .filter(|event| event.kind == CeiKind::Interaction)
++            .collect()
+     }
+ }
+ 
+@@ -95,7 +101,10 @@ impl ModelCollector {
+         let mut bindings = Bindings::default();
+         bindings.visit_block(block);
+         let paths = analyze_block(block, vec![CeiPath::default()], &bindings);
+-        self.models.push(CeiModel { function: name.into(), paths });
++        self.models.push(CeiModel {
++            function: name.into(),
++            paths,
++        });
+     }
+ }
+ 
+@@ -140,10 +149,18 @@ fn client_constructor(expr: &Expr) -> bool {
+     match expr {
+         Expr::Call(call) => match &*call.func {
+             Expr::Path(path) => {
+-                let segments: Vec<String> = path.path.segments.iter()
+-                    .map(|part| part.ident.to_string()).collect();
++                let segments: Vec<String> = path
++                    .path
++                    .segments
++                    .iter()
++                    .map(|part| part.ident.to_string())
++                    .collect();
+                 segments.last().is_some_and(|last| last == "new")
+-                    && segments.iter().rev().skip(1).any(|part| part == "Client" || part.ends_with("Client"))
++                    && segments
++                        .iter()
++                        .rev()
++                        .skip(1)
++                        .any(|part| part == "Client" || part.ends_with("Client"))
+             }
+             _ => false,
+         },
+@@ -156,8 +173,7 @@ fn client_constructor(expr: &Expr) -> bool {
+ 
+ fn binding_ident(expr: &Expr) -> Option<String> {
+     match expr {
+-        Expr::Path(p) if p.path.segments.len() == 1 =>
+-            Some(p.path.segments[0].ident.to_string()),
++        Expr::Path(p) if p.path.segments.len() == 1 => Some(p.path.segments[0].ident.to_string()),
+         Expr::Reference(e) => binding_ident(&e.expr),
+         Expr::Paren(e) => binding_ident(&e.expr),
+         Expr::Group(e) => binding_ident(&e.expr),
+@@ -168,8 +184,10 @@ fn binding_ident(expr: &Expr) -> Option<String> {
+ fn storage_handle(expr: &Expr, bindings: &Bindings) -> bool {
+     match expr {
+         Expr::MethodCall(call) => {
+-            matches!(call.method.to_string().as_str(), "storage" | "persistent" | "temporary" | "instance")
+-                || storage_handle(&call.receiver, bindings)
++            matches!(
++                call.method.to_string().as_str(),
++                "storage" | "persistent" | "temporary" | "instance"
++            ) || storage_handle(&call.receiver, bindings)
+         }
+         Expr::Reference(e) => storage_handle(&e.expr, bindings),
+         Expr::Paren(e) => storage_handle(&e.expr, bindings),
+@@ -185,7 +203,8 @@ fn client_receiver(expr: &Expr, bindings: &Bindings) -> bool {
+     if let Some(name) = binding_ident(expr) {
+         // Generated clients are often named *_client, sac or token. This
+         // convention also captures arguments typed as a generated client.
+-        return bindings.clients.contains(&name) || name.ends_with("_client")
++        return bindings.clients.contains(&name)
++            || name.ends_with("_client")
+             || matches!(name.as_str(), "token" | "sac" | "token_client");
+     }
+     match expr {
+@@ -206,8 +225,10 @@ fn classify_method(node: &syn::ExprMethodCall, bindings: &Bindings) -> Option<Ce
+     } else if matches!(method.as_str(), "invoke_contract" | "try_invoke_contract") {
+         CeiKind::Interaction
+     } else if client_receiver(&node.receiver, bindings)
+-        && !matches!(method.as_str(), "new" | "address" | "clone" | "clone_from"
+-            | "env" | "contract_address")
++        && !matches!(
++            method.as_str(),
++            "new" | "address" | "clone" | "clone_from" | "env" | "contract_address"
++        )
+     {
+         // All generated Client methods issue a host call. In particular SAC
+         // transfer/transfer_from, approve, burn and mint are interactions.
+@@ -215,27 +236,50 @@ fn classify_method(node: &syn::ExprMethodCall, bindings: &Bindings) -> Option<Ce
+     } else {
+         return None;
+     };
+-    Some(CeiEvent { kind, operation: method, line: node.method.span().start().line })
++    Some(CeiEvent {
++        kind,
++        operation: method,
++        line: node.method.span().start().line,
++    })
+ }
+ 
+ fn classify_call(node: &syn::ExprCall) -> Option<CeiEvent> {
+-    let Expr::Path(path) = &*node.func else { return None };
+-    let parts: Vec<String> = path.path.segments.iter()
+-        .map(|p| p.ident.to_string()).collect();
++    let Expr::Path(path) = &*node.func else {
++        return None;
++    };
++    let parts: Vec<String> = path
++        .path
++        .segments
++        .iter()
++        .map(|p| p.ident.to_string())
++        .collect();
+     let last = parts.last()?;
+     let lower = last.to_ascii_lowercase();
+     // Known storage helper names, not unrelated arbitrary calls.
+-    if matches!(lower.as_str(), "write_balance" | "save_balance" | "store_balance"
+-        | "write_state" | "store_state" | "write_storage" | "save_storage")
+-    {
+-        return Some(CeiEvent { kind: CeiKind::Effect, operation: last.clone(),
+-            line: node.span().start().line });
++    if matches!(
++        lower.as_str(),
++        "write_balance"
++            | "save_balance"
++            | "store_balance"
++            | "write_state"
++            | "store_state"
++            | "write_storage"
++            | "save_storage"
++    ) {
++        return Some(CeiEvent {
++            kind: CeiKind::Effect,
++            operation: last.clone(),
++            line: node.span().start().line,
++        });
+     }
+     if (last == "transfer" || last == "transfer_from")
+         && parts.iter().any(|p| p == "Client" || p.ends_with("Client"))
+     {
+-        return Some(CeiEvent { kind: CeiKind::Interaction, operation: last.clone(),
+-            line: node.span().start().line });
++        return Some(CeiEvent {
++            kind: CeiKind::Interaction,
++            operation: last.clone(),
++            line: node.span().start().line,
++        });
+     }
+     None
+ }
+@@ -309,22 +353,31 @@ fn inspect_expr(expr: &Expr, paths: Vec<CeiPath>, bindings: &Bindings) -> Vec<Ce
+             } else {
+                 paths
+             };
+-            result.into_iter().map(|mut path| {
+-                path.terminated = true;
+-                path
+-            }).collect()
++            result
++                .into_iter()
++                .map(|mut path| {
++                    path.terminated = true;
++                    path
++                })
++                .collect()
+         }
+         Expr::Paren(node) => inspect_expr(&node.expr, paths, bindings),
+         Expr::Group(node) => inspect_expr(&node.expr, paths, bindings),
+         _ => {
+-            let mut collector = Events { bindings, events: Vec::new() };
++            let mut collector = Events {
++                bindings,
++                events: Vec::new(),
++            };
+             collector.visit_expr(expr);
+-            paths.into_iter().map(|mut path| {
+-                if !path.terminated {
+-                    path.events.extend(collector.events.iter().cloned());
+-                }
+-                path
+-            }).collect()
++            paths
++                .into_iter()
++                .map(|mut path| {
++                    if !path.terminated {
++                        path.events.extend(collector.events.iter().cloned());
++                    }
++                    path
++                })
++                .collect()
+         }
+     }
+ }
+diff --git a/tooling/sanctifier-core/src/rules/cei_violation.rs b/tooling/sanctifier-core/src/rules/cei_violation.rs
+index e7fa1b7..4448ff8 100644
+--- a/tooling/sanctifier-core/src/rules/cei_violation.rs
++++ b/tooling/sanctifier-core/src/rules/cei_violation.rs
+@@ -8,15 +8,21 @@ use crate::rules::{Rule, RuleViolation, Severity};
+ pub struct CeiViolationRule;
+ 
+ impl CeiViolationRule {
+-    pub fn new() -> Self { Self }
++    pub fn new() -> Self {
++        Self
++    }
+ }
+ 
+ impl Default for CeiViolationRule {
+-    fn default() -> Self { Self::new() }
++    fn default() -> Self {
++        Self::new()
++    }
+ }
+ 
+ impl Rule for CeiViolationRule {
+-    fn name(&self) -> &str { "cei_violation" }
++    fn name(&self) -> &str {
++        "cei_violation"
++    }
+ 
+     fn description(&self) -> &str {
+         "Detects cross-contract or token/SAC interactions before later storage writes"
+@@ -44,7 +50,9 @@ impl Rule for CeiViolationRule {
+             .collect()
+     }
+ 
+-    fn as_any(&self) -> &dyn std::any::Any { self }
++    fn as_any(&self) -> &dyn std::any::Any {
++        self
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/tooling/sanctifier-core/src/rules/mod.rs b/tooling/sanctifier-core/src/rules/mod.rs
+index a88ec65..d530576 100644
+--- a/tooling/sanctifier-core/src/rules/mod.rs
++++ b/tooling/sanctifier-core/src/rules/mod.rs
+@@ -6,9 +6,9 @@ pub mod auth_on_caller;
+ pub mod auth_replay;
+ pub mod balance_equality;
+ pub mod bls_subgroup_check;
++pub mod cei_violation;
+ pub mod contracterror_enum;
+ pub mod cross_contract_call_in_loop;
+-pub mod cei_violation;
+ pub mod division_by_zero;
+ pub mod eager_unwrap_or;
+ pub mod edge_amount;
+-- 
+2.43.0
+
+
+From c213789e5c2b060af3d1df76befbe23932644181 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:39:47 +0000
+Subject: [PATCH 2/3] test(cei): index cei_violation and map it in the
+ differential corpus
+
+Registering cei_violation in RuleRegistry::with_default_rules() trips
+two registry gates that the original change did not update:
+
+- tests/detector_docs_coverage.rs::index_lists_every_detector requires
+  every default detector to be linked from docs/detectors/README.md.
+- tests/differential_test.rs::rule_to_code_map_covers_all_default_rules
+  requires every default rule in sanctifier_rule_to_code.
+
+Adds the cei_violation row to the detector index and maps both the
+rule name and the emitted SANCT_CEI rule_name to SANCT_CEI, matching
+the existing cross_contract_call_in_loop entries. No corpus case is
+added: the gallery reentrancy fixture's interaction is an event
+publish, which cannot call back, so its recorded ground truth is
+unchanged.
+
+Refs #336, #310, #325
+---
+ docs/detectors/README.md                                        | 1 +
+ .../tests/fixtures/corpus/differential-corpus.json              | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/docs/detectors/README.md b/docs/detectors/README.md
+index ef4b9cb..cd16665 100644
+--- a/docs/detectors/README.md
++++ b/docs/detectors/README.md
+@@ -56,6 +56,7 @@ detector page and to the relevant [Glossary](../glossary.md) term.
+ | [`contracterror_enum`](contracterror_enum.md) | [`SANCT_CONTRACTERROR_ENUM`](../error-codes.md) | logic | Warning | Public function returns error enum missing `#[contracterror]` or repr |
+ | [`vesting_schedule`](vesting_schedule.md) | [`SANCT_VESTING_RANGE`](../error-codes.md) | logic | Warning | Schedule duration (`end - start`) not proven `end > start` |
+ | [`cross_contract_call_in_loop`](cross_contract_call_in_loop.md) | [`SANCT_CROSS_CONTRACT_CALL_IN_LOOP`](../error-codes.md) | resource_limits | Warning | Cross-contract call (`invoke_contract` or a `*Client`) issued from inside a loop |
++| [`cei_violation`](cei_violation.md) | [`SANCT_CEI`](../error-codes.md) | reentrancy | Error | Cross-contract / token-SAC call (`invoke_contract` or a `*Client`) before a later storage write on the same path |
+ | [`unbounded_event_emission`](unbounded_event_emission.md) | [`SANCT_UNBOUNDED_EVENT_EMISSION`](../error-codes.md) | resource_limits | Warning | `env.events().publish(..)` issued from inside a loop with no iteration bound |
+ | [`unbounded_input_length`](unbounded_input_length.md) | [`SANCT_UNBOUNDED_INPUT`](../error-codes.md) | denial_of_service | Medium | Caller-sized `Bytes`/`Vec`/`Map` argument whose length is never checked |
+ | [`sep41_allowance_decrement`](sep41_allowance_decrement.md) | [`SANCT_SEP41_ALLOWANCE_NOT_DECREMENTED`](../error-codes.md) | authorization | Error | `transfer_from` reads the allowance but never writes back a decremented value |
+diff --git a/tooling/sanctifier-core/tests/fixtures/corpus/differential-corpus.json b/tooling/sanctifier-core/tests/fixtures/corpus/differential-corpus.json
+index b802fa2..7fb8862 100644
+--- a/tooling/sanctifier-core/tests/fixtures/corpus/differential-corpus.json
++++ b/tooling/sanctifier-core/tests/fixtures/corpus/differential-corpus.json
+@@ -62,6 +62,8 @@
+     "vesting_schedule": "SANCT_VESTING_RANGE",
+     "cross_contract_call_in_loop": "SANCT_CROSS_CONTRACT_CALL_IN_LOOP",
+     "SANCT_CROSS_CONTRACT_CALL_IN_LOOP": "SANCT_CROSS_CONTRACT_CALL_IN_LOOP",
++    "cei_violation": "SANCT_CEI",
++    "SANCT_CEI": "SANCT_CEI",
+     "unbounded_event_emission": "SANCT_UNBOUNDED_EVENT_EMISSION",
+     "SANCT_UNBOUNDED_EVENT_EMISSION": "SANCT_UNBOUNDED_EVENT_EMISSION",
+     "unbounded_input_length": "SANCT_UNBOUNDED_INPUT",
+-- 
+2.43.0
+
+
+From 58dc9edbbbefb8c51c64a4d9802f3fb30c0b3527 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:42:37 +0000
+Subject: [PATCH 3/3] test(cei): add golden snapshot fixture with token/SAC
+ transfers
+
+#310 asks for golden snapshots of vulnerable and safe fixtures and #325
+for fixtures with token transfers. Adds the per-detector fixture used by
+tests/detector_snapshots.rs: SAC transfer through a bound token client,
+inline transfer_from and host invoke_contract before a storage write are
+flagged; write-before-transfer, mutually exclusive branches and an
+event publish before a write stay clean. The reviewed snapshot records
+exactly the three vulnerable entrypoints.
+
+Refs #336, #310, #325
+---
+ docs/detectors/cei_violation.md               |  4 +
+ .../tests/detector_snapshots.rs               | 12 ++-
+ .../tests/fixtures/detectors/cei_violation.rs | 78 +++++++++++++++++++
+ .../detector_snapshots__cei_violation.snap    | 19 +++++
+ 4 files changed, 112 insertions(+), 1 deletion(-)
+ create mode 100644 tooling/sanctifier-core/tests/fixtures/detectors/cei_violation.rs
+ create mode 100644 tooling/sanctifier-core/tests/snapshots/detector_snapshots__cei_violation.snap
+
+diff --git a/docs/detectors/cei_violation.md b/docs/detectors/cei_violation.md
+index da0c03e..a4bde58 100644
+--- a/docs/detectors/cei_violation.md
++++ b/docs/detectors/cei_violation.md
+@@ -66,3 +66,7 @@ The focused regression cases live alongside cei_violation.rs, including
+ token::Client transfer and transfer_from, host invoke_contract, write-before-
+ interaction safety, mutually exclusive branches, a local storage handle and
+ loop labeling.
++The golden snapshot fixture
++`tooling/sanctifier-core/tests/fixtures/detectors/cei_violation.rs` pairs
++vulnerable SAC transfer, transfer_from and invoke_contract entrypoints with
++safe write-first, exclusive-branch and event-only counterparts.
+diff --git a/tooling/sanctifier-core/tests/detector_snapshots.rs b/tooling/sanctifier-core/tests/detector_snapshots.rs
+index 146c852..4abbd87 100644
+--- a/tooling/sanctifier-core/tests/detector_snapshots.rs
++++ b/tooling/sanctifier-core/tests/detector_snapshots.rs
+@@ -18,7 +18,8 @@ use sanctifier_core::rules::auth_replay::AuthReplayRule;
+ use sanctifier_core::rules::{
+     allowance_race::AllowanceRaceRule, arg_dos::ArgDosRule,
+     arithmetic_overflow::ArithmeticOverflowRule, auth_gap::AuthGapRule,
+-    balance_equality::BalanceEqualityRule, contracterror_enum::ContracterrorEnumRule,
++    balance_equality::BalanceEqualityRule, cei_violation::CeiViolationRule,
++    contracterror_enum::ContracterrorEnumRule,
+     cross_contract_call_in_loop::CrossContractCallInLoopRule, division_by_zero::DivisionByZeroRule,
+     edge_amount::EdgeAmountRule, error_code_collision::ErrorCodeCollisionRule,
+     excessive_clone::ExcessiveCloneRule, fee_rounding::FeeRoundingRule,
+@@ -519,6 +520,15 @@ fn snapshot_cross_contract_call_in_loop() {
+     );
+ }
+ 
++#[test]
++fn snapshot_cei_violation() {
++    assert_detector_snapshot(
++        "cei_violation",
++        &CeiViolationRule::new(),
++        include_str!("fixtures/detectors/cei_violation.rs"),
++    );
++}
++
+ #[test]
+ fn snapshot_nullifier_growth() {
+     assert_detector_snapshot(
+diff --git a/tooling/sanctifier-core/tests/fixtures/detectors/cei_violation.rs b/tooling/sanctifier-core/tests/fixtures/detectors/cei_violation.rs
+new file mode 100644
+index 0000000..71c1bd5
+--- /dev/null
++++ b/tooling/sanctifier-core/tests/fixtures/detectors/cei_violation.rs
+@@ -0,0 +1,78 @@
++#![no_std]
++use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
++
++// FIXTURE: cei_violation detector (SANCT_CEI)
++// A cross-contract call, including a token / Stellar Asset Contract (SAC)
++// transfer, runs before a later storage write on the same path, so a callback
++// can re-enter while the contract's own state is still stale.
++
++#[contracttype]
++pub enum DataKey {
++    Balance(Address),
++    Locked,
++}
++
++const PAID: Symbol = symbol_short!("PAID");
++
++#[contract]
++pub struct CeiVaultContract;
++
++#[contractimpl]
++impl CeiVaultContract {
++    // Violation: SAC transfer through a bound token client before the debit.
++    pub fn withdraw(env: Env, user: Address, token: Address, amount: i128) {
++        user.require_auth();
++        let key = DataKey::Balance(user.clone());
++        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
++        let sac = token::Client::new(&env, &token);
++        sac.transfer(&env.current_contract_address(), &user, &amount);
++        env.storage().persistent().set(&key, &(balance - amount));
++    }
++
++    // Violation: inline token client transfer_from before the credit.
++    pub fn deposit(env: Env, from: Address, token: Address, amount: i128) {
++        from.require_auth();
++        let key = DataKey::Balance(from.clone());
++        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
++        token::Client::new(&env, &token).transfer_from(
++            &env.current_contract_address(),
++            &from,
++            &env.current_contract_address(),
++            &amount,
++        );
++        env.storage().persistent().set(&key, &(balance + amount));
++    }
++
++    // Violation: host invoke_contract before the instance lock is released.
++    pub fn call_hook(env: Env, hook: Address) {
++        env.invoke_contract::<()>(&hook, &symbol_short!("on_call"), Vec::new(&env));
++        env.storage().instance().set(&DataKey::Locked, &false);
++    }
++
++    // Safe (CEI order): the debit is committed before the SAC transfer.
++    pub fn withdraw_safe(env: Env, user: Address, token: Address, amount: i128) {
++        user.require_auth();
++        let key = DataKey::Balance(user.clone());
++        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
++        env.storage().persistent().set(&key, &(balance - amount));
++        let sac = token::Client::new(&env, &token);
++        sac.transfer(&env.current_contract_address(), &user, &amount);
++    }
++
++    // Safe: the transfer and the write are on mutually exclusive branches.
++    pub fn pay_or_record(env: Env, user: Address, token: Address, amount: i128, pay_now: bool) {
++        user.require_auth();
++        if pay_now {
++            token::Client::new(&env, &token).transfer(&env.current_contract_address(), &user, &amount);
++        } else {
++            env.storage().persistent().set(&DataKey::Balance(user), &amount);
++        }
++    }
++
++    // Safe: an event publish is not a cross-contract call and cannot re-enter.
++    pub fn record_paid(env: Env, user: Address, amount: i128) {
++        user.require_auth();
++        env.events().publish((PAID,), (user.clone(), amount));
++        env.storage().persistent().set(&DataKey::Balance(user), &amount);
++    }
++}
+diff --git a/tooling/sanctifier-core/tests/snapshots/detector_snapshots__cei_violation.snap b/tooling/sanctifier-core/tests/snapshots/detector_snapshots__cei_violation.snap
+new file mode 100644
+index 0000000..efdb438
+--- /dev/null
++++ b/tooling/sanctifier-core/tests/snapshots/detector_snapshots__cei_violation.snap
+@@ -0,0 +1,19 @@
++---
++source: tooling/sanctifier-core/tests/detector_snapshots.rs
++expression: findings
++---
++- rule_name: SANCT_CEI
++  severity: Error
++  message: "SANCT_CEI: withdraw invokes external transfer on line 28 before set writes state on line 29; a callback may re-enter while internal state is stale"
++  location: "withdraw:28"
++  suggestion: "Validate and authorize, commit the internal storage update before invoking untrusted contracts/token clients, and apply a reentrancy guard where necessary"
++- rule_name: SANCT_CEI
++  severity: Error
++  message: "SANCT_CEI: deposit invokes external transfer_from on line 37 before set writes state on line 43; a callback may re-enter while internal state is stale"
++  location: "deposit:37"
++  suggestion: "Validate and authorize, commit the internal storage update before invoking untrusted contracts/token clients, and apply a reentrancy guard where necessary"
++- rule_name: SANCT_CEI
++  severity: Error
++  message: "SANCT_CEI: call_hook invokes external invoke_contract on line 48 before set writes state on line 49; a callback may re-enter while internal state is stale"
++  location: "call_hook:48"
++  suggestion: "Validate and authorize, commit the internal storage update before invoking untrusted contracts/token clients, and apply a reentrancy guard where necessary"
+-- 
+2.43.0
+

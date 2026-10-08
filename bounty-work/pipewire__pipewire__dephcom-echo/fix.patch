@@ -1,0 +1,1686 @@
+From 16b4201f9a73a2e63702eac2303b6d8b8615c04d Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:33:18 +0000
+Subject: [PATCH] pulse-server: apply filters requested with
+ filter.want/filter.apply
+
+Do what the PulseAudio module-filter-heuristics and module-filter-apply
+modules do: when a stream asks for a filter with the filter.want or
+filter.apply property, load module-<filter> on top of the device the
+stream uses, move the stream to the filter and unload the filter again
+10 seconds after it is no longer used. filter.suppress disables the
+filter for a stream and filter.apply.<filter>.parameters adds module
+arguments.
+
+Echo cancellation needs a playback and a record stream. Like
+PulseAudio, it is applied when a playback and a record stream of the
+same group (media.role, application.id, application.name or media.name)
+both want it. Both streams are then routed through one
+module-echo-cancel that uses their devices as sink_master and
+source_master. filter.want is ignored on devices meant for calls
+(device.intended-roles with phone or Communication), filter.apply is
+always honoured.
+
+Streams are moved with the target.object metadata, like a move with
+pactl. The streams get state.restore-target = false while they are
+moved to a filter so that the session manager does not remember the
+filter as their target. When the session manager did not link a moved
+stream to the filter after 2 seconds, the move is requested again.
+
+When someone else moves a filtered stream to another device, the filter
+is applied on the new device. When the device of a filter goes away,
+the filter is unloaded and the streams are filtered again where they
+end up. When the filter module is unloaded by hand, the streams go back
+to their devices and the filter is not loaded again for them.
+
+This gives communication applications that use the PulseAudio API,
+such as Jami, echo cancellation without any configuration.
+
+Automatic filters can be disabled with pulse.filter-apply = false.
+
+Fixes #4170
+---
+ src/daemon/pipewire-pulse.conf.in             |    1 +
+ src/modules/meson.build                       |   11 +
+ src/modules/module-protocol-pulse.c           |   43 +
+ .../module-protocol-pulse/filter-apply.c      | 1022 +++++++++++++++++
+ .../module-protocol-pulse/filter-apply.h      |  159 +++
+ src/modules/module-protocol-pulse/internal.h  |    4 +
+ .../module-protocol-pulse/pulse-server.c      |   25 +-
+ src/modules/module-protocol-pulse/stream.c    |    4 +
+ src/modules/module-protocol-pulse/stream.h    |    7 +
+ .../module-protocol-pulse/test-filter-apply.c |  132 +++
+ 10 files changed, 1406 insertions(+), 2 deletions(-)
+ create mode 100644 src/modules/module-protocol-pulse/filter-apply.c
+ create mode 100644 src/modules/module-protocol-pulse/filter-apply.h
+ create mode 100644 src/modules/module-protocol-pulse/test-filter-apply.c
+
+diff --git a/src/daemon/pipewire-pulse.conf.in b/src/daemon/pipewire-pulse.conf.in
+index 434848f9b..7f8d8e343 100644
+--- a/src/daemon/pipewire-pulse.conf.in
++++ b/src/daemon/pipewire-pulse.conf.in
+@@ -131,6 +131,7 @@ pulse.properties = {
+     ]
+     #server.dbus-name       = "org.pulseaudio.Server"
+     #pulse.allow-module-loading = true
++    #pulse.filter-apply     = true          # load filters for filter.want/filter.apply
+     #pulse.min.req          = 256/48000     # 5.3ms
+     #pulse.default.req      = 960/48000     # 20 milliseconds
+     #pulse.min.frag         = 256/48000     # 5.3ms
+diff --git a/src/modules/meson.build b/src/modules/meson.build
+index efef9abbf..15e2a8d0d 100644
+--- a/src/modules/meson.build
++++ b/src/modules/meson.build
+@@ -317,6 +317,7 @@ pipewire_module_protocol_pulse_sources = [
+   'module-protocol-pulse/collect.c',
+   'module-protocol-pulse/cmd.c',
+   'module-protocol-pulse/extension.c',
++  'module-protocol-pulse/filter-apply.c',
+   'module-protocol-pulse/format.c',
+   'module-protocol-pulse/manager.c',
+   'module-protocol-pulse/message.c',
+@@ -420,6 +421,16 @@ pipewire_module_protocol_pulse = shared_library('pipewire-module-protocol-pulse'
+   dependencies : pipewire_module_protocol_pulse_deps,
+ )
+ 
++if get_option('tests').allowed()
++  test('pw-test-pulse-filter-apply',
++    executable('pw-test-pulse-filter-apply',
++      'module-protocol-pulse/test-filter-apply.c',
++      include_directories : [configinc],
++      dependencies : [spa_dep],
++    ),
++  )
++endif
++
+ build_module_pulse_tunnel = pulseaudio_dep.found()
+   if build_module_pulse_tunnel
+     pipewire_module_pulse_tunnel = shared_library('pipewire-module-pulse-tunnel',
+diff --git a/src/modules/module-protocol-pulse.c b/src/modules/module-protocol-pulse.c
+index 9239ef5bd..0859d5769 100644
+--- a/src/modules/module-protocol-pulse.c
++++ b/src/modules/module-protocol-pulse.c
+@@ -67,6 +67,7 @@
+  *     ]
+  *     #server.dbus-name       = "org.pulseaudio.Server"
+  *     #pulse.allow-module-loading = true
++ *     #pulse.filter-apply     = true
+  *     #pulse.min.req          = 256/48000     # 5.3ms
+  *     #pulse.default.req      = 960/48000     # 20 milliseconds
+  *     #pulse.min.frag         = 256/48000     # 5.3ms
+@@ -140,6 +141,48 @@
+  * By default, clients are allowed to load and unload modules. You can disable this
+  * feature with this option.
+  *
++ * ### Automatic filters
++ *
++ *\code{.unparsed}
++ *     pulse.filter-apply = true
++ *\endcode
++ *
++ * Load filters for streams that ask for them, like the PulseAudio
++ * module-filter-heuristics and module-filter-apply do. A stream asks for a
++ * filter with these properties:
++ *
++ * - `filter.want = <name>`: a hint that the stream would like the filter. It is
++ *   ignored on devices that are meant for calls (devices with `phone` or
++ *   `Communication` in `device.intended-roles`), they already do this.
++ * - `filter.apply = <name>`: always apply the filter. This overrides
++ *   `filter.want`, an empty value applies no filter.
++ * - `filter.suppress = <name>`: don't apply the filter.
++ * - `filter.apply.<name>.parameters = <args>`: extra module arguments. These are
++ *   only taken from the stream when `pulse.allow-module-loading` is enabled. The
++ *   property can also be set on the device.
++ *
++ * The filter is `module-<name>`, loaded with the device of the stream as
++ * `sink_master` or `source_master`. The stream is moved to the sink or source
++ * of the filter with the `target.object` metadata, like `pactl move-sink-input`
++ * does. While it is moved to a filter, the stream has
++ * `state.restore-target = false` so that the session manager does not remember
++ * the filter as the target of the stream.
++ *
++ * Filter instances are shared between streams with the same devices and
++ * parameters and they are unloaded 10 seconds after the last stream stopped
++ * using them. When a stream is moved to another device, the filter is applied
++ * on the new device.
++ *
++ * Echo cancellation (`echo-cancel`) needs a playback and a record stream. It is
++ * applied when there is a playback and a record stream in the same group (same
++ * `media.role`, `application.id`, `application.name` or `media.name`) that both
++ * want it. Both streams are then routed through one `module-echo-cancel` with
++ * their devices as masters. This is how communication applications that use
++ * the PulseAudio API (with `filter.want = echo-cancel`) get echo cancellation
++ * without configuration.
++ *
++ * Set this option to false to disable automatic filters.
++ *
+  * ### Playback buffering options
+  *
+  *\code{.unparsed}
+diff --git a/src/modules/module-protocol-pulse/filter-apply.c b/src/modules/module-protocol-pulse/filter-apply.c
+new file mode 100644
+index 000000000..1b1289ed8
+--- /dev/null
++++ b/src/modules/module-protocol-pulse/filter-apply.c
+@@ -0,0 +1,1022 @@
++/* PipeWire */
++/* SPDX-FileCopyrightText: Copyright © 2026 woahwhattheheck */
++/* SPDX-License-Identifier: MIT */
++
++#include "config.h"
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <spa/utils/defs.h>
++#include <spa/utils/list.h>
++#include <spa/utils/string.h>
++#include <pipewire/pipewire.h>
++#include <pipewire/timer-queue.h>
++#include <pipewire/work-queue.h>
++
++#include "log.h"
++
++#include "client.h"
++#include "collect.h"
++#include "defs.h"
++#include "filter-apply.h"
++#include "internal.h"
++#include "manager.h"
++#include "module.h"
++#include "server.h"
++#include "stream.h"
++
++/* unload filters that are no longer used after this time, like
++ * module-filter-apply does, so that a stream that is quickly recreated
++ * does not cause the filter to be reloaded */
++#define FILTER_UNLOAD_TIMEOUT	(10 * SPA_NSEC_PER_SEC)
++/* check that the moved streams arrived in the filter after this time */
++#define FILTER_CHECK_TIMEOUT	(2 * SPA_NSEC_PER_SEC)
++#define FILTER_MAX_RETRY	3
++
++#define KEY_RESTORE_TARGET	"state.restore-target"
++
++enum {
++	SIDE_SINK,	/* playback streams, sink_master */
++	SIDE_SOURCE,	/* record streams, source_master */
++	N_SIDES,
++};
++
++static const char * const side_names[N_SIDES] = { "sink", "source" };
++
++struct filter {
++	struct spa_list link;
++	struct filter_apply *fa;
++
++	char *name;			/* the filter, like "echo-cancel" */
++	char *parameters;		/* extra module arguments */
++	uint64_t master[N_SIDES];	/* serial of the devices we filter */
++
++	struct module *module;
++	struct spa_hook module_listener;
++
++	unsigned int failed:1;
++	unsigned int unloading:1;
++};
++
++struct filter_apply {
++	struct impl *impl;
++	struct spa_list filters;
++
++	struct pw_timer timer;
++	struct pw_timer check_timer;
++
++	unsigned int run_pending:1;
++	unsigned int timer_pending:1;
++	unsigned int check_pending:1;
++};
++
++/* what we know about a stream */
++struct stream_state {
++	const struct spa_dict *props;
++	const struct spa_dict *client_props;
++	struct pw_manager_object *peer;		/* the node the stream is linked to */
++	struct pw_manager_object *master;	/* the device the filter is for */
++	struct filter *on;			/* our filter the stream is linked to */
++	const char *want;			/* the filter the stream wants */
++	bool pinned;				/* we moved the stream to its filter */
++	bool filtered;				/* the stream is or goes to the wanted filter */
++	bool foreign;				/* filtered by a filter we don't manage */
++	int side;
++};
++
++static void schedule_run(struct filter_apply *fa);
++static void schedule_check(struct filter_apply *fa);
++
++static inline int stream_side(struct stream *s)
++{
++	return s->direction == PW_DIRECTION_OUTPUT ? SIDE_SINK : SIDE_SOURCE;
++}
++
++/* iterate all streams of all clients, needs a `struct client *_client` and a
++ * `union pw_map_item *_item` in scope. Use return, not break, to stop early. */
++#define for_each_stream(impl, s)						\
++	for (struct server *_server = spa_list_first(&(impl)->servers, struct server, link);	\
++	     !spa_list_is_end(_server, &(impl)->servers, link);			\
++	     _server = spa_list_next(_server, link))				\
++		spa_list_for_each(_client, &_server->clients, link)		\
++			pw_array_for_each(_item, &_client->streams.items)	\
++				if (!pw_map_item_is_free(_item) &&		\
++				    ((s) = _item->data) != NULL)
++
++/* the global properties only have a few keys, use the node info */
++static const char *node_lookup(struct pw_manager_object *o, const char *key)
++{
++	const struct pw_node_info *info;
++	const char *str = NULL;
++
++	if (o == NULL || !spa_streq(o->type, PW_TYPE_INTERFACE_Node))
++		return NULL;
++	if ((info = o->info) != NULL && info->props != NULL)
++		str = spa_dict_lookup(info->props, key);
++	if (str == NULL && o->props != NULL)
++		str = pw_properties_get(o->props, key);
++	return str;
++}
++
++static const char *node_name(struct pw_manager_object *o)
++{
++	return node_lookup(o, PW_KEY_NODE_NAME);
++}
++
++static struct module *node_get_module(struct impl *impl, struct pw_manager_object *o)
++{
++	const char *str;
++	uint32_t index;
++
++	if ((str = node_lookup(o, "pulse.module.id")) == NULL ||
++	    !spa_atou32(str, &index, 10))
++		return NULL;
++
++	return pw_map_lookup(&impl->modules, index & MODULE_INDEX_MASK);
++}
++
++static struct filter *find_filter_for_node(struct filter_apply *fa, struct pw_manager_object *o)
++{
++	struct module *module;
++	struct filter *f;
++
++	if ((module = node_get_module(fa->impl, o)) == NULL)
++		return NULL;
++
++	spa_list_for_each(f, &fa->filters, link) {
++		if (f->module == module)
++			return f;
++	}
++	return NULL;
++}
++
++/* check if the node is already an instance of the filter, either one we
++ * loaded, one loaded with pactl load-module or an echo-canceller set up in
++ * the PipeWire configuration */
++static bool node_provides_filter(struct filter_apply *fa, struct pw_manager_object *o,
++		const char *name)
++{
++	struct module *module;
++	const char *str;
++
++	if ((module = node_get_module(fa->impl, o)) != NULL)
++		return spa_strstartswith(module->info->name, "module-") &&
++			spa_streq(module->info->name + strlen("module-"), name);
++
++	if (spa_streq(name, FILTER_ECHO_CANCEL) &&
++	    (str = node_lookup(o, PW_KEY_NODE_LINK_GROUP)) != NULL &&
++	    spa_strstartswith(str, "echo-cancel-"))
++		return true;
++
++	return false;
++}
++
++static struct pw_manager_object *find_node_by_serial(struct pw_manager *m, uint64_t serial)
++{
++	struct pw_manager_object *o;
++
++	if (serial == SPA_ID_INVALID)
++		return NULL;
++
++	spa_list_for_each(o, &m->object_list, link) {
++		if (o->creating || o->removing)
++			continue;
++		if (o->serial == serial && spa_streq(o->type, PW_TYPE_INTERFACE_Node))
++			return o;
++	}
++	return NULL;
++}
++
++/* the sink or source the filter module made */
++static struct pw_manager_object *find_filter_node(struct filter *f, struct pw_manager *m, int side)
++{
++	struct pw_manager_object *o;
++
++	if (f->module == NULL || f->unloading)
++		return NULL;
++
++	spa_list_for_each(o, &m->object_list, link) {
++		if (o->creating || o->removing)
++			continue;
++		if (side == SIDE_SINK ? !pw_manager_object_is_sink(o) :
++		    !pw_manager_object_is_source(o))
++			continue;
++		if (node_get_module(f->fa->impl, o) == f->module)
++			return o;
++	}
++	return NULL;
++}
++
++static bool stream_is_candidate(struct stream *s)
++{
++	const struct pw_properties *props;
++
++	if (s->type == STREAM_TYPE_UPLOAD || s->stream == NULL || s->killed ||
++	    s->client->manager == NULL || s->id == 0 || s->id == SPA_ID_INVALID)
++		return false;
++
++	props = pw_stream_get_properties(s->stream);
++	if (props == NULL)
++		return false;
++
++	/* streams that can't be moved or that monitor something */
++	if (spa_atob(pw_properties_get(props, PW_KEY_NODE_DONT_RECONNECT)) ||
++	    spa_atob(pw_properties_get(props, PW_KEY_STREAM_CAPTURE_SINK)) ||
++	    spa_atob(pw_properties_get(props, PW_KEY_STREAM_MONITOR)))
++		return false;
++
++	return true;
++}
++
++static void stream_get_state(struct filter_apply *fa, struct stream *s, struct stream_state *st)
++{
++	struct pw_manager *m = s->client->manager;
++	const char *roles = NULL;
++
++	spa_zero(*st);
++	st->side = stream_side(s);
++
++	if (!stream_is_candidate(s))
++		return;
++
++	st->props = &pw_stream_get_properties(s->stream)->dict;
++	st->client_props = s->client->props ? &s->client->props->dict : NULL;
++
++	/* most streams don't want filters */
++	if (s->filter == NULL &&
++	    spa_dict_lookup(st->props, FILTER_KEY_WANT) == NULL &&
++	    spa_dict_lookup(st->props, FILTER_KEY_APPLY) == NULL)
++		return;
++
++	st->peer = find_linked(m, s->id, s->direction);
++
++	/* When we moved the stream to a filter, the filter decides where the
++	 * stream belongs, the peer can be anything while the session manager
++	 * relinks the stream. */
++	st->pinned = s->filter != NULL && s->filter_target != SPA_ID_INVALID &&
++		!s->filter->unloading;
++
++	if (st->pinned) {
++		st->master = find_node_by_serial(m, s->filter->master[st->side]);
++	} else if (st->peer != NULL) {
++		if ((st->on = find_filter_for_node(fa, st->peer)) != NULL)
++			st->master = find_node_by_serial(m, st->on->master[st->side]);
++		else if (st->side == SIDE_SINK || pw_manager_object_is_source(st->peer))
++			st->master = st->peer;
++		else
++			/* capturing from a monitor, nothing to filter */
++			return;
++	}
++	roles = node_lookup(st->master, PW_KEY_DEVICE_INTENDED_ROLES);
++
++	if (s->filter_inhibit)
++		return;
++
++	st->want = filter_apply_get_name(st->props, roles);
++	if (st->want == NULL)
++		return;
++
++	if (st->pinned) {
++		st->filtered = spa_streq(s->filter->name, st->want);
++	} else if (st->on != NULL) {
++		st->filtered = spa_streq(st->on->name, st->want);
++	} else if (st->peer != NULL) {
++		st->filtered = st->foreign = node_provides_filter(fa, st->peer, st->want);
++	}
++}
++
++static bool stream_same_group(const char *filter, const struct stream_state *a,
++		const struct stream_state *b)
++{
++	char ga[512], gb[512];
++
++	filter_apply_get_group(ga, sizeof(ga), filter, a->props, a->client_props);
++	filter_apply_get_group(gb, sizeof(gb), filter, b->props, b->client_props);
++	return spa_streq(ga, gb);
++}
++
++static int stream_move_full(struct stream *s, struct pw_manager_object *dev, const char *type)
++{
++	struct client *client = s->client;
++	int res;
++
++	if (client->manager == NULL || client->metadata_default == NULL)
++		return -ENOENT;
++
++	pw_log_info("[%s] stream %u: filter move to %s", client->name, s->id,
++			dev ? node_name(dev) : "default");
++
++	/* the session manager uses target.object before target.node, only
++	 * change target.object so that the stream is relinked only once */
++	if (dev != NULL)
++		res = pw_manager_set_metadata(client->manager, client->metadata_default,
++				s->id, METADATA_TARGET_OBJECT,
++				type, "%"PRIu64, dev->serial);
++	else
++		res = pw_manager_set_metadata(client->manager, client->metadata_default,
++				s->id, METADATA_TARGET_OBJECT, NULL, NULL);
++	if (res < 0)
++		goto error;
++	return 0;
++error:
++	pw_log_warn("[%s] stream %u: can't move: %s", client->name, s->id,
++			spa_strerror(res));
++	return res;
++}
++
++static int stream_move(struct stream *s, struct pw_manager_object *dev)
++{
++	return stream_move_full(s, dev, SPA_TYPE_INFO_BASE"Id");
++}
++
++/* The session manager remembers where streams are moved to and moves new
++ * streams of the same application or role there. Our moves are temporary,
++ * ask it not to remember them. */
++static void stream_set_no_restore(struct stream *s, bool no_restore)
++{
++	struct spa_dict_item item;
++
++	if (s->stream == NULL || s->filter_no_restore == no_restore)
++		return;
++	if (no_restore && pw_properties_get(pw_stream_get_properties(s->stream),
++				KEY_RESTORE_TARGET) != NULL)
++		return;
++
++	item = SPA_DICT_ITEM_INIT(KEY_RESTORE_TARGET, no_restore ? "false" : NULL);
++	pw_stream_update_properties(s->stream, &SPA_DICT_INIT(&item, 1));
++	s->filter_no_restore = no_restore;
++}
++
++static void stream_detach(struct stream *s)
++{
++	s->filter = NULL;
++	s->filter_target = SPA_ID_INVALID;
++	stream_set_no_restore(s, false);
++}
++
++static bool node_is_default(struct client *client, struct pw_manager_object *o, int side)
++{
++	const char *def = side == SIDE_SINK ? client->default_sink : client->default_source;
++	return def == NULL || spa_streq(def, node_name(o));
++}
++
++/* Forget about the filter of a stream. When we moved the stream to the
++ * filter, move it back to the device the filter was applied to, like
++ * module-filter-apply does. Moving to the default device clears the target,
++ * like a move with pactl does. A stream that someone else moved in the
++ * meantime is not ours anymore and is left alone. */
++static void stream_restore(struct filter_apply *fa, struct stream *s)
++{
++	struct pw_manager *m = s->client->manager;
++	struct pw_manager_object *master = NULL;
++	struct filter *f = s->filter;
++	int side = stream_side(s);
++
++	if (s->filter_target != SPA_ID_INVALID && m != NULL &&
++	    s->stream != NULL && !s->killed) {
++		if (f != NULL)
++			master = find_node_by_serial(m, f->master[side]);
++		if (master != NULL && node_is_default(s->client, master, side))
++			master = NULL;
++		stream_move(s, master);
++	}
++	/* metadata changes of detached streams are ignored */
++	stream_detach(s);
++}
++
++static void filter_free(struct filter *f)
++{
++	struct impl *impl = f->fa->impl;
++	struct stream *s;
++	struct client *_client;
++	union pw_map_item *_item;
++
++	for_each_stream(impl, s) {
++		if (s->filter == f)
++			stream_detach(s);
++	}
++	if (f->module != NULL)
++		spa_hook_remove(&f->module_listener);
++	spa_list_remove(&f->link);
++	free(f->name);
++	free(f->parameters);
++	free(f);
++}
++
++static void filter_unload(struct filter *f, const char *reason)
++{
++	struct module *module = f->module;
++
++	if (f->unloading)
++		return;
++
++	pw_log_info("unload filter %s (module %u): %s", f->name,
++			module ? module->index : SPA_ID_INVALID, reason);
++
++	f->unloading = true;
++	if (module != NULL)
++		module_unload(module);
++	else
++		filter_free(f);
++}
++
++static void on_filter_module_loaded(void *data, int result)
++{
++	struct filter *f = data;
++	struct module *module = f->module;
++	struct impl *impl = f->fa->impl;
++
++	if (result < 0) {
++		pw_log_warn("failed to load filter %s: %s", f->name, spa_strerror(result));
++		f->failed = true;
++		module_schedule_unload(module);
++		return;
++	}
++	pw_log_info("loaded filter %s: module %u", f->name, module->index);
++
++	module->loaded = true;
++	broadcast_subscribe_event(impl,
++			SUBSCRIPTION_EVENT_MODULE,
++			SUBSCRIPTION_EVENT_NEW,
++			module->index);
++	schedule_run(f->fa);
++}
++
++static void on_filter_module_destroy(void *data)
++{
++	struct filter *f = data;
++	struct filter_apply *fa = f->fa;
++	struct impl *impl = fa->impl;
++	struct stream *s;
++	struct client *_client;
++	union pw_map_item *_item;
++
++	spa_hook_remove(&f->module_listener);
++	f->module = NULL;
++
++	for_each_stream(impl, s) {
++		if (s->filter != f)
++			continue;
++		/* the filter was unloaded by someone else, don't load it
++		 * again for this stream unless its properties change */
++		if (!f->unloading && !f->failed)
++			s->filter_inhibit = true;
++		stream_restore(fa, s);
++	}
++	if (f->failed) {
++		/* keep the failed filter around so that we don't retry
++		 * until the streams that want it are gone */
++		f->unloading = false;
++	} else {
++		filter_free(f);
++	}
++	schedule_run(fa);
++}
++
++static const struct module_events filter_module_events = {
++	VERSION_MODULE_EVENTS,
++	.loaded = on_filter_module_loaded,
++	.destroy = on_filter_module_destroy,
++};
++
++static void args_append(FILE *f, const char *key, const char *value)
++{
++	fprintf(f, " %s=\"", key);
++	for (; *value; value++) {
++		if (*value == '"' || *value == '\\')
++			fputc('\\', f);
++		fputc(*value, f);
++	}
++	fputc('"', f);
++}
++
++static struct filter *filter_load(struct filter_apply *fa, const char *name,
++		struct pw_manager_object *master[N_SIDES], const char *parameters)
++{
++	struct impl *impl = fa->impl;
++	struct filter *f;
++	struct module *module;
++	char module_name[256], *args = NULL;
++	size_t size;
++	FILE *mf;
++	int i, res;
++
++	f = calloc(1, sizeof(*f));
++	if (f == NULL)
++		return NULL;
++	f->fa = fa;
++	f->name = strdup(name);
++	f->parameters = parameters ? strdup(parameters) : NULL;
++	for (i = 0; i < N_SIDES; i++)
++		f->master[i] = master[i] ? master[i]->serial : SPA_ID_INVALID;
++	spa_list_append(&fa->filters, &f->link);
++
++	if (f->name == NULL || (parameters != NULL && f->parameters == NULL))
++		goto error_errno;
++
++	if ((mf = open_memstream(&args, &size)) == NULL)
++		goto error_errno;
++	for (i = 0; i < N_SIDES; i++) {
++		const char *str = node_name(master[i]);
++		char key[64];
++
++		if (str == NULL)
++			continue;
++		snprintf(key, sizeof(key), "%s_master", side_names[i]);
++		args_append(mf, key, str);
++
++		/* PulseAudio names the echo-canceller devices after their
++		 * master, this also avoids clashes with an echo-canceller
++		 * that is loaded from the configuration */
++		if (spa_streq(name, FILTER_ECHO_CANCEL)) {
++			char value[1024];
++			snprintf(key, sizeof(key), "%s_name", side_names[i]);
++			snprintf(value, sizeof(value), "%s.%s", str, name);
++			args_append(mf, key, value);
++		}
++	}
++	if (parameters != NULL)
++		fprintf(mf, " %s", parameters);
++	fclose(mf);
++
++	snprintf(module_name, sizeof(module_name), "module-%s", name);
++	pw_log_info("load filter %s: %s%s", name, module_name, args);
++
++	module = module_create(impl, module_name, args);
++	free(args);
++	if (module == NULL)
++		goto error_errno;
++
++	f->module = module;
++	module_add_listener(module, &f->module_listener, &filter_module_events, f);
++
++	res = module_load(module);
++	if (res < 0) {
++		pw_log_warn("failed to load filter %s: %s", name, spa_strerror(res));
++		f->failed = true;
++		module_schedule_unload(module);
++	} else if (!SPA_RESULT_IS_ASYNC(res)) {
++		on_filter_module_loaded(f, res);
++	}
++	return f;
++
++error_errno:
++	pw_log_warn("can't create filter %s: %m", name);
++	f->failed = true;
++	return f;
++}
++
++static bool filter_supports(struct impl *impl, const char *name, int side, bool group)
++{
++	const struct module_info *info;
++	const struct module_args *a;
++	char module_name[256];
++	bool has[N_SIDES] = { false, false };
++	int i;
++
++	snprintf(module_name, sizeof(module_name), "module-%s", name);
++	if ((info = module_info_find(impl, module_name)) == NULL ||
++	    info->load == NULL || info->valid_args == NULL)
++		return false;
++
++	for (a = info->valid_args; a->key != NULL; a++) {
++		for (i = 0; i < N_SIDES; i++) {
++			char key[64];
++			snprintf(key, sizeof(key), "%s_master", side_names[i]);
++			if (spa_streq(a->key, key))
++				has[i] = true;
++		}
++	}
++	return group ? (has[SIDE_SINK] && has[SIDE_SOURCE]) : has[side];
++}
++
++static struct filter *find_filter(struct filter_apply *fa, const char *name,
++		struct pw_manager_object *master[N_SIDES], const char *parameters)
++{
++	struct filter *f;
++	int i;
++
++	spa_list_for_each(f, &fa->filters, link) {
++		if (f->unloading || !spa_streq(f->name, name) ||
++		    !spa_streq(f->parameters, parameters))
++			continue;
++		for (i = 0; i < N_SIDES; i++) {
++			if (f->master[i] != (master[i] ? master[i]->serial : SPA_ID_INVALID))
++				break;
++		}
++		if (i == N_SIDES)
++			return f;
++	}
++	return NULL;
++}
++
++static const char *get_parameters(struct filter_apply *fa, const char *name,
++		const struct stream_state *st)
++{
++	char key[256];
++	const char *str = NULL;
++
++	snprintf(key, sizeof(key), FILTER_KEY_APPLY".%s.parameters", name);
++
++	/* parameters from the client are module arguments, only allow them
++	 * when clients are allowed to load modules */
++	if (fa->impl->defs.allow_module_loading)
++		str = spa_dict_lookup(st->props, key);
++	if (str == NULL)
++		str = node_lookup(st->master, key);
++	return str;
++}
++
++/* Route the stream through the filter. The clients each have their own view
++ * of the graph, the filter devices might not be visible yet for this client,
++ * we'll be called again when they are. */
++static void stream_route(struct stream *s, struct filter *f, const struct stream_state *st)
++{
++	struct pw_manager_object *dev;
++
++	s->filter = f;
++
++	if (f->failed ||
++	    (dev = find_filter_node(f, s->client->manager, st->side)) == NULL)
++		return;
++	if (st->peer == dev || s->filter_target == dev->serial)
++		return;
++
++	stream_set_no_restore(s, true);
++	if (stream_move(s, dev) >= 0) {
++		s->filter_target = dev->serial;
++		s->filter_retry = 0;
++		schedule_check(f->fa);
++	}
++}
++
++/* route the stream and the streams in its group through the filter */
++static void route_streams(struct filter_apply *fa, struct filter *f, struct stream *stream,
++		const struct stream_state *state, bool group)
++{
++	struct impl *impl = fa->impl;
++	struct stream *s;
++	struct client *_client;
++	union pw_map_item *_item;
++
++	for_each_stream(impl, s) {
++		struct stream_state st;
++
++		if (s != stream) {
++			if (!group)
++				continue;
++			stream_get_state(fa, s, &st);
++			if (!spa_streq(st.want, f->name) ||
++			    !stream_same_group(f->name, state, &st))
++				continue;
++		} else {
++			st = *state;
++		}
++		stream_route(s, f, &st);
++	}
++}
++
++/* For filters that work on a pair of streams (echo-cancel), find the device
++ * of a stream of the other direction in the same group. Like PulseAudio, we
++ * use the master of the filter when that stream is already filtered. */
++static struct pw_manager_object *find_paired_master(struct filter_apply *fa,
++		struct stream *stream, const struct stream_state *state)
++{
++	struct impl *impl = fa->impl;
++	struct stream *s;
++	struct client *_client;
++	union pw_map_item *_item;
++
++	for_each_stream(impl, s) {
++		struct stream_state st;
++
++		if (s == stream || s->direction == stream->direction)
++			continue;
++		stream_get_state(fa, s, &st);
++		if (!spa_streq(st.want, state->want) || st.master == NULL || st.foreign ||
++		    !stream_same_group(state->want, state, &st))
++			continue;
++		return st.master;
++	}
++	return NULL;
++}
++
++static void process_stream(struct filter_apply *fa, struct stream *stream,
++		const struct stream_state *state)
++{
++	struct impl *impl = fa->impl;
++	struct pw_manager_object *master[N_SIDES] = { NULL, NULL };
++	const char *name = state->want, *parameters;
++	struct filter *f;
++	bool group;
++
++	group = spa_streq(name, FILTER_ECHO_CANCEL);
++	if (!filter_supports(impl, name, state->side, group)) {
++		pw_log_debug("stream %u: filter %s not supported", stream->id, name);
++		return;
++	}
++	master[state->side] = state->master;
++
++	if (group) {
++		int other = state->side == SIDE_SINK ? SIDE_SOURCE : SIDE_SINK;
++
++		if ((master[other] = find_paired_master(fa, stream, state)) == NULL) {
++			pw_log_debug("stream %u: filter %s waits for a %s stream",
++					stream->id, name, side_names[other]);
++			return;
++		}
++	}
++	parameters = get_parameters(fa, name, state);
++
++	if ((f = find_filter(fa, name, master, parameters)) == NULL &&
++	    (f = filter_load(fa, name, master, parameters)) == NULL)
++		return;
++
++	route_streams(fa, f, stream, state, group);
++}
++
++static bool filter_in_use(struct filter_apply *fa, struct filter *f)
++{
++	struct impl *impl = fa->impl;
++	struct stream *s;
++	struct client *_client;
++	union pw_map_item *_item;
++
++	for_each_stream(impl, s) {
++		struct pw_manager_object *peer;
++
++		if (s->filter == f)
++			return true;
++		if (f->module == NULL || !stream_is_candidate(s))
++			continue;
++		if ((peer = find_linked(s->client->manager, s->id, s->direction)) != NULL &&
++		    find_filter_for_node(fa, peer) == f)
++			return true;
++	}
++	return false;
++}
++
++static void on_housekeeping(void *data)
++{
++	struct filter_apply *fa = data;
++	struct filter *f, *t;
++
++	fa->timer_pending = false;
++
++	spa_list_for_each_safe(f, t, &fa->filters, link) {
++		if (!filter_in_use(fa, f))
++			filter_unload(f, "not used");
++	}
++}
++
++static void schedule_housekeeping(struct filter_apply *fa)
++{
++	if (fa->timer_pending)
++		return;
++	fa->timer_pending = true;
++	pw_timer_queue_add(fa->impl->timer_queue, &fa->timer, NULL,
++			FILTER_UNLOAD_TIMEOUT, on_housekeeping, fa);
++}
++
++/* The session manager might fail to link a stream that we moved, for
++ * example when the filter was not completely ready. Ask again a few times. */
++static void on_check(void *data)
++{
++	struct filter_apply *fa = data;
++	struct impl *impl = fa->impl;
++	struct stream *s;
++	struct client *_client;
++	union pw_map_item *_item;
++
++	fa->check_pending = false;
++
++	for_each_stream(impl, s) {
++		struct pw_manager *m = s->client->manager;
++		struct pw_manager_object *dev;
++		struct filter *f = s->filter;
++
++		if (f == NULL || s->filter_target == SPA_ID_INVALID ||
++		    !stream_is_candidate(s) ||
++		    (dev = find_filter_node(f, m, stream_side(s))) == NULL ||
++		    dev->serial != s->filter_target ||
++		    find_linked(m, s->id, s->direction) == dev)
++			continue;
++
++		if (s->filter_retry >= FILTER_MAX_RETRY) {
++			pw_log_warn("[%s] stream %u: not linked to filter %s",
++					s->client->name, s->id, f->name);
++			continue;
++		}
++		s->filter_retry++;
++		pw_log_info("[%s] stream %u: not linked to filter %s yet, retry %u",
++				s->client->name, s->id, f->name, s->filter_retry);
++
++		/* setting the same value does not trigger a rescan, toggle
++		 * the type, the value stays the same */
++		stream_move_full(s, dev, s->filter_retry & 1 ?
++				SPA_TYPE_INFO_BASE"Long" : SPA_TYPE_INFO_BASE"Id");
++		schedule_check(fa);
++	}
++}
++
++static void schedule_check(struct filter_apply *fa)
++{
++	if (fa->check_pending)
++		return;
++	fa->check_pending = true;
++	pw_timer_queue_add(fa->impl->timer_queue, &fa->check_timer, NULL,
++			FILTER_CHECK_TIMEOUT, on_check, fa);
++}
++
++/* check with the manager of a client that uses the filter if the devices
++ * the filter is applied to still exist */
++static bool filter_lost_master(struct filter_apply *fa, struct filter *f)
++{
++	struct impl *impl = fa->impl;
++	struct stream *s;
++	struct client *_client;
++	union pw_map_item *_item;
++	int i;
++
++	if (f->module == NULL || f->unloading)
++		return false;
++
++	for_each_stream(impl, s) {
++		if (s->filter != f || s->client->manager == NULL)
++			continue;
++		for (i = 0; i < N_SIDES; i++) {
++			if (f->master[i] != SPA_ID_INVALID &&
++			    find_node_by_serial(s->client->manager, f->master[i]) == NULL)
++				return true;
++		}
++		return false;
++	}
++	return false;
++}
++
++static void filter_apply_run(struct filter_apply *fa)
++{
++	struct impl *impl = fa->impl;
++	struct stream *s;
++	struct filter *f, *t;
++	struct client *_client;
++	union pw_map_item *_item;
++	bool unused = false;
++
++	/* the master of a filter went away, unload the filter. The streams
++	 * will be moved somewhere else and we'll filter them there. */
++	spa_list_for_each_safe(f, t, &fa->filters, link) {
++		if (filter_lost_master(fa, f))
++			filter_unload(f, "master removed");
++	}
++
++	for_each_stream(impl, s) {
++		struct stream_state st;
++
++		stream_get_state(fa, s, &st);
++
++		if (s->filter != NULL && !spa_streq(s->filter->name, st.want)) {
++			/* the stream doesn't want the filter anymore */
++			stream_restore(fa, s);
++		}
++		if (st.want == NULL)
++			continue;
++
++		/* finish moving the streams to their filter */
++		if (s->filter != NULL)
++			stream_route(s, s->filter, &st);
++
++		if (st.filtered || st.master == NULL)
++			continue;
++
++		process_stream(fa, s, &st);
++	}
++
++	spa_list_for_each(f, &fa->filters, link) {
++		if (!filter_in_use(fa, f))
++			unused = true;
++	}
++	if (unused)
++		schedule_housekeeping(fa);
++}
++
++static void do_run(void *obj, void *data, int res, uint32_t id)
++{
++	struct filter_apply *fa = obj;
++
++	fa->run_pending = false;
++	filter_apply_run(fa);
++}
++
++static void schedule_run(struct filter_apply *fa)
++{
++	if (fa == NULL || fa->run_pending || !fa->impl->defs.filter_apply)
++		return;
++	fa->run_pending = true;
++	pw_work_queue_add(fa->impl->work_queue, fa, 0, do_run, NULL);
++}
++
++void filter_apply_object_changed(struct impl *impl, struct pw_manager_object *o)
++{
++	if (spa_streq(o->type, PW_TYPE_INTERFACE_Node) ||
++	    spa_streq(o->type, PW_TYPE_INTERFACE_Link) ||
++	    spa_streq(o->type, PW_TYPE_INTERFACE_Metadata))
++		schedule_run(impl->filter_apply);
++}
++
++void filter_apply_object_updated(struct impl *impl, struct pw_manager_object *o)
++{
++	struct filter_apply *fa = impl->filter_apply;
++
++	/* the properties of a node changed, only interesting when we have
++	 * filters, the routing of streams is triggered by new links */
++	if (fa != NULL && !spa_list_is_empty(&fa->filters) &&
++	    spa_streq(o->type, PW_TYPE_INTERFACE_Node))
++		schedule_run(fa);
++}
++
++void filter_apply_metadata(struct client *client, uint32_t subject, const char *key,
++		const char *value)
++{
++	union pw_map_item *item;
++	uint64_t serial;
++
++	if (key != NULL && !spa_streq(key, METADATA_TARGET_OBJECT))
++		return;
++
++	pw_array_for_each(item, &client->streams.items) {
++		struct stream *s = item->data;
++
++		if (pw_map_item_is_free(item) || s->id != subject ||
++		    s->filter_target == SPA_ID_INVALID)
++			continue;
++
++		/* the change we made ourselves */
++		if (value != NULL && spa_atou64(value, &serial, 10) &&
++		    serial == s->filter_target)
++			return;
++
++		/* someone else moved the stream, it is not ours anymore. We'll
++		 * apply the filter again on the new device. */
++		pw_log_info("[%s] stream %u: moved away from filter %s",
++				client->name, s->id, s->filter ? s->filter->name : "");
++		stream_detach(s);
++		schedule_run(s->impl->filter_apply);
++		return;
++	}
++}
++
++void filter_apply_stream_changed(struct stream *stream)
++{
++	stream->filter_inhibit = false;
++	schedule_run(stream->impl->filter_apply);
++}
++
++void filter_apply_stream_free(struct stream *stream)
++{
++	if (stream->filter == NULL)
++		return;
++	stream->filter = NULL;
++	stream->filter_target = SPA_ID_INVALID;
++	schedule_run(stream->impl->filter_apply);
++}
++
++int filter_apply_init(struct impl *impl)
++{
++	struct filter_apply *fa;
++
++	fa = calloc(1, sizeof(*fa));
++	if (fa == NULL)
++		return -errno;
++
++	fa->impl = impl;
++	spa_list_init(&fa->filters);
++	impl->filter_apply = fa;
++	return 0;
++}
++
++void filter_apply_free(struct impl *impl)
++{
++	struct filter_apply *fa = impl->filter_apply;
++	struct filter *f;
++
++	if (fa == NULL)
++		return;
++
++	/* the modules are unloaded by the caller */
++	spa_list_consume(f, &fa->filters, link)
++		filter_free(f);
++
++	if (fa->timer_pending)
++		pw_timer_queue_cancel(&fa->timer);
++	if (fa->check_pending)
++		pw_timer_queue_cancel(&fa->check_timer);
++	pw_work_queue_cancel(impl->work_queue, fa, SPA_ID_INVALID);
++
++	impl->filter_apply = NULL;
++	free(fa);
++}
+diff --git a/src/modules/module-protocol-pulse/filter-apply.h b/src/modules/module-protocol-pulse/filter-apply.h
+new file mode 100644
+index 000000000..614900c11
+--- /dev/null
++++ b/src/modules/module-protocol-pulse/filter-apply.h
+@@ -0,0 +1,159 @@
++/* PipeWire */
++/* SPDX-FileCopyrightText: Copyright © 2026 PipeWire authors */
++/* SPDX-License-Identifier: MIT */
++
++#ifndef PULSE_SERVER_FILTER_APPLY_H
++#define PULSE_SERVER_FILTER_APPLY_H
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <spa/utils/dict.h>
++#include <spa/utils/string.h>
++
++/*
++ * Automatic filters for streams, the equivalent of the PulseAudio
++ * module-filter-heuristics + module-filter-apply pair.
++ *
++ * A stream asks for a filter with the filter.want or filter.apply property,
++ * for example filter.want = "echo-cancel". The server then loads (or reuses)
++ * module-<filter> on top of the device the stream is playing to or recording
++ * from, routes the stream through the filter and unloads the filter again
++ * when it is no longer used. filter.suppress = <filter> disables the filter
++ * for a stream.
++ *
++ * Echo cancellation needs both the playback and the capture side of a call.
++ * Like PulseAudio, the echo canceller is only set up once there is a
++ * playback and a record stream in the same group (same media.role,
++ * application.id, application.name or media.name) that both ask for it.
++ */
++
++#define FILTER_KEY_WANT		"filter.want"
++#define FILTER_KEY_APPLY	"filter.apply"
++#define FILTER_KEY_SUPPRESS	"filter.suppress"
++#define FILTER_ECHO_CANCEL	"echo-cancel"
++
++struct impl;
++struct stream;
++struct client;
++struct pw_manager_object;
++
++int filter_apply_init(struct impl *impl);
++void filter_apply_free(struct impl *impl);
++
++/* an object was added or removed, re-evaluate the streams */
++void filter_apply_object_changed(struct impl *impl, struct pw_manager_object *o);
++/* an object changed */
++void filter_apply_object_updated(struct impl *impl, struct pw_manager_object *o);
++/* the default metadata of a client changed */
++void filter_apply_metadata(struct client *client, uint32_t subject, const char *key,
++		const char *value);
++/* the properties of the stream changed */
++void filter_apply_stream_changed(struct stream *stream);
++/* the stream is about to be destroyed */
++void filter_apply_stream_free(struct stream *stream);
++
++/* returns true when word is one of the space separated words in list */
++static inline bool filter_apply_str_in_list(const char *list, const char *word)
++{
++	size_t len, wlen;
++
++	if (list == NULL || word == NULL)
++		return false;
++
++	wlen = strlen(word);
++	while (*list != '\0') {
++		list += strspn(list, " \t");
++		len = strcspn(list, " \t");
++		if (len == wlen && strncmp(list, word, len) == 0)
++			return true;
++		list += len;
++	}
++	return false;
++}
++
++/* Devices that are meant for calls (headsets and handsets) do their own echo
++ * cancellation. PulseAudio uses the "phone" role, PipeWire "Communication". */
++static inline bool filter_apply_is_phone_device(const char *intended_roles)
++{
++	return filter_apply_str_in_list(intended_roles, "phone") ||
++		filter_apply_str_in_list(intended_roles, "Communication");
++}
++
++/**
++ * Get the filter a stream wants.
++ *
++ * \param props the stream properties
++ * \param intended_roles the device.intended-roles of the device the stream
++ *     is using, or NULL
++ * \return the filter name or NULL when no filter should be applied
++ *
++ * filter.apply is an explicit request and is always honoured. filter.want is
++ * a hint (module-filter-heuristics), it is ignored when filter.apply is set
++ * and on devices that are meant for calls. In both cases filter.suppress set
++ * to the same filter name disables the filter.
++ */
++static inline const char *filter_apply_get_name(const struct spa_dict *props,
++		const char *intended_roles)
++{
++	const char *name, *suppress;
++
++	if (props == NULL)
++		return NULL;
++
++	if ((name = spa_dict_lookup(props, FILTER_KEY_APPLY)) == NULL) {
++		if ((name = spa_dict_lookup(props, FILTER_KEY_WANT)) == NULL)
++			return NULL;
++		if (filter_apply_is_phone_device(intended_roles))
++			return NULL;
++	}
++	if (name[0] == '\0')
++		return NULL;
++
++	suppress = spa_dict_lookup(props, FILTER_KEY_SUPPRESS);
++	if (spa_streq(suppress, name))
++		return NULL;
++
++	return name;
++}
++
++/* Lookup a key in the stream properties, then in the client properties */
++static inline const char *filter_apply_lookup(const struct spa_dict *props,
++		const struct spa_dict *client_props, const char *key)
++{
++	const char *str = props ? spa_dict_lookup(props, key) : NULL;
++	if (str == NULL && client_props != NULL)
++		str = spa_dict_lookup(client_props, key);
++	return str;
++}
++
++/**
++ * Make the group name of a stream for a filter, this is what
++ * pa_proplist_get_stream_group() does. Streams of the same group are routed
++ * through the same filter. Streams that want a different filter are never in
++ * the same group.
++ */
++static inline int filter_apply_get_group(char *buf, size_t size, const char *filter,
++		const struct spa_dict *props, const struct spa_dict *client_props)
++{
++	static const struct {
++		const char *key;
++		const char *tag;
++	} keys[] = {
++		{ "media.role", "by-media-role" },
++		{ "application.id", "by-application-id" },
++		{ "application.name", "by-application-name" },
++		{ "media.name", "by-media-name" },
++	};
++	const char *str;
++	size_t i;
++
++	for (i = 0; i < SPA_N_ELEMENTS(keys); i++) {
++		if ((str = filter_apply_lookup(props, client_props, keys[i].key)) != NULL)
++			return snprintf(buf, size, "%s-%s:%s", filter, keys[i].tag, str);
++	}
++	return snprintf(buf, size, "%s-fallback", filter);
++}
++
++#endif /* PULSE_SERVER_FILTER_APPLY_H */
+diff --git a/src/modules/module-protocol-pulse/internal.h b/src/modules/module-protocol-pulse/internal.h
+index 9f9531e7e..9d2153524 100644
+--- a/src/modules/module-protocol-pulse/internal.h
++++ b/src/modules/module-protocol-pulse/internal.h
+@@ -23,9 +23,11 @@ struct pw_loop;
+ struct pw_context;
+ struct pw_work_queue;
+ struct pw_properties;
++struct filter_apply;
+ 
+ struct defs {
+ 	bool allow_module_loading;
++	bool filter_apply;
+ 	struct spa_fraction min_req;
+ 	struct spa_fraction default_req;
+ 	struct spa_fraction min_frag;
+@@ -68,6 +70,8 @@ struct impl {
+ 	struct pw_map samples;
+ 	struct pw_map modules;
+ 
++	struct filter_apply *filter_apply;
++
+ 	struct spa_list free_messages;
+ 	struct defs defs;
+ 	struct stats stat;
+diff --git a/src/modules/module-protocol-pulse/pulse-server.c b/src/modules/module-protocol-pulse/pulse-server.c
+index 7f19739a1..9560c7541 100644
+--- a/src/modules/module-protocol-pulse/pulse-server.c
++++ b/src/modules/module-protocol-pulse/pulse-server.c
+@@ -41,6 +41,7 @@
+ #include "dbus-name.h"
+ #include "defs.h"
+ #include "extension.h"
++#include "filter-apply.h"
+ #include "format.h"
+ #include "internal.h"
+ #include "manager.h"
+@@ -58,6 +59,7 @@
+ #include "volume.h"
+ 
+ #define DEFAULT_ALLOW_MODULE_LOADING 	"true"
++#define DEFAULT_FILTER_APPLY		"true"
+ #define DEFAULT_MIN_REQ			"256/48000"
+ #define DEFAULT_DEFAULT_REQ		"960/48000"
+ #define DEFAULT_MIN_FRAG		"256/48000"
+@@ -891,6 +893,8 @@ static void manager_added(void *data, struct pw_manager_object *o)
+ 
+ 	update_object_info(manager, o, &impl->defs);
+ 
++	filter_apply_object_changed(impl, o);
++
+ 	send_object_event(client, o, SUBSCRIPTION_EVENT_NEW);
+ 
+ 	o->change_mask = 0;
+@@ -907,6 +911,8 @@ static void manager_updated(void *data, struct pw_manager_object *o)
+ 
+ 	update_object_info(manager, o, &impl->defs);
+ 
++	filter_apply_object_updated(impl, o);
++
+ 	send_object_event(client, o, SUBSCRIPTION_EVENT_CHANGE);
+ 
+ 	o->change_mask = 0;
+@@ -922,6 +928,8 @@ static void manager_removed(void *data, struct pw_manager_object *o)
+ 	struct client *client = data;
+ 	const char *str;
+ 
++	filter_apply_object_changed(client->impl, o);
++
+ 	send_object_event(client, o, SUBSCRIPTION_EVENT_REMOVE);
+ 
+ 	send_default_change_subscribe_event(client, pw_manager_object_is_sink(o), pw_manager_object_is_source_or_monitor(o));
+@@ -950,6 +958,9 @@ static void manager_metadata(void *data, struct pw_manager_object *o,
+ 	pw_log_debug("meta id:%d subject:%d key:%s type:%s value:%s",
+ 			o->id, subject, key, type, value);
+ 
++	if (subject != PW_ID_CORE && o == client->metadata_default)
++		filter_apply_metadata(client, subject, key, value);
++
+ 	if (subject == PW_ID_CORE && o == client->metadata_default) {
+ 		char name[1024];
+ 
+@@ -3325,8 +3336,10 @@ static int do_update_proplist(struct client *client, uint32_t command, uint32_t
+ 		if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
+ 			return -ENOENT;
+ 
+-		if (pw_stream_update_properties(stream->stream, &props->dict) > 0)
++		if (pw_stream_update_properties(stream->stream, &props->dict) > 0) {
+ 			stream_update_tag_param(stream);
++			filter_apply_stream_changed(stream);
++		}
+ 	} else {
+ 		if (pw_properties_update(client->props, &props->dict) > 0) {
+ 			client_update_quirks(client);
+@@ -3386,7 +3399,8 @@ static int do_remove_proplist(struct client *client, uint32_t command, uint32_t
+ 		if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
+ 			return -ENOENT;
+ 
+-		pw_stream_update_properties(stream->stream, &dict);
++		if (pw_stream_update_properties(stream->stream, &dict) > 0)
++			filter_apply_stream_changed(stream);
+ 	} else {
+ 		pw_core_update_properties(client->core, &dict);
+ 	}
+@@ -5553,6 +5567,8 @@ static void impl_clear(struct impl *impl)
+ 	struct server *s;
+ 	struct client *c;
+ 
++	filter_apply_free(impl);
++
+ 	pw_map_for_each(&impl->modules, impl_unload_module, impl);
+ 	pw_map_clear(&impl->modules);
+ 
+@@ -5676,6 +5692,8 @@ static void load_defaults(struct defs *def, struct pw_properties *props)
+ {
+ 	parse_bool(props, "pulse.allow-module-loading", DEFAULT_ALLOW_MODULE_LOADING,
+ 			&def->allow_module_loading);
++	parse_bool(props, "pulse.filter-apply", DEFAULT_FILTER_APPLY,
++			&def->filter_apply);
+ 	parse_frac(props, "pulse.min.req", DEFAULT_MIN_REQ, &def->min_req);
+ 	parse_frac(props, "pulse.default.req", DEFAULT_DEFAULT_REQ, &def->default_req);
+ 	parse_frac(props, "pulse.min.frag", DEFAULT_MIN_FRAG, &def->min_frag);
+@@ -5718,6 +5736,9 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
+ 	impl->work_queue = pw_context_get_work_queue(context);
+ 	impl->timer_queue = pw_context_get_timer_queue(context);
+ 
++	if ((res = filter_apply_init(impl)) < 0)
++		goto error_free;
++
+ 	if (props == NULL)
+ 		props = pw_properties_new(NULL, NULL);
+ 	if (props == NULL)
+diff --git a/src/modules/module-protocol-pulse/stream.c b/src/modules/module-protocol-pulse/stream.c
+index 2ce36a74a..bb15d94f5 100644
+--- a/src/modules/module-protocol-pulse/stream.c
++++ b/src/modules/module-protocol-pulse/stream.c
+@@ -21,6 +21,7 @@
+ #include "client.h"
+ #include "commands.h"
+ #include "defs.h"
++#include "filter-apply.h"
+ #include "internal.h"
+ #include "log.h"
+ #include "message.h"
+@@ -86,6 +87,7 @@ struct stream *stream_new(struct client *client, enum stream_type type, uint32_t
+ 	spa_ringbuffer_init(&stream->ring);
+ 
+ 	stream->peer_index = SPA_ID_INVALID;
++	stream->filter_target = SPA_ID_INVALID;
+ 
+ 	parse_frac(client->props, "pulse.min.req", &defs->min_req, &stream->min_req);
+ 	parse_frac(client->props, "pulse.min.frag", &defs->min_frag, &stream->min_frag);
+@@ -142,6 +144,8 @@ void stream_free(struct stream *stream)
+ 
+ 	pw_timer_queue_cancel(&stream->timer);
+ 
++	filter_apply_stream_free(stream);
++
+ 	if (stream->drain_tag)
+ 		reply_error(client, -1, stream->drain_tag, -ENOENT);
+ 
+diff --git a/src/modules/module-protocol-pulse/stream.h b/src/modules/module-protocol-pulse/stream.h
+index 8e1fe178c..faa83b7c5 100644
+--- a/src/modules/module-protocol-pulse/stream.h
++++ b/src/modules/module-protocol-pulse/stream.h
+@@ -16,6 +16,7 @@
+ #include "volume.h"
+ 
+ struct impl;
++struct filter;
+ struct client;
+ struct spa_io_rate_match;
+ 
+@@ -91,6 +92,9 @@ struct stream {
+ 	struct volume volume;
+ 	bool muted;
+ 
++	struct filter *filter;		/**< filter we routed the stream to, see filter-apply.c */
++	uint64_t filter_target;		/**< serial of the filter node we moved the stream to */
++
+ 	uint32_t drain_tag;
+ 	unsigned int corked:1;
+ 	unsigned int draining:1;
+@@ -107,6 +111,9 @@ struct stream {
+ 	unsigned int fail_on_suspend:1;
+ 	unsigned int is_suspended:1;
+ 	unsigned int dont_inhibit_auto_suspend:1;
++	unsigned int filter_inhibit:1;	/**< don't apply filters until the properties change */
++	unsigned int filter_no_restore:1; /**< we set state.restore-target = false */
++	unsigned int filter_retry:2;	/**< times we asked again to move to the filter */
+ };
+ 
+ struct stream *stream_new(struct client *client, enum stream_type type, uint32_t create_tag,
+diff --git a/src/modules/module-protocol-pulse/test-filter-apply.c b/src/modules/module-protocol-pulse/test-filter-apply.c
+new file mode 100644
+index 000000000..df1810f4d
+--- /dev/null
++++ b/src/modules/module-protocol-pulse/test-filter-apply.c
+@@ -0,0 +1,132 @@
++/* PipeWire */
++/* SPDX-FileCopyrightText: Copyright © 2026 woahwhattheheck */
++/* SPDX-License-Identifier: MIT */
++
++/* Check the filter.want / filter.apply / filter.suppress rules and the
++ * stream grouping used to pair echo-cancel streams. */
++
++#include <stdio.h>
++
++#include <spa/utils/defs.h>
++#include <spa/utils/dict.h>
++#include <spa/utils/string.h>
++
++#include "filter-apply.h"
++
++#define DICT(...) &SPA_DICT_ITEMS(__VA_ARGS__)
++
++static void test_str_in_list(void)
++{
++	spa_assert_se(filter_apply_str_in_list("phone", "phone"));
++	spa_assert_se(filter_apply_str_in_list("music  phone", "phone"));
++	spa_assert_se(filter_apply_str_in_list(" phone music", "phone"));
++	spa_assert_se(!filter_apply_str_in_list("phones", "phone"));
++	spa_assert_se(!filter_apply_str_in_list("headphone", "phone"));
++	spa_assert_se(!filter_apply_str_in_list("", "phone"));
++	spa_assert_se(!filter_apply_str_in_list(NULL, "phone"));
++
++	spa_assert_se(filter_apply_is_phone_device("phone"));
++	spa_assert_se(filter_apply_is_phone_device("Communication"));
++	spa_assert_se(filter_apply_is_phone_device("Music Communication"));
++	spa_assert_se(!filter_apply_is_phone_device("Music"));
++	spa_assert_se(!filter_apply_is_phone_device(NULL));
++}
++
++static void test_get_name(void)
++{
++	/* nothing requested */
++	spa_assert_se(filter_apply_get_name(NULL, NULL) == NULL);
++	spa_assert_se(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM("media.role", "phone")), NULL) == NULL);
++
++	/* filter.want */
++	spa_assert_se(spa_streq(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel")), NULL),
++			"echo-cancel"));
++	spa_assert_se(spa_streq(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel")), "Music"),
++			"echo-cancel"));
++	spa_assert_se(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "")), NULL) == NULL);
++
++	/* filter.want is a hint, devices for calls cancel echo themselves */
++	spa_assert_se(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel")), "phone") == NULL);
++	spa_assert_se(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel")), "Communication") == NULL);
++
++	/* filter.apply is explicit, it wins over filter.want and the device */
++	spa_assert_se(spa_streq(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_APPLY, "echo-cancel")), "phone"),
++			"echo-cancel"));
++	spa_assert_se(spa_streq(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_APPLY, "equalizer-sink"),
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel")), NULL),
++			"equalizer-sink"));
++	/* an empty filter.apply disables filter.want */
++	spa_assert_se(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_APPLY, ""),
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel")), NULL) == NULL);
++
++	/* filter.suppress */
++	spa_assert_se(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel"),
++			SPA_DICT_ITEM(FILTER_KEY_SUPPRESS, "echo-cancel")), NULL) == NULL);
++	spa_assert_se(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_APPLY, "echo-cancel"),
++			SPA_DICT_ITEM(FILTER_KEY_SUPPRESS, "echo-cancel")), NULL) == NULL);
++	spa_assert_se(spa_streq(filter_apply_get_name(DICT(
++			SPA_DICT_ITEM(FILTER_KEY_WANT, "echo-cancel"),
++			SPA_DICT_ITEM(FILTER_KEY_SUPPRESS, "equalizer-sink")), NULL),
++			"echo-cancel"));
++}
++
++static void test_group(void)
++{
++	char a[256], b[256];
++
++	/* media.role comes first */
++	filter_apply_get_group(a, sizeof(a), "echo-cancel", DICT(
++			SPA_DICT_ITEM("media.role", "Communication"),
++			SPA_DICT_ITEM("application.name", "Jami")), NULL);
++	spa_assert_se(spa_streq(a, "echo-cancel-by-media-role:Communication"));
++
++	/* then the application, which can come from the client */
++	filter_apply_get_group(a, sizeof(a), "echo-cancel", DICT(
++			SPA_DICT_ITEM("media.name", "playback")), DICT(
++			SPA_DICT_ITEM("application.name", "Jami")));
++	filter_apply_get_group(b, sizeof(b), "echo-cancel", DICT(
++			SPA_DICT_ITEM("media.name", "record")), DICT(
++			SPA_DICT_ITEM("application.name", "Jami")));
++	spa_assert_se(spa_streq(a, "echo-cancel-by-application-name:Jami"));
++	spa_assert_se(spa_streq(a, b));
++
++	filter_apply_get_group(a, sizeof(a), "echo-cancel", DICT(
++			SPA_DICT_ITEM("application.id", "net.jami.Jami"),
++			SPA_DICT_ITEM("application.name", "Jami")), NULL);
++	spa_assert_se(spa_streq(a, "echo-cancel-by-application-id:net.jami.Jami"));
++
++	/* streams of different applications are not grouped */
++	filter_apply_get_group(b, sizeof(b), "echo-cancel", DICT(
++			SPA_DICT_ITEM("application.id", "org.gnome.Calls")), NULL);
++	spa_assert_se(!spa_streq(a, b));
++
++	/* streams that want a different filter are not grouped */
++	filter_apply_get_group(a, sizeof(a), "echo-cancel", DICT(
++			SPA_DICT_ITEM("media.role", "Communication")), NULL);
++	filter_apply_get_group(b, sizeof(b), "equalizer-sink", DICT(
++			SPA_DICT_ITEM("media.role", "Communication")), NULL);
++	spa_assert_se(!spa_streq(a, b));
++
++	filter_apply_get_group(a, sizeof(a), "echo-cancel", NULL, NULL);
++	spa_assert_se(spa_streq(a, "echo-cancel-fallback"));
++}
++
++int main(int argc, char *argv[])
++{
++	test_str_in_list();
++	test_get_name();
++	test_group();
++	fprintf(stdout, "filter-apply: all tests passed\n");
++	return 0;
++}
+-- 
+2.43.0
+

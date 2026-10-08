@@ -19,7 +19,7 @@ It is one continuous, unedited capture. Every action is a real X11 input event (
 
 ## Source the demo binary was built from (read this first)
 
-**PR head `a89f905d462f23d454454df98f6b9937c3e71d30` cannot show its main window.** Both build modes stop with:
+**PR head `a89f905d462f23d454454df98f6b9937c3e71d30` cannot show its main window.** Both build modes fail with:
 
 ```
 qrc:/src/ui/menu/LensProfile.qml:231:5: CameraLensSelector is not a type
@@ -32,7 +32,9 @@ QQmlApplicationEngine failed to load component
 * `cargo build --release` (`just run`): QML is embedded through the explicit `qrc!` list in `src/resources_qml.rs`, which does not include `CameraLensSelector.qml` or `CameraCatalog.js`. Log: `evidence/exact_head_release_build_qml_error.txt`.
 * On `master`, every component is registered in both places.
 
-`fix.patch` adds those three registration lines and changes no behaviour. It is commit `1dd5ad89e4d6ddf3e0b499360892e108869bc7c8` on top of `a89f905d`. **The demo binary was built from `a89f905d` + `fix.patch`, source tree `74e2508f055ac0e4e94bebf7025cfab10bfe3940`.** After `fix.patch` is applied to the PR branch, `git rev-parse HEAD^{tree}` on the new head should print `74e2508f…`. If it does, the video matches that head byte for byte at source level.
+`fix.patch` adds those three registration lines and changes no behaviour. It is commit `1dd5ad89e4d6ddf3e0b499360892e108869bc7c8` on top of `a89f905d`. **The demo binary was built from `a89f905d` + `fix.patch`, source tree `74e2508f055ac0e4e94bebf7025cfab10bfe3940`.**
+
+**Live PR head match (re-read 2026-10-08 05:19 UTC).** The same three lines are now on the PR branch as `61a94a77` + `7637c87c`. Live PR head `7637c87cb37f7a6439a3e6ac3e011942773bdfb5` has `HEAD^{tree}` = `74e2508f…`, so the video matches the current PR head byte for byte at source level.
 
 ## Build provenance
 
@@ -72,12 +74,14 @@ QQmlApplicationEngine failed to load component
 
 ```bash
 git clone https://github.com/gyroflow/gyroflow && cd gyroflow
-git fetch origin pull/1244/head && git checkout a89f905d462f23d454454df98f6b9937c3e71d30
-git am --keep-cr /path/to/fix.patch           # CRLF files; tree must be 74e2508f…
+git fetch origin pull/1244/head && git checkout 7637c87cb37f7a6439a3e6ac3e011942773bdfb5
+git rev-parse HEAD^{tree}                      # 74e2508f… (same as a89f905d + fix.patch)
 # ext/: Qt 6.4.3 (aqt), ffmpeg-9.0-linux-clang-gpl-lite, mdk-sdk, OpenCV 4.12.0 (see table)
-. repro/env.sh && cargo build --profile deploy --locked
+. /path/to/bounty-work/gyroflow__gyroflow__742/repro/env.sh && cargo build --profile deploy --locked
 Xvfb :142 -screen 0 1600x1000x24 -noreset &
-repro/record_demo.sh                           # writes rec/raw.mkv + rec/marks.txt
+/path/to/bounty-work/gyroflow__gyroflow__742/repro/record_demo.sh   # writes rec/raw.mkv + rec/marks.txt
 ```
 
-`evidence/demo_step_timestamps.txt` holds the step marks from the recorded run. `evidence/demo_run_app_log_excerpt.txt` holds the app log lines: Qt/Gyroflow version, profiles loaded, OpenCV 4.12.0, calibration RMS.
+The `repro/` scripts use this container's absolute paths: the clone at `/home/user/work/clones/gyroflow__gyroflow` and the work dir `/home/user/work/gyroflow-demo` (`drive.sh`, `env.sh`, the chessboard clip). Edit `P`, `REC` and the sourced paths before running them elsewhere.
+
+`evidence/demo_step_timestamps.txt` contains the step marks from the recorded run. `evidence/demo_run_app_log_excerpt.txt` contains the app log lines: Qt/Gyroflow version, profiles loaded, OpenCV 4.12.0, calibration RMS.

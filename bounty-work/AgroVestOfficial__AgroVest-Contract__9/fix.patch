@@ -1,0 +1,78 @@
+diff --git a/contracts/dao/src/lib.rs b/contracts/dao/src/lib.rs
+--- a/contracts/dao/src/lib.rs
++++ b/contracts/dao/src/lib.rs
+@@ -233,6 +233,18 @@ impl DaoContract {
+     /// Tally votes for a proposal.
+     pub fn tally_votes(env: Env, caller: Address, proposal_id: u32) {
+         caller.require_auth();
+ 
++        let prop_key = (Symbol::new(&env, "prop"), proposal_id);
++        let proposal: ProposalData = env
++            .storage()
++            .persistent()
++            .get(&prop_key)
++            .unwrap_or_else(|| panic!("{:?}", DaoError::ProposalNotFound));
++
++        if env.ledger().timestamp() < proposal.ends_at {
++            panic!("{:?}", DaoError::ProposalNotEnded);
++        }
++
+         let total_key = (Symbol::new(&env, "total_v"), proposal_id);
+         let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+ 
+diff --git a/contracts/dao/src/test.rs b/contracts/dao/src/test.rs
+--- a/contracts/dao/src/test.rs
++++ b/contracts/dao/src/test.rs
+@@ -1,4 +1,4 @@
+-use soroban_sdk::testutils::Address as _;
++use soroban_sdk::testutils::{Address as _, Ledger as _};
+ use soroban_sdk::token::{StellarAssetClient, TokenClient};
+ use soroban_sdk::{contract, contractimpl, Address, Env, String};
+ 
+@@ -203,6 +203,23 @@ fn test_resolve_dispute() {
+     assert!(dispute.ruling);
+ }
+ 
++#[test]
++#[should_panic(expected = "ProposalNotEnded")]
++fn test_tally_votes_before_proposal_end_fails() {
++    let ctx = setup();
++    let proposer = Address::generate(&ctx.env);
++    let caller = Address::generate(&ctx.env);
++    let title = String::from_str(&ctx.env, "Fund Rice Farm");
++    let desc = String::from_str(&ctx.env, "Proposal to fund rice farming operations");
++    let ends_at = ctx.env.ledger().timestamp() + 86400;
++
++    ctx.client
++        .create_proposal(&proposer, &title, &desc, &100i128, &ends_at);
++
++    ctx.client.tally_votes(&caller, &1u32);
++}
++
+ #[test]
+ #[should_panic(expected = "InsufficientVotes")]
+ fn test_execute_proposal_reject_votes_fails() {
+@@ -220,6 +237,7 @@ fn test_execute_proposal_reject_votes_fails() {
+     ctx.client
+         .create_proposal(&proposer, &title, &desc, &100i128, &ends_at);
+     ctx.client.vote_proposal(&voter, &1u32, &VoteData::Reject);
++    ctx.env.ledger().set_timestamp(ends_at);
+     ctx.client.tally_votes(&voter, &1u32);
+ 
+     let name = String::from_str(&ctx.env, "Rice Farm");
+@@ -245,6 +263,7 @@ fn test_execute_proposal_insufficient_accept_votes_fails() {
+     ctx.client
+         .create_proposal(&proposer, &title, &desc, &1000i128, &ends_at);
+     ctx.client.vote_proposal(&voter, &1u32, &VoteData::Accept);
++    ctx.env.ledger().set_timestamp(ends_at);
+     ctx.client.tally_votes(&voter, &1u32);
+ 
+     let proposal = ctx.client.get_proposal(&1u32);
+@@ -272,6 +291,7 @@ fn test_execute_proposal_sufficient_accept_votes_succeeds() {
+     ctx.client
+         .create_proposal(&proposer, &title, &desc, &50i128, &ends_at);
+     ctx.client.vote_proposal(&voter, &1u32, &VoteData::Accept);
++    ctx.env.ledger().set_timestamp(ends_at);
+     ctx.client.tally_votes(&voter, &1u32);
+ 
+     let proposal = ctx.client.get_proposal(&1u32);

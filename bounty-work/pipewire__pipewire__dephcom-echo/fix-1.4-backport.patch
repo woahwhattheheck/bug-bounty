@@ -1,4 +1,4 @@
-From 29ace7613c67de9816d99d71333625e254e8749e Mon Sep 17 00:00:00 2001
+From a65023389447f1f6d7c9db748af285ed3e952375 Mon Sep 17 00:00:00 2001
 From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 04:33:18 +0000
 Subject: [PATCH] pulse-server: apply filters requested with
@@ -43,14 +43,14 @@ Fixes #4170
  src/daemon/pipewire-pulse.conf.in             |    1 +
  src/modules/meson.build                       |   11 +
  src/modules/module-protocol-pulse.c           |   43 +
- .../module-protocol-pulse/filter-apply.c      | 1022 +++++++++++++++++
+ .../module-protocol-pulse/filter-apply.c      | 1040 +++++++++++++++++
  .../module-protocol-pulse/filter-apply.h      |  159 +++
  src/modules/module-protocol-pulse/internal.h  |    4 +
  .../module-protocol-pulse/pulse-server.c      |   25 +-
  src/modules/module-protocol-pulse/stream.c    |    4 +
  src/modules/module-protocol-pulse/stream.h    |    7 +
  .../module-protocol-pulse/test-filter-apply.c |  132 +++
- 10 files changed, 1406 insertions(+), 2 deletions(-)
+ 10 files changed, 1424 insertions(+), 2 deletions(-)
  create mode 100644 src/modules/module-protocol-pulse/filter-apply.c
  create mode 100644 src/modules/module-protocol-pulse/filter-apply.h
  create mode 100644 src/modules/module-protocol-pulse/test-filter-apply.c
@@ -159,10 +159,10 @@ index ea5eb6cbe..cb4ecba2c 100644
   *\code{.unparsed}
 diff --git a/src/modules/module-protocol-pulse/filter-apply.c b/src/modules/module-protocol-pulse/filter-apply.c
 new file mode 100644
-index 000000000..36e2b83ae
+index 000000000..9651486da
 --- /dev/null
 +++ b/src/modules/module-protocol-pulse/filter-apply.c
-@@ -0,0 +1,1022 @@
+@@ -0,0 +1,1040 @@
 +/* PipeWire */
 +/* SPDX-FileCopyrightText: Copyright © 2026 woahwhattheheck */
 +/* SPDX-License-Identifier: MIT */
@@ -735,26 +735,44 @@ index 000000000..36e2b83ae
 +	return f;
 +}
 +
++static bool module_has_arg(const struct module_info *info, const char *key)
++{
++	const char * const *a;
++	const char *usage, *p;
++	size_t len = strlen(key);
++
++	if (info->valid_args != NULL) {
++		for (a = info->valid_args; *a != NULL; a++) {
++			if (spa_streq(*a, key))
++				return true;
++		}
++		return false;
++	}
++	/* most modules only describe their arguments in the usage */
++	if (info->properties == NULL ||
++	    (usage = spa_dict_lookup(info->properties, PW_KEY_MODULE_USAGE)) == NULL)
++		return false;
++	for (p = usage; (p = strstr(p, key)) != NULL; p += len) {
++		if (p[len] == '=')
++			return true;
++	}
++	return false;
++}
++
 +static bool filter_supports(struct impl *impl, const char *name, int side, bool group)
 +{
 +	const struct module_info *info;
-+	const char * const *a;
-+	char module_name[256];
-+	bool has[N_SIDES] = { false, false };
++	char module_name[256], key[64];
++	bool has[N_SIDES];
 +	int i;
 +
 +	snprintf(module_name, sizeof(module_name), "module-%s", name);
-+	if ((info = module_info_find(impl, module_name)) == NULL ||
-+	    info->load == NULL || info->valid_args == NULL)
++	if ((info = module_info_find(impl, module_name)) == NULL || info->load == NULL)
 +		return false;
 +
-+	for (a = info->valid_args; *a != NULL; a++) {
-+		for (i = 0; i < N_SIDES; i++) {
-+			char key[64];
-+			snprintf(key, sizeof(key), "%s_master", side_names[i]);
-+			if (spa_streq(*a, key))
-+				has[i] = true;
-+		}
++	for (i = 0; i < N_SIDES; i++) {
++		snprintf(key, sizeof(key), "%s_master", side_names[i]);
++		has[i] = module_has_arg(info, key);
 +	}
 +	return group ? (has[SIDE_SINK] && has[SIDE_SOURCE]) : has[side];
 +}

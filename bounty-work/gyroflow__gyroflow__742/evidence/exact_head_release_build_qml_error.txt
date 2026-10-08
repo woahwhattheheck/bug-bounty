@@ -1,0 +1,7 @@
+04:17:21 [DEBUG] gyroflow: [in main] Qt version: 6.4.3
+04:17:21 [DEBUG] gyroflow: Gyroflow 1.6.3 (dev248193)
+04:17:21 [WARN] QQmlApplicationEngine failed to load component
+04:17:21 [WARN] qrc:/src/ui/main_window.qml:140:13: Type App unavailable
+04:17:21 [WARN] qrc:/src/ui/App.qml:176:17: Type Menu.LensProfile unavailable
+04:17:21 [WARN] qrc:/src/ui/menu/LensProfile.qml:231:5: CameraLensSelector is not a type
+binary sha256 13fbf0ded6c2eaeef1e9ef4d7d08d284cfe02a3afdfb998a5660b5ee74a7ec20  (git a89f905d462f23d454454df98f6b9937c3e71d30, cargo build --release)

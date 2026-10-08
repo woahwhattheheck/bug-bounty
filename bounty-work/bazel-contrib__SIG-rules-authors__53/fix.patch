@@ -1,0 +1,1759 @@
+From 515e77f0bce1333ed18fdfc8e1e869827a704029 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:47:33 +0000
+Subject: [PATCH] feat(catalog): add a GitHub traffic collector
+
+GitHub only shows repository traffic to accounts with push access and only
+keeps the last 14 days, so the SIG cannot gather these numbers itself.
+
+Add tools/github_traffic/github_traffic.py, which reads the documented
+traffic endpoints (views, clones, popular referrers and paths) with a token
+taken from the environment, merges each 14-day window into CSV files that
+keep the full history, and can publish them to a GitHub Gist the SIG can
+ingest without a privileged token. Repositories can be listed explicitly,
+read from a file, or enumerated from an org (public, non-archived, non-fork
+repositories the token can push to). It handles pagination, primary and
+secondary rate limits and transient errors, and only needs the Python
+standard library.
+
+Add a daily GitHub Actions workflow that runs it once a token secret and a
+Gist ID are configured, plus documentation and unit tests that run against
+a fake transport.
+
+Closes #53
+---
+ .github/workflows/github_traffic.yaml       |  63 ++
+ .gitignore                                  |   3 +
+ README.md                                   |   6 +
+ tools/github_traffic/README.md              | 162 ++++
+ tools/github_traffic/github_traffic.py      | 781 ++++++++++++++++++++
+ tools/github_traffic/github_traffic_test.py | 663 +++++++++++++++++
+ 6 files changed, 1678 insertions(+)
+ create mode 100644 .github/workflows/github_traffic.yaml
+ create mode 100644 .gitignore
+ create mode 100644 tools/github_traffic/README.md
+ create mode 100755 tools/github_traffic/github_traffic.py
+ create mode 100755 tools/github_traffic/github_traffic_test.py
+
+diff --git a/.github/workflows/github_traffic.yaml b/.github/workflows/github_traffic.yaml
+new file mode 100644
+index 0000000..12f99ca
+--- /dev/null
++++ b/.github/workflows/github_traffic.yaml
+@@ -0,0 +1,63 @@
++# Collects GitHub traffic (views, clones, referrers, popular paths) for the
++# repositories in TRAFFIC_ORG and publishes the history to a Gist.
++# See tools/github_traffic/README.md for the one-time setup.
++name: GitHub traffic
++
++on:
++  schedule:
++    # GitHub keeps 14 days of traffic, so any cadence under two weeks loses
++    # nothing. Daily runs keep the published data fresh.
++    - cron: "17 6 * * *"
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: github-traffic
++  cancel-in-progress: false
++
++jobs:
++  collect:
++    if: github.repository == 'bazel-contrib/SIG-rules-authors'
++    runs-on: ubuntu-latest
++    timeout-minutes: 30
++    env:
++      # Token of an account with push access to the repositories.
++      GITHUB_TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
++      # Optional token with Gist write access, if different from the above.
++      GIST_TOKEN: ${{ secrets.TRAFFIC_GIST_TOKEN }}
++      TRAFFIC_ORG: ${{ vars.TRAFFIC_ORG || 'bazelbuild' }}
++      TRAFFIC_MATCH: ${{ vars.TRAFFIC_MATCH }}
++      TRAFFIC_GIST_ID: ${{ vars.TRAFFIC_GIST_ID }}
++    steps:
++      - uses: actions/checkout@v4
++      - name: Collect traffic
++        shell: bash
++        run: |
++          if [[ -z "${GITHUB_TRAFFIC_TOKEN}" ]]; then
++            echo "::notice::The TRAFFIC_TOKEN secret is not set; nothing to collect."
++            exit 0
++          fi
++          args=(--org "${TRAFFIC_ORG}" --output-dir traffic-data)
++          if [[ -n "${TRAFFIC_MATCH}" ]]; then
++            args+=(--match "${TRAFFIC_MATCH}")
++          fi
++          if [[ -n "${TRAFFIC_GIST_ID}" ]]; then
++            args+=(--gist-id "${TRAFFIC_GIST_ID}")
++          fi
++          status=0
++          python3 tools/github_traffic/github_traffic.py "${args[@]}" >summary.txt || status=$?
++          cat summary.txt
++          {
++            echo '```'
++            cat summary.txt
++            echo '```'
++          } >>"${GITHUB_STEP_SUMMARY}"
++          exit "${status}"
++      - uses: actions/upload-artifact@v4
++        if: always() && hashFiles('traffic-data/*.csv') != ''
++        with:
++          name: traffic-data
++          path: traffic-data/
++          retention-days: 90
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..33b8925
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,3 @@
++__pycache__/
++# Default output of tools/github_traffic/github_traffic.py
++/traffic-data/
+diff --git a/README.md b/README.md
+index 3d509f4..ec8ba0c 100644
+--- a/README.md
++++ b/README.md
+@@ -62,6 +62,12 @@ Read the [Meeting notes] from prior meetings.
+ 
+ Read the original [community proposal] to form the Rules Authors SIG.
+ 
++## Tools
++
++- [`tools/github_traffic`](tools/github_traffic/README.md) collects GitHub
++  traffic (views, clones, referrers, popular paths) for ruleset repositories
++  and publishes the history for the SIG to ingest.
++
+ ## Members and partners
+ 
+ List of [Members of the SIG] (unless you're a member, this will show only members who chose to allow this information to be public).
+diff --git a/tools/github_traffic/README.md b/tools/github_traffic/README.md
+new file mode 100644
+index 0000000..ec037a4
+--- /dev/null
++++ b/tools/github_traffic/README.md
+@@ -0,0 +1,162 @@
++# GitHub traffic collector
++
++`github_traffic.py` records how much the Bazel rulesets are used, as seen by
++GitHub: page views, git clones, top referring sites and the most visited
++content. It reads the documented
++[traffic API](https://docs.github.com/en/rest/metrics/traffic) and keeps the
++numbers in CSV files that anyone can ingest.
++
++Two GitHub limits shape the design:
++
++- Traffic is only visible to accounts with **push access** to a repository.
++  An outside party cannot collect it, so the script runs with a token from
++  someone who has that access, and publishes the result where the SIG can read
++  it without a privileged token.
++- GitHub only keeps the **last 14 days**. Every run merges the current window
++  into the stored history, so running at least every 13 days (daily is
++  recommended) gives a complete, gap-free time series.
++
++The script needs only Python 3.8+ and its standard library.
++
++## Token
++
++The token is read from the environment, never from the command line. The
++script looks at `$GITHUB_TRAFFIC_TOKEN`, then `$GITHUB_TOKEN`, then
++`$GH_TOKEN` (or the variable named with `--token-env`).
++
++Create a
++[fine-grained personal access token](https://github.com/settings/personal-access-tokens/new)
++owned by an account with push access to the repositories:
++
++- **Resource owner**: the organization, e.g. `bazelbuild` (the org may need to
++  approve the token).
++- **Repository access**: all repositories, or the ones to collect.
++- **Repository permissions**: **Administration: Read-only**. This is the
++  permission GitHub requires for the traffic endpoints. Metadata: Read-only is
++  added automatically.
++
++To publish to a Gist (see below) the token that writes the Gist needs the
++account permission **Gists: Read and write**. Gists belong to a user, not an
++org, so this is usually a second fine-grained token with the user as resource
++owner. Put it in `$GIST_TOKEN` (or name its variable with `--gist-token-env`);
++without it the traffic token is used for the Gist too.
++
++Repositories the token cannot read are reported on stderr and skipped; the
++data of the others is still saved, and the exit code is 1.
++
++## Running it
++
++```sh
++export GITHUB_TRAFFIC_TOKEN=github_pat_...
++
++# Every public, non-archived, non-fork repository of the org that the token
++# can push to.
++python3 tools/github_traffic/github_traffic.py --org bazelbuild
++
++# Only the rulesets.
++python3 tools/github_traffic/github_traffic.py --org bazelbuild --match '^rules_'
++
++# An explicit list.
++python3 tools/github_traffic/github_traffic.py \
++  --repo bazelbuild/rules_python --repo bazelbuild/rules_apple
++
++# A list kept in a file: one OWNER/NAME per line, # starts a comment.
++python3 tools/github_traffic/github_traffic.py --repos-file repos.txt
++```
++
++Each run prints the 14-day totals per repository:
++
++```
++repository                  views  visitors    clones   cloners
++bazelbuild/rules_apple       4210       900        77        30
++bazelbuild/rules_python      1520       610       340       120
++```
++
++and updates the CSV files in `--output-dir` (default `traffic-data/`).
++Run `github_traffic.py --help` for all options.
++
++| Exit code | Meaning                                                       |
++| --------- | ------------------------------------------------------------- |
++| 0         | Every repository was collected and the data was written.      |
++| 1         | Some or all repositories failed, or the data was not written. |
++| 2         | Configuration error: no token, no repositories, bad Gist ID.  |
++
++## Output
++
++All files are CSV with a header row, sorted for stable diffs. Dates are UTC.
++
++| File            | One row per                        | Columns                                                    |
++| --------------- | ---------------------------------- | ---------------------------------------------------------- |
++| `views.csv`     | repository and day                 | `repo,date,count,uniques`                                  |
++| `clones.csv`    | repository and day                 | `repo,date,count,uniques`                                  |
++| `summary.csv`   | collection date and repository     | `collected,repo,views,views_uniques,clones,clones_uniques` |
++| `referrers.csv` | collection date, repo and referrer | `collected,repo,referrer,count,uniques`                    |
++| `paths.csv`     | collection date, repo and path     | `collected,repo,path,title,count,uniques`                  |
++
++- `views.csv` and `clones.csv` are the daily time series. A day stays in
++  GitHub's window for 14 days, so it is seen by several runs; the largest
++  numbers seen are kept, which means the current (partial) day is completed by
++  later runs and re-running never lowers a recorded value. Days without any
++  traffic may be absent; treat them as zero.
++- `summary.csv`, `referrers.csv` and `paths.csv` are dated snapshots of
++  GitHub's 14-day totals. Unique visitors cannot be added up across days, so
++  `summary.csv` is the place to compare repositories by unique visitors.
++  GitHub reports only the top 10 referrers and paths. A second run on the same
++  date replaces that date's snapshot.
++
++## Publishing to a Gist
++
++Create a Gist once (it can be secret), with any placeholder file, and pass its
++ID:
++
++```sh
++python3 tools/github_traffic/github_traffic.py --org bazelbuild --gist-id 0123456789abcdef
++```
++
++The script first reads the CSV files already in the Gist (and in
++`--output-dir`), merges the new data into them and writes them back, so the
++Gist always holds the full history and the script can run from any machine
++without keeping local state. Pass `--output-dir ''` to skip the local copy.
++Unchanged files are not re-uploaded.
++
++Consumers read the latest data without a token, for example:
++
++```
++https://gist.githubusercontent.com/<owner>/<gist-id>/raw/views.csv
++```
++
++## Running on a schedule
++
++### GitHub Actions
++
++[`.github/workflows/github_traffic.yaml`](../../.github/workflows/github_traffic.yaml)
++runs the collector daily (and on demand from the Actions tab). It does nothing
++until it is configured in this repository's settings:
++
++| Setting              | Kind     | Value                                                                                     |
++| -------------------- | -------- | ----------------------------------------------------------------------------------------- |
++| `TRAFFIC_TOKEN`      | secret   | The traffic token described above.                                                        |
++| `TRAFFIC_GIST_TOKEN` | secret   | Optional: the Gist token, if it is a separate token.                                      |
++| `TRAFFIC_GIST_ID`    | variable | The Gist to publish to. Without it, data is only kept as a workflow artifact for 90 days. |
++| `TRAFFIC_ORG`        | variable | Optional: the org to collect, default `bazelbuild`.                                       |
++| `TRAFFIC_MATCH`      | variable | Optional: a regex on repository names, e.g. `^rules_`.                                    |
++
++Each run also attaches the CSV files as an artifact and shows the 14-day
++totals in the run summary.
++
++### cron
++
++Someone with push access can run it from any machine instead, e.g. daily at
++06:17 UTC:
++
++```
++17 6 * * * cd /path/to/SIG-rules-authors && GITHUB_TRAFFIC_TOKEN=... python3 tools/github_traffic/github_traffic.py --org bazelbuild --gist-id 0123456789abcdef
++```
++
++## Tests
++
++The tests use a fake HTTP transport and need neither network nor token:
++
++```sh
++python3 tools/github_traffic/github_traffic_test.py
++```
+diff --git a/tools/github_traffic/github_traffic.py b/tools/github_traffic/github_traffic.py
+new file mode 100755
+index 0000000..47edb48
+--- /dev/null
++++ b/tools/github_traffic/github_traffic.py
+@@ -0,0 +1,781 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Bazel Authors. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Collect GitHub repository traffic and keep a history of it.
++
++GitHub only shows repository traffic (page views, git clones, top referrers
++and top content paths) to accounts with push access, and only for the last
++14 days. This script reads those numbers through the documented REST API
++(https://docs.github.com/en/rest/metrics/traffic), merges them into CSV files
++that keep the full history, and can publish the files to a GitHub Gist so the
++SIG can ingest them without holding a privileged token.
++
++The token is read from the environment, never from the command line.
++See README.md next to this file for setup and usage.
++"""
++
++import argparse
++import csv
++import datetime
++import io
++import json
++import os
++import re
++import sys
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++API_URL = "https://api.github.com"
++API_VERSION = "2022-11-28"
++USER_AGENT = "bazel-contrib-github-traffic"
++
++# Environment variables searched for the traffic token, in order.
++TOKEN_ENV_VARS = ("GITHUB_TRAFFIC_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
++# Environment variables searched for the Gist token, in order. When none is
++# set the traffic token is used for the Gist as well.
++GIST_TOKEN_ENV_VARS = ("GIST_TOKEN",)
++
++_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
++_LINK_RE = re.compile(r'<([^>]+)>\s*;\s*rel="([^"]+)"')
++_INT_FIELDS = frozenset(
++    ["count", "uniques", "views", "views_uniques", "clones", "clones_uniques"]
++)
++
++
++class GitHubError(Exception):
++    """An HTTP error returned by the GitHub API."""
++
++    def __init__(self, status, url, message):
++        if status:
++            super().__init__(f"HTTP {status} for {url}: {message}")
++        else:
++            super().__init__(f"request to {url} failed: {message}")
++        self.status = status
++        self.url = url
++        self.message = message
++
++
++class HttpResponse:
++    """The parts of an HTTP response the client needs."""
++
++    def __init__(self, status, headers, body):
++        self.status = status
++        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
++        self.body = body or b""
++
++    def json(self):
++        if not self.body:
++            return None
++        return json.loads(self.body.decode("utf-8"))
++
++
++def urllib_transport(method, url, headers, body=None, timeout=60):
++    """Performs one HTTP request with the standard library."""
++    request = urllib.request.Request(url, data=body, headers=headers, method=method)
++    try:
++        with urllib.request.urlopen(request, timeout=timeout) as response:
++            return HttpResponse(
++                response.status, dict(response.headers), response.read()
++            )
++    except urllib.error.HTTPError as e:
++        return HttpResponse(e.code, dict(e.headers or {}), e.read())
++
++
++def _error_message(response):
++    try:
++        data = response.json()
++    except ValueError:
++        data = None
++    if isinstance(data, dict) and data.get("message"):
++        return data["message"]
++    return response.body.decode("utf-8", "replace")[:200] or "no response body"
++
++
++def _next_link(header):
++    """Returns the rel="next" URL from a Link header, or None."""
++    for url, rel in _LINK_RE.findall(header or ""):
++        if "next" in rel.split():
++            return url
++    return None
++
++
++class GitHubClient:
++    """A small GitHub REST client with pagination and rate limit handling."""
++
++    def __init__(
++        self,
++        token,
++        api_url=API_URL,
++        transport=urllib_transport,
++        sleep=time.sleep,
++        clock=time.time,
++        max_retries=3,
++        max_wait=900,
++    ):
++        self.token = token
++        self.api_url = api_url.rstrip("/")
++        self.transport = transport
++        self.sleep = sleep
++        self.clock = clock
++        self.max_retries = max_retries
++        self.max_wait = max_wait
++
++    def url(self, path, params=None):
++        if path.startswith(("https://", "http://")):
++            url = path
++        else:
++            url = self.api_url + path
++        if params:
++            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
++        return url
++
++    def _headers(self):
++        headers = {
++            "Accept": "application/vnd.github+json",
++            "X-GitHub-Api-Version": API_VERSION,
++            "User-Agent": USER_AGENT,
++        }
++        if self.token:
++            headers["Authorization"] = "Bearer " + self.token
++        return headers
++
++    def _retry_delay(self, response, attempt):
++        """Returns how many seconds to wait before retrying, or None."""
++        status = response.status
++        headers = response.headers
++        delay = None
++        if status in (403, 429):
++            if "retry-after" in headers:
++                # Secondary rate limit.
++                try:
++                    delay = int(headers["retry-after"])
++                except ValueError:
++                    return None
++            elif headers.get("x-ratelimit-remaining") == "0":
++                # Primary rate limit: wait until the window resets.
++                try:
++                    delay = int(headers["x-ratelimit-reset"]) - int(self.clock()) + 1
++                except (KeyError, ValueError):
++                    delay = 60
++            else:
++                # A plain 403, e.g. the token lacks push access. Not retryable.
++                return None
++        elif status >= 500:
++            delay = 2**attempt
++        else:
++            return None
++        delay = max(delay, 1)
++        if delay > self.max_wait:
++            return None
++        return delay
++
++    def request(self, method, path, params=None, payload=None):
++        """Sends a request and returns the HttpResponse, raising on errors."""
++        url = self.url(path, params)
++        headers = self._headers()
++        body = None
++        if payload is not None:
++            body = json.dumps(payload).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        attempt = 0
++        while True:
++            try:
++                response = self.transport(method, url, headers, body)
++            except OSError as e:
++                # Connection errors and timeouts (urllib.error.URLError is an
++                # OSError) are retried like server errors.
++                if attempt >= self.max_retries:
++                    raise GitHubError(0, url, str(e)) from e
++                self.sleep(min(2**attempt, self.max_wait))
++                attempt += 1
++                continue
++            if response.status < 400:
++                return response
++            delay = self._retry_delay(response, attempt)
++            if delay is None or attempt >= self.max_retries:
++                raise GitHubError(response.status, url, _error_message(response))
++            self.sleep(delay)
++            attempt += 1
++
++    def get(self, path, params=None):
++        return self.request("GET", path, params).json()
++
++    def paginate(self, path, params=None):
++        """Returns all items of a paginated list endpoint."""
++        params = dict(params or {})
++        params.setdefault("per_page", 100)
++        url = self.url(path, params)
++        items = []
++        while url:
++            response = self.request("GET", url)
++            items.extend(response.json() or [])
++            url = _next_link(response.headers.get("link"))
++            # Never send the token anywhere but the API host.
++            if url and not url.startswith(self.api_url + "/"):
++                raise GitHubError(response.status, url, "pagination left the API host")
++        return items
++
++    def fetch_raw(self, url):
++        """Downloads a public URL (e.g. a Gist raw_url) without the token."""
++        try:
++            response = self.transport("GET", url, {"User-Agent": USER_AGENT}, None)
++        except OSError as e:
++            raise GitHubError(0, url, str(e)) from e
++        if response.status >= 400:
++            raise GitHubError(response.status, url, _error_message(response))
++        return response.body.decode("utf-8")
++
++
++def _repo_path(repo):
++    if not _REPO_RE.match(repo):
++        raise ValueError(f"invalid repository {repo!r}, expected OWNER/NAME")
++    owner, name = repo.split("/")
++    return f"{urllib.parse.quote(owner)}/{urllib.parse.quote(name)}"
++
++
++def list_org_repos(
++    client,
++    org,
++    include_private=False,
++    include_archived=False,
++    include_forks=False,
++    pattern=None,
++):
++    """Lists the repositories of an org whose traffic the token can read.
++
++    GitHub reports the authenticated user's permissions on each repository;
++    repositories without push access are skipped because their traffic
++    endpoints would only return 403.
++    """
++    params = {"type": "all" if include_private else "public", "sort": "full_name"}
++    repos = []
++    for repo in client.paginate(f"/orgs/{urllib.parse.quote(org)}/repos", params):
++        if repo.get("private") and not include_private:
++            continue
++        if repo.get("archived") and not include_archived:
++            continue
++        if repo.get("fork") and not include_forks:
++            continue
++        permissions = repo.get("permissions")
++        if permissions is not None and not any(
++            permissions.get(p) for p in ("admin", "maintain", "push")
++        ):
++            continue
++        if pattern and not pattern.search(repo["name"]):
++            continue
++        repos.append(repo["full_name"])
++    return repos
++
++
++def read_repos_file(path):
++    """Reads OWNER/NAME lines, ignoring blank lines and # comments."""
++    repos = []
++    with open(path, encoding="utf-8") as f:
++        for line in f:
++            line = line.split("#", 1)[0].strip()
++            if line:
++                repos.append(line)
++    return repos
++
++
++def fetch_traffic(client, repo):
++    """Fetches the four traffic endpoints for one repository."""
++    path = f"/repos/{_repo_path(repo)}/traffic"
++    return {
++        "views": client.get(path + "/views", {"per": "day"}) or {},
++        "clones": client.get(path + "/clones", {"per": "day"}) or {},
++        "referrers": client.get(path + "/popular/referrers") or [],
++        "paths": client.get(path + "/popular/paths") or [],
++    }
++
++
++class Table:
++    """One CSV file of traffic records.
++
++    Daily tables (views, clones) hold one row per repository and UTC day. When
++    the same day is seen by several runs the larger numbers are kept: a day's
++    counters only grow while it is inside GitHub's 14-day window, so re-running
++    never lowers a value that was already recorded.
++
++    Snapshot tables (summary, referrers, paths) hold what GitHub reported on a
++    collection date. GitHub only reports these as 14-day totals, so each run
++    stores a dated snapshot, and a later run on the same date replaces the
++    earlier snapshot for that repository.
++    """
++
++    def __init__(self, name, fields, key, group=None):
++        self.name = name
++        self.fields = tuple(fields)
++        self.key = tuple(key)
++        self.group = tuple(group) if group else None
++
++    def parse(self, text):
++        reader = csv.DictReader(io.StringIO(text))
++        if reader.fieldnames is None:
++            return []
++        missing = [f for f in self.fields if f not in reader.fieldnames]
++        if missing:
++            raise ValueError(
++                "{}: missing column(s) {}".format(self.name, ", ".join(missing))
++            )
++        rows = []
++        for raw in reader:
++            row = {}
++            for field in self.fields:
++                value = raw[field] or ""
++                row[field] = int(value or 0) if field in _INT_FIELDS else value
++            rows.append(row)
++        return rows
++
++    def format(self, rows):
++        out = io.StringIO()
++        writer = csv.DictWriter(out, fieldnames=self.fields, lineterminator="\n")
++        writer.writeheader()
++        for row in sorted(rows, key=self._sort_key):
++            writer.writerow(row)
++        return out.getvalue()
++
++    def _sort_key(self, row):
++        if self.group is None:
++            return tuple(row[f] for f in self.key)
++        return (
++            tuple(row[f] for f in self.group),
++            -row.get("count", 0),
++            tuple(row[f] for f in self.key),
++        )
++
++    def merge(self, existing, new):
++        """Merges newly collected rows into existing ones."""
++        if self.group is not None:
++            replaced = {tuple(r[f] for f in self.group) for r in new}
++            existing = [
++                r for r in existing if tuple(r[f] for f in self.group) not in replaced
++            ]
++            merged = {}
++            for row in list(existing) + list(new):
++                merged[tuple(row[f] for f in self.key)] = dict(row)
++            return list(merged.values())
++        merged = {}
++        for row in list(existing) + list(new):
++            key = tuple(row[f] for f in self.key)
++            old = merged.get(key)
++            if old is None:
++                merged[key] = dict(row)
++            else:
++                for field in self.fields:
++                    if field in _INT_FIELDS:
++                        old[field] = max(old[field], row[field])
++        return list(merged.values())
++
++
++TABLES = (
++    Table("views.csv", ["repo", "date", "count", "uniques"], ["repo", "date"]),
++    Table("clones.csv", ["repo", "date", "count", "uniques"], ["repo", "date"]),
++    Table(
++        "summary.csv",
++        ["collected", "repo", "views", "views_uniques", "clones", "clones_uniques"],
++        ["collected", "repo"],
++        group=["collected", "repo"],
++    ),
++    Table(
++        "referrers.csv",
++        ["collected", "repo", "referrer", "count", "uniques"],
++        ["collected", "repo", "referrer"],
++        group=["collected", "repo"],
++    ),
++    Table(
++        "paths.csv",
++        ["collected", "repo", "path", "title", "count", "uniques"],
++        ["collected", "repo", "path"],
++        group=["collected", "repo"],
++    ),
++)
++TABLES_BY_NAME = {t.name: t for t in TABLES}
++
++
++def traffic_to_rows(repo, traffic, collected):
++    """Converts the API responses for one repository into table rows."""
++    rows = {t.name: [] for t in TABLES}
++    for kind in ("views", "clones"):
++        for entry in traffic[kind].get(kind) or []:
++            rows[kind + ".csv"].append(
++                {
++                    "repo": repo,
++                    # Timestamps are aligned to UTC midnight.
++                    "date": entry["timestamp"][:10],
++                    "count": int(entry.get("count", 0)),
++                    "uniques": int(entry.get("uniques", 0)),
++                }
++            )
++    rows["summary.csv"].append(
++        {
++            "collected": collected,
++            "repo": repo,
++            "views": int(traffic["views"].get("count", 0)),
++            "views_uniques": int(traffic["views"].get("uniques", 0)),
++            "clones": int(traffic["clones"].get("count", 0)),
++            "clones_uniques": int(traffic["clones"].get("uniques", 0)),
++        }
++    )
++    for entry in traffic["referrers"]:
++        rows["referrers.csv"].append(
++            {
++                "collected": collected,
++                "repo": repo,
++                "referrer": entry.get("referrer", ""),
++                "count": int(entry.get("count", 0)),
++                "uniques": int(entry.get("uniques", 0)),
++            }
++        )
++    for entry in traffic["paths"]:
++        rows["paths.csv"].append(
++            {
++                "collected": collected,
++                "repo": repo,
++                "path": entry.get("path", ""),
++                "title": entry.get("title", ""),
++                "count": int(entry.get("count", 0)),
++                "uniques": int(entry.get("uniques", 0)),
++            }
++        )
++    return rows
++
++
++class DirectoryStore:
++    """Keeps the CSV files in a local directory."""
++
++    def __init__(self, path):
++        self.path = path
++
++    def __str__(self):
++        return self.path
++
++    def load(self):
++        files = {}
++        for table in TABLES:
++            path = os.path.join(self.path, table.name)
++            if os.path.exists(path):
++                with open(path, encoding="utf-8", newline="") as f:
++                    files[table.name] = f.read()
++        return files
++
++    def save(self, files):
++        os.makedirs(self.path, exist_ok=True)
++        for name, text in files.items():
++            path = os.path.join(self.path, name)
++            tmp = path + ".tmp"
++            with open(tmp, "w", encoding="utf-8", newline="") as f:
++                f.write(text)
++            os.replace(tmp, path)
++
++
++class GistStore:
++    """Keeps the CSV files in a GitHub Gist.
++
++    The Gist must already exist; create it once by hand (it can be secret) and
++    pass its ID. Anyone can then read the latest data from
++    https://gist.githubusercontent.com/<owner>/<id>/raw/<file>.
++    """
++
++    def __init__(self, client, gist_id):
++        self.client = client
++        self.gist_id = gist_id
++        self._loaded = {}
++
++    def __str__(self):
++        return "gist " + self.gist_id
++
++    def load(self):
++        gist = self.client.get(f"/gists/{urllib.parse.quote(self.gist_id)}")
++        files = {}
++        for name, info in (gist.get("files") or {}).items():
++            if name not in TABLES_BY_NAME:
++                continue
++            content = info.get("content")
++            # The API truncates large files; the raw URL has the full content.
++            if info.get("truncated") or content is None:
++                content = self.client.fetch_raw(info["raw_url"])
++            files[name] = content
++        self._loaded = dict(files)
++        return files
++
++    def save(self, files):
++        changed = {
++            name: {"content": text}
++            for name, text in files.items()
++            if self._loaded.get(name) != text
++        }
++        if not changed:
++            return
++        self.client.request(
++            "PATCH",
++            f"/gists/{urllib.parse.quote(self.gist_id)}",
++            payload={"files": changed},
++        )
++        self._loaded.update({name: f["content"] for name, f in changed.items()})
++
++
++def merge_tables(loaded_files, new_rows):
++    """Merges every store's files and the new rows into one text per table."""
++    result = {}
++    for table in TABLES:
++        existing = []
++        for files in loaded_files:
++            if table.name in files:
++                existing = table.merge(existing, table.parse(files[table.name]))
++        result[table.name] = table.format(table.merge(existing, new_rows[table.name]))
++    return result
++
++
++def _find_token(environ, names):
++    for name in names:
++        if environ.get(name):
++            return name, environ[name]
++    return None, None
++
++
++def _push_access_hint(error):
++    if error.status == 403:
++        return (
++            " (the token needs push access to this repository; for a"
++            ' fine-grained token grant the "Administration" repository'
++            " permission with read access)"
++        )
++    if error.status == 404:
++        return " (repository not found, or not visible to the token)"
++    return ""
++
++
++def format_summary(rows):
++    """Formats the 14-day totals of this run as a plain text table."""
++    rows = sorted(rows, key=lambda r: (-r["views"], r["repo"]))
++    header = ("repository", "views", "visitors", "clones", "cloners")
++    lines = [
++        (r["repo"], r["views"], r["views_uniques"], r["clones"], r["clones_uniques"])
++        for r in rows
++    ]
++    width = max([len(header[0])] + [len(line[0]) for line in lines])
++    out = []
++    for line in [header, *lines]:
++        name, numbers = line[0], line[1:]
++        out.append(f"{name:<{width}}" + "".join(f" {n:>9}" for n in numbers))
++    return "\n".join(out) + "\n"
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        description=(
++            "Collect GitHub traffic (views, clones, referrers, popular paths) "
++            "and merge it into CSV files that keep the history beyond "
++            "GitHub's 14-day window."
++        ),
++        epilog=(
++            f"The token is read from ${TOKEN_ENV_VARS[0]} (falling back to "
++            f"${' or $'.join(TOKEN_ENV_VARS[1:])}). It must belong to an "
++            "account with push access to the repositories."
++        ),
++    )
++    source = parser.add_argument_group("repositories")
++    source.add_argument(
++        "--repo",
++        action="append",
++        default=[],
++        metavar="OWNER/NAME",
++        help="repository to collect; may be repeated",
++    )
++    source.add_argument(
++        "--repos-file",
++        metavar="FILE",
++        help="file with one OWNER/NAME per line (# starts a comment)",
++    )
++    source.add_argument(
++        "--org",
++        action="append",
++        default=[],
++        help=(
++            "collect every repository of this org the token can push to; "
++            "may be repeated"
++        ),
++    )
++    source.add_argument(
++        "--match",
++        metavar="REGEX",
++        help="with --org, only keep repositories whose name matches REGEX",
++    )
++    source.add_argument(
++        "--include-private",
++        action="store_true",
++        help="with --org, also collect private repositories",
++    )
++    source.add_argument(
++        "--include-archived",
++        action="store_true",
++        help="with --org, also collect archived repositories",
++    )
++    source.add_argument(
++        "--include-forks",
++        action="store_true",
++        help="with --org, also collect forks",
++    )
++    output = parser.add_argument_group("output")
++    output.add_argument(
++        "--output-dir",
++        default="traffic-data",
++        metavar="DIR",
++        help="directory holding the CSV files (default: %(default)s)",
++    )
++    output.add_argument(
++        "--gist-id",
++        metavar="ID",
++        help="also merge into and publish to this existing GitHub Gist",
++    )
++    auth = parser.add_argument_group("authentication")
++    auth.add_argument(
++        "--token-env",
++        metavar="NAME",
++        help="environment variable holding the traffic token",
++    )
++    auth.add_argument(
++        "--gist-token-env",
++        metavar="NAME",
++        help=(
++            "environment variable holding the token used for the Gist "
++            f"(default: ${GIST_TOKEN_ENV_VARS[0]}, else the traffic token)"
++        ),
++    )
++    auth.add_argument(
++        "--api-url",
++        default=API_URL,
++        help="GitHub API base URL (default: %(default)s)",
++    )
++    return parser
++
++
++def main(argv=None, environ=None, transport=None, today=None, stdout=None, stderr=None):
++    """Runs the collector. Returns 0 on success, 1 if any repository failed
++    and 2 for configuration errors."""
++    environ = os.environ if environ is None else environ
++    transport = transport or urllib_transport
++    stdout = stdout or sys.stdout
++    stderr = stderr or sys.stderr
++    args = build_parser().parse_args(argv)
++
++    def error(message):
++        print("error: " + message, file=stderr)
++        return 2
++
++    token_vars = [args.token_env] if args.token_env else list(TOKEN_ENV_VARS)
++    _, token = _find_token(environ, token_vars)
++    if not token:
++        return error("no token found; set $" + " or $".join(token_vars))
++    client = GitHubClient(token, api_url=args.api_url, transport=transport)
++
++    pattern = None
++    if args.match:
++        try:
++            pattern = re.compile(args.match)
++        except re.error as e:
++            return error(f"invalid --match: {e}")
++
++    repos = list(args.repo)
++    try:
++        if args.repos_file:
++            repos.extend(read_repos_file(args.repos_file))
++    except OSError as e:
++        return error(str(e))
++    for repo in repos:
++        if not _REPO_RE.match(repo):
++            return error(f"invalid repository {repo!r}, expected OWNER/NAME")
++    try:
++        for org in args.org:
++            repos.extend(
++                list_org_repos(
++                    client,
++                    org,
++                    include_private=args.include_private,
++                    include_archived=args.include_archived,
++                    include_forks=args.include_forks,
++                    pattern=pattern,
++                )
++            )
++    except GitHubError as e:
++        return error(str(e))
++    repos = list(dict.fromkeys(repos))
++    if not repos:
++        return error("no repositories to collect; use --repo, --repos-file or --org")
++
++    stores = []
++    if args.output_dir:
++        stores.append(DirectoryStore(args.output_dir))
++    if args.gist_id:
++        gist_vars = (
++            [args.gist_token_env] if args.gist_token_env else list(GIST_TOKEN_ENV_VARS)
++        )
++        _, gist_token = _find_token(environ, gist_vars)
++        gist_client = GitHubClient(
++            gist_token or token, api_url=args.api_url, transport=transport
++        )
++        stores.append(GistStore(gist_client, args.gist_id))
++    if not stores:
++        return error("nothing to write; set --output-dir and/or --gist-id")
++
++    # Load existing data first so a bad Gist ID fails before any collection.
++    loaded = []
++    try:
++        for store in stores:
++            loaded.append(store.load())
++            for name in loaded[-1]:
++                TABLES_BY_NAME[name].parse(loaded[-1][name])
++    except (OSError, ValueError, GitHubError) as e:
++        return error(f"cannot read {store}: {e}")
++
++    collected = today or datetime.datetime.now(datetime.timezone.utc).date().isoformat()
++    new_rows = {t.name: [] for t in TABLES}
++    failures = []
++    for repo in repos:
++        try:
++            traffic = fetch_traffic(client, repo)
++        except GitHubError as e:
++            failures.append(repo)
++            print(f"warning: {repo}: {e}{_push_access_hint(e)}", file=stderr)
++            continue
++        for name, rows in traffic_to_rows(repo, traffic, collected).items():
++            new_rows[name].extend(rows)
++
++    if len(failures) == len(repos):
++        print("error: no traffic could be collected", file=stderr)
++        return 1
++
++    files = merge_tables(loaded, new_rows)
++    try:
++        for store in stores:
++            store.save(files)
++    except (OSError, GitHubError) as e:
++        print(f"error: cannot write {store}: {e}", file=stderr)
++        return 1
++
++    stdout.write(format_summary(new_rows["summary.csv"]))
++    written = ", ".join(str(s) for s in stores)
++    print(
++        f"collected {len(repos) - len(failures)} of {len(repos)} repositories "
++        f"on {collected}; wrote {written}",
++        file=stderr,
++    )
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/github_traffic/github_traffic_test.py b/tools/github_traffic/github_traffic_test.py
+new file mode 100755
+index 0000000..8f35f1f
+--- /dev/null
++++ b/tools/github_traffic/github_traffic_test.py
+@@ -0,0 +1,663 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Bazel Authors. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Tests for github_traffic. They use a fake transport, never the network."""
++
++import io
++import json
++import os
++import re
++import sys
++import tempfile
++import unittest
++import urllib.parse
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import github_traffic  # noqa: E402
++
++API = "https://api.github.com"
++
++
++def _response(status=200, payload=None, headers=None, text=None):
++    if text is not None:
++        body = text.encode("utf-8")
++    elif payload is not None:
++        body = json.dumps(payload).encode("utf-8")
++    else:
++        body = b""
++    return github_traffic.HttpResponse(status, headers or {}, body)
++
++
++class FakeTransport:
++    """Serves canned responses keyed by (method, URL without query)."""
++
++    def __init__(self, routes=None):
++        # Each route maps to a response or a list of responses served in order.
++        self.routes = dict(routes or {})
++        self.calls = []
++
++    def __call__(self, method, url, headers, body=None, timeout=60):
++        self.calls.append(
++            {
++                "method": method,
++                "url": url,
++                "headers": headers,
++                "body": json.loads(body.decode("utf-8")) if body else None,
++            }
++        )
++        parts = urllib.parse.urlsplit(url)
++        base = f"{parts.scheme}://{parts.netloc}{parts.path}"
++        for key in ((method, url), (method, base)):
++            if key in self.routes:
++                route = self.routes[key]
++                if isinstance(route, list):
++                    return route.pop(0) if len(route) > 1 else route[0]
++                return route
++        return _response(404, {"message": "Not Found"})
++
++
++def _views(days):
++    """Builds a /traffic/views payload from {date: (count, uniques)}."""
++    return {
++        "count": sum(c for c, _ in days.values()),
++        "uniques": max([u for _, u in days.values()] or [0]),
++        "views": [
++            {"timestamp": d + "T00:00:00Z", "count": c, "uniques": u}
++            for d, (c, u) in sorted(days.items())
++        ],
++    }
++
++
++def _clones(days):
++    payload = _views(days)
++    payload["clones"] = payload.pop("views")
++    return payload
++
++
++def _traffic_routes(repo, views, clones, referrers=(), paths=()):
++    base = f"{API}/repos/{repo}/traffic"
++    return {
++        ("GET", base + "/views"): _response(payload=_views(views)),
++        ("GET", base + "/clones"): _response(payload=_clones(clones)),
++        ("GET", base + "/popular/referrers"): _response(payload=list(referrers)),
++        ("GET", base + "/popular/paths"): _response(payload=list(paths)),
++    }
++
++
++class TrafficToRowsTest(unittest.TestCase):
++    def test_converts_api_payloads(self):
++        traffic = {
++            "views": _views({"2026-10-01": (10, 4), "2026-10-02": (7, 3)}),
++            "clones": _clones({"2026-10-02": (2, 1)}),
++            "referrers": [{"referrer": "Google", "count": 5, "uniques": 2}],
++            "paths": [
++                {
++                    "path": "/bazelbuild/rules_python",
++                    "title": "rules_python",
++                    "count": 9,
++                    "uniques": 4,
++                }
++            ],
++        }
++        rows = github_traffic.traffic_to_rows(
++            "bazelbuild/rules_python", traffic, "2026-10-03"
++        )
++        self.assertEqual(
++            rows["views.csv"],
++            [
++                {
++                    "repo": "bazelbuild/rules_python",
++                    "date": "2026-10-01",
++                    "count": 10,
++                    "uniques": 4,
++                },
++                {
++                    "repo": "bazelbuild/rules_python",
++                    "date": "2026-10-02",
++                    "count": 7,
++                    "uniques": 3,
++                },
++            ],
++        )
++        self.assertEqual(
++            rows["clones.csv"],
++            [
++                {
++                    "repo": "bazelbuild/rules_python",
++                    "date": "2026-10-02",
++                    "count": 2,
++                    "uniques": 1,
++                }
++            ],
++        )
++        self.assertEqual(
++            rows["summary.csv"],
++            [
++                {
++                    "collected": "2026-10-03",
++                    "repo": "bazelbuild/rules_python",
++                    "views": 17,
++                    "views_uniques": 4,
++                    "clones": 2,
++                    "clones_uniques": 1,
++                }
++            ],
++        )
++        self.assertEqual(rows["referrers.csv"][0]["referrer"], "Google")
++        self.assertEqual(rows["paths.csv"][0]["title"], "rules_python")
++        self.assertEqual(rows["paths.csv"][0]["collected"], "2026-10-03")
++
++
++class TableTest(unittest.TestCase):
++    def setUp(self):
++        self.views = github_traffic.TABLES_BY_NAME["views.csv"]
++        self.referrers = github_traffic.TABLES_BY_NAME["referrers.csv"]
++
++    def _day(self, date, count, uniques, repo="o/r"):
++        return {"repo": repo, "date": date, "count": count, "uniques": uniques}
++
++    def test_daily_merge_keeps_history_and_largest_values(self):
++        existing = [
++            self._day("2026-09-01", 5, 2),
++            self._day("2026-09-02", 3, 1),  # partial day, grows later
++            self._day("2026-09-03", 8, 4),
++        ]
++        new = [
++            self._day("2026-09-02", 6, 2),
++            self._day("2026-09-03", 7, 4),  # never lower a recorded value
++            self._day("2026-09-04", 1, 1),
++            self._day("2026-09-04", 1, 1, repo="o/other"),
++        ]
++        merged = self.views.parse(self.views.format(self.views.merge(existing, new)))
++        self.assertEqual(
++            merged,
++            [
++                self._day("2026-09-04", 1, 1, repo="o/other"),
++                self._day("2026-09-01", 5, 2),
++                self._day("2026-09-02", 6, 2),
++                self._day("2026-09-03", 8, 4),
++                self._day("2026-09-04", 1, 1),
++            ],
++        )
++
++    def test_snapshot_merge_replaces_same_day_and_repo(self):
++        def ref(collected, repo, referrer, count):
++            return {
++                "collected": collected,
++                "repo": repo,
++                "referrer": referrer,
++                "count": count,
++                "uniques": 1,
++            }
++
++        existing = [
++            ref("2026-09-01", "o/r", "google.com", 4),
++            ref("2026-09-02", "o/r", "google.com", 5),
++            ref("2026-09-02", "o/r", "bing.com", 1),
++            ref("2026-09-02", "o/other", "github.com", 3),
++        ]
++        new = [ref("2026-09-02", "o/r", "github.com", 9)]
++        merged = self.referrers.merge(existing, new)
++        self.assertCountEqual(
++            merged,
++            [
++                ref("2026-09-01", "o/r", "google.com", 4),
++                ref("2026-09-02", "o/r", "github.com", 9),
++                ref("2026-09-02", "o/other", "github.com", 3),
++            ],
++        )
++
++    def test_format_is_sorted_and_round_trips(self):
++        rows = [self._day("2026-09-02", 1, 1), self._day("2026-09-01", 2, 2)]
++        text = self.views.format(rows)
++        self.assertEqual(
++            text,
++            "repo,date,count,uniques\no/r,2026-09-01,2,2\no/r,2026-09-02,1,1\n",
++        )
++        self.assertEqual(self.views.parse(text), sorted(rows, key=lambda r: r["date"]))
++
++    def test_parse_rejects_missing_columns(self):
++        with self.assertRaisesRegex(ValueError, "uniques"):
++            self.views.parse("repo,date,count\no/r,2026-09-01,1\n")
++
++    def test_parse_empty_text(self):
++        self.assertEqual(self.views.parse(""), [])
++
++
++class GitHubClientTest(unittest.TestCase):
++    def test_sends_token_and_api_version(self):
++        transport = FakeTransport({("GET", API + "/x"): _response(payload={"a": 1})})
++        client = github_traffic.GitHubClient("secret", transport=transport)
++        self.assertEqual(client.get("/x"), {"a": 1})
++        headers = transport.calls[0]["headers"]
++        self.assertEqual(headers["Authorization"], "Bearer secret")
++        self.assertEqual(headers["X-GitHub-Api-Version"], github_traffic.API_VERSION)
++        self.assertEqual(headers["Accept"], "application/vnd.github+json")
++
++    def test_paginates_with_link_header(self):
++        page2 = API + "/orgs/o/repos?per_page=100&page=2"
++        transport = FakeTransport(
++            {
++                ("GET", page2): _response(payload=[{"n": 2}]),
++                ("GET", API + "/orgs/o/repos"): _response(
++                    payload=[{"n": 1}],
++                    headers={"Link": f'<{page2}>; rel="next", <{page2}>; rel="last"'},
++                ),
++            }
++        )
++        client = github_traffic.GitHubClient("t", transport=transport)
++        self.assertEqual(client.paginate("/orgs/o/repos"), [{"n": 1}, {"n": 2}])
++        self.assertIn("per_page=100", transport.calls[0]["url"])
++
++    def test_pagination_never_leaves_api_host(self):
++        transport = FakeTransport(
++            {
++                ("GET", API + "/orgs/o/repos"): _response(
++                    payload=[], headers={"Link": '<https://evil.example/x>; rel="next"'}
++                )
++            }
++        )
++        client = github_traffic.GitHubClient("t", transport=transport)
++        with self.assertRaises(github_traffic.GitHubError):
++            client.paginate("/orgs/o/repos")
++        self.assertEqual(len(transport.calls), 1)
++
++    def test_waits_for_primary_rate_limit_reset(self):
++        limited = _response(
++            403,
++            {"message": "API rate limit exceeded"},
++            headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1030"},
++        )
++        transport = FakeTransport(
++            {("GET", API + "/x"): [limited, _response(payload={"ok": True})]}
++        )
++        sleeps = []
++        client = github_traffic.GitHubClient(
++            "t", transport=transport, sleep=sleeps.append, clock=lambda: 1000
++        )
++        self.assertEqual(client.get("/x"), {"ok": True})
++        self.assertEqual(sleeps, [31])
++
++    def test_honors_retry_after(self):
++        limited = _response(429, {"message": "slow down"}, headers={"Retry-After": "7"})
++        transport = FakeTransport(
++            {("GET", API + "/x"): [limited, _response(payload={"ok": True})]}
++        )
++        sleeps = []
++        client = github_traffic.GitHubClient(
++            "t", transport=transport, sleep=sleeps.append
++        )
++        self.assertEqual(client.get("/x"), {"ok": True})
++        self.assertEqual(sleeps, [7])
++
++    def test_does_not_retry_missing_push_access(self):
++        denied = _response(
++            403,
++            {"message": "Must have push access to repository"},
++            headers={"X-RateLimit-Remaining": "4999"},
++        )
++        transport = FakeTransport({("GET", API + "/x"): denied})
++        client = github_traffic.GitHubClient("t", transport=transport, sleep=self.fail)
++        with self.assertRaises(github_traffic.GitHubError) as ctx:
++            client.get("/x")
++        self.assertEqual(ctx.exception.status, 403)
++        self.assertIn("push access", ctx.exception.message)
++
++    def test_gives_up_when_reset_is_too_far(self):
++        limited = _response(
++            403,
++            {"message": "API rate limit exceeded"},
++            headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "99999"},
++        )
++        transport = FakeTransport({("GET", API + "/x"): limited})
++        client = github_traffic.GitHubClient(
++            "t", transport=transport, sleep=self.fail, clock=lambda: 0
++        )
++        with self.assertRaises(github_traffic.GitHubError):
++            client.get("/x")
++
++    def test_retries_connection_errors(self):
++        responses = [OSError("connection reset"), _response(payload={"ok": True})]
++
++        def transport(method, url, headers, body=None, timeout=60):
++            item = responses.pop(0)
++            if isinstance(item, Exception):
++                raise item
++            return item
++
++        sleeps = []
++        client = github_traffic.GitHubClient(
++            "t", transport=transport, sleep=sleeps.append
++        )
++        self.assertEqual(client.get("/x"), {"ok": True})
++        self.assertEqual(sleeps, [1])
++
++    def test_reports_persistent_connection_errors(self):
++        def transport(method, url, headers, body=None, timeout=60):
++            raise OSError("timed out")
++
++        client = github_traffic.GitHubClient(
++            "t", transport=transport, sleep=lambda s: None
++        )
++        with self.assertRaises(github_traffic.GitHubError) as ctx:
++            client.get("/x")
++        self.assertEqual(ctx.exception.status, 0)
++        self.assertIn("timed out", str(ctx.exception))
++
++
++class ListOrgReposTest(unittest.TestCase):
++    def test_filters_repositories(self):
++        def repo(name, **kw):
++            data = {
++                "name": name,
++                "full_name": "bazelbuild/" + name,
++                "private": False,
++                "archived": False,
++                "fork": False,
++                "permissions": {"admin": False, "maintain": False, "push": True},
++            }
++            data.update(kw)
++            return data
++
++        transport = FakeTransport(
++            {
++                ("GET", API + "/orgs/bazelbuild/repos"): _response(
++                    payload=[
++                        repo("rules_python"),
++                        repo("rules_old", archived=True),
++                        repo("rules_fork", fork=True),
++                        repo(
++                            "rules_readonly",
++                            permissions={"admin": False, "push": False, "pull": True},
++                        ),
++                        repo("bazel"),
++                    ]
++                )
++            }
++        )
++        client = github_traffic.GitHubClient("t", transport=transport)
++        self.assertEqual(
++            github_traffic.list_org_repos(client, "bazelbuild"),
++            ["bazelbuild/rules_python", "bazelbuild/bazel"],
++        )
++        self.assertIn("type=public", transport.calls[0]["url"])
++        self.assertEqual(
++            github_traffic.list_org_repos(
++                client,
++                "bazelbuild",
++                include_archived=True,
++                include_forks=True,
++                pattern=re.compile(r"^rules_"),
++            ),
++            [
++                "bazelbuild/rules_python",
++                "bazelbuild/rules_old",
++                "bazelbuild/rules_fork",
++            ],
++        )
++
++
++class GistStoreTest(unittest.TestCase):
++    def test_loads_truncated_files_from_raw_url_and_saves_changes(self):
++        raw_url = "https://gist.githubusercontent.com/u/abc/raw/123/views.csv"
++        transport = FakeTransport(
++            {
++                ("GET", API + "/gists/abc"): _response(
++                    payload={
++                        "files": {
++                            "views.csv": {
++                                "truncated": True,
++                                "content": "repo,da",
++                                "raw_url": raw_url,
++                            },
++                            "clones.csv": {
++                                "truncated": False,
++                                "content": "repo,date,count,uniques\n",
++                            },
++                            "notes.md": {"content": "unrelated"},
++                        }
++                    }
++                ),
++                ("GET", raw_url): _response(
++                    text="repo,date,count,uniques\no/r,2026-09-01,1,1\n"
++                ),
++                ("PATCH", API + "/gists/abc"): _response(payload={}),
++            }
++        )
++        client = github_traffic.GitHubClient("t", transport=transport)
++        store = github_traffic.GistStore(client, "abc")
++        files = store.load()
++        self.assertEqual(
++            files,
++            {
++                "views.csv": "repo,date,count,uniques\no/r,2026-09-01,1,1\n",
++                "clones.csv": "repo,date,count,uniques\n",
++            },
++        )
++        # The raw download must not carry the token.
++        raw_call = next(c for c in transport.calls if c["url"] == raw_url)
++        self.assertNotIn("Authorization", raw_call["headers"])
++
++        store.save(
++            {
++                "views.csv": files["views.csv"],  # unchanged, not sent
++                "clones.csv": "repo,date,count,uniques\no/r,2026-09-01,2,1\n",
++            }
++        )
++        patch = [c for c in transport.calls if c["method"] == "PATCH"]
++        self.assertEqual(len(patch), 1)
++        self.assertEqual(
++            patch[0]["body"],
++            {
++                "files": {
++                    "clones.csv": {
++                        "content": "repo,date,count,uniques\no/r,2026-09-01,2,1\n"
++                    }
++                }
++            },
++        )
++        # Saving the same content again does nothing.
++        store.save({"clones.csv": "repo,date,count,uniques\no/r,2026-09-01,2,1\n"})
++        self.assertEqual(len([c for c in transport.calls if c["method"] == "PATCH"]), 1)
++
++
++class MainTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.out_dir = os.path.join(self.tmp.name, "data")
++
++    def _run(self, argv, transport, today, environ=None):
++        stdout, stderr = io.StringIO(), io.StringIO()
++        code = github_traffic.main(
++            argv,
++            environ={"GITHUB_TRAFFIC_TOKEN": "t"} if environ is None else environ,
++            transport=transport,
++            today=today,
++            stdout=stdout,
++            stderr=stderr,
++        )
++        return code, stdout.getvalue(), stderr.getvalue()
++
++    def _read(self, name):
++        with open(os.path.join(self.out_dir, name), encoding="utf-8") as f:
++            return f.read()
++
++    def test_requires_token_from_environment(self):
++        code, _, err = self._run(
++            ["--repo", "o/r", "--output-dir", self.out_dir],
++            FakeTransport(),
++            "2026-10-01",
++            environ={},
++        )
++        self.assertEqual(code, 2)
++        self.assertIn("GITHUB_TRAFFIC_TOKEN", err)
++
++    def test_custom_token_env(self):
++        transport = FakeTransport(_traffic_routes("o/r", {"2026-09-30": (1, 1)}, {}))
++        code, _, _ = self._run(
++            ["--repo", "o/r", "--output-dir", self.out_dir, "--token-env", "MY_TOKEN"],
++            transport,
++            "2026-10-01",
++            environ={"MY_TOKEN": "mine"},
++        )
++        self.assertEqual(code, 0)
++        self.assertEqual(transport.calls[0]["headers"]["Authorization"], "Bearer mine")
++
++    def test_rejects_invalid_repository(self):
++        transport = FakeTransport()
++        code, _, err = self._run(
++            ["--repo", "not-a-repo", "--org", "o", "--output-dir", self.out_dir],
++            transport,
++            "2026-10-01",
++        )
++        self.assertEqual(code, 2)
++        self.assertIn("OWNER/NAME", err)
++        self.assertEqual(transport.calls, [])
++
++    def test_collects_merges_across_runs_and_reports_failures(self):
++        routes = _traffic_routes(
++            "bazelbuild/rules_python",
++            {"2026-09-29": (10, 5), "2026-09-30": (4, 2)},
++            {"2026-09-30": (3, 1)},
++            referrers=[{"referrer": "Google", "count": 6, "uniques": 3}],
++            paths=[{"path": "/p", "title": "t", "count": 2, "uniques": 1}],
++        )
++        routes[("GET", API + "/repos/bazelbuild/rules_apple/traffic/views")] = (
++            _response(
++                403,
++                {"message": "Must have push access to repository"},
++                headers={"X-RateLimit-Remaining": "4000"},
++            )
++        )
++        repos_file = os.path.join(self.tmp.name, "repos.txt")
++        with open(repos_file, "w", encoding="utf-8") as f:
++            f.write("# rulesets\nbazelbuild/rules_apple  # no push access\n\n")
++        code, out, err = self._run(
++            [
++                "--repo",
++                "bazelbuild/rules_python",
++                "--repos-file",
++                repos_file,
++                "--output-dir",
++                self.out_dir,
++            ],
++            FakeTransport(routes),
++            "2026-09-30",
++        )
++        self.assertEqual(code, 1)
++        self.assertIn("bazelbuild/rules_apple", err)
++        self.assertIn('"Administration"', err)
++        self.assertIn("bazelbuild/rules_python", out)
++        self.assertEqual(
++            self._read("views.csv"),
++            "repo,date,count,uniques\n"
++            "bazelbuild/rules_python,2026-09-29,10,5\n"
++            "bazelbuild/rules_python,2026-09-30,4,2\n",
++        )
++        self.assertEqual(
++            self._read("summary.csv"),
++            "collected,repo,views,views_uniques,clones,clones_uniques\n"
++            "2026-09-30,bazelbuild/rules_python,14,5,3,1\n",
++        )
++
++        # Next day: 2026-09-29 dropped out of the window, 2026-09-30 is now
++        # complete and 2026-10-01 is new. History is kept.
++        routes = _traffic_routes(
++            "bazelbuild/rules_python",
++            {"2026-09-30": (9, 4), "2026-10-01": (1, 1)},
++            {"2026-09-30": (3, 1)},
++            referrers=[{"referrer": "github.com", "count": 2, "uniques": 2}],
++        )
++        code, _, _ = self._run(
++            ["--repo", "bazelbuild/rules_python", "--output-dir", self.out_dir],
++            FakeTransport(routes),
++            "2026-10-01",
++        )
++        self.assertEqual(code, 0)
++        self.assertEqual(
++            self._read("views.csv"),
++            "repo,date,count,uniques\n"
++            "bazelbuild/rules_python,2026-09-29,10,5\n"
++            "bazelbuild/rules_python,2026-09-30,9,4\n"
++            "bazelbuild/rules_python,2026-10-01,1,1\n",
++        )
++        self.assertEqual(
++            self._read("referrers.csv"),
++            "collected,repo,referrer,count,uniques\n"
++            "2026-09-30,bazelbuild/rules_python,Google,6,3\n"
++            "2026-10-01,bazelbuild/rules_python,github.com,2,2\n",
++        )
++        self.assertEqual(
++            self._read("paths.csv"),
++            "collected,repo,path,title,count,uniques\n"
++            "2026-09-30,bazelbuild/rules_python,/p,t,2,1\n",
++        )
++
++    def test_all_failures_write_nothing(self):
++        code, _, err = self._run(
++            ["--repo", "o/r", "--output-dir", self.out_dir],
++            FakeTransport(),
++            "2026-10-01",
++        )
++        self.assertEqual(code, 1)
++        self.assertIn("no traffic could be collected", err)
++        self.assertFalse(os.path.exists(self.out_dir))
++
++    def test_publishes_to_gist_with_gist_token(self):
++        routes = _traffic_routes("o/r", {"2026-10-01": (2, 1)}, {})
++        routes[("GET", API + "/gists/g1")] = _response(
++            payload={
++                "files": {
++                    "views.csv": {
++                        "content": "repo,date,count,uniques\no/r,2026-09-20,5,5\n"
++                    }
++                }
++            }
++        )
++        routes[("PATCH", API + "/gists/g1")] = _response(payload={})
++        transport = FakeTransport(routes)
++        code, _, _ = self._run(
++            ["--repo", "o/r", "--output-dir", "", "--gist-id", "g1"],
++            transport,
++            "2026-10-01",
++            environ={"GITHUB_TRAFFIC_TOKEN": "traffic", "GIST_TOKEN": "gist"},
++        )
++        self.assertEqual(code, 0)
++        patch = next(c for c in transport.calls if c["method"] == "PATCH")
++        self.assertEqual(patch["headers"]["Authorization"], "Bearer gist")
++        traffic_call = next(c for c in transport.calls if "/traffic/" in c["url"])
++        self.assertEqual(traffic_call["headers"]["Authorization"], "Bearer traffic")
++        files = patch["body"]["files"]
++        self.assertEqual(
++            files["views.csv"]["content"],
++            "repo,date,count,uniques\no/r,2026-09-20,5,5\no/r,2026-10-01,2,1\n",
++        )
++        self.assertEqual(sorted(files), sorted(t.name for t in github_traffic.TABLES))
++
++    def test_bad_gist_fails_before_collecting(self):
++        transport = FakeTransport()
++        code, _, err = self._run(
++            ["--repo", "o/r", "--output-dir", "", "--gist-id", "missing"],
++            transport,
++            "2026-10-01",
++        )
++        self.assertEqual(code, 2)
++        self.assertIn("gist missing", err)
++        self.assertFalse(any("/traffic/" in c["url"] for c in transport.calls))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

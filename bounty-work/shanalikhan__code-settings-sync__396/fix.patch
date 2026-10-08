@@ -1,0 +1,175 @@
+From 034586cd4b7c6f9d3a149979d949089655e3ef87 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:07:03 +0000
+Subject: [PATCH] fix(sync): keep unsaved editor changes when downloading
+ settings (#396)
+
+Download overwrote settings files on disk while VS Code could still hold
+them open, which produced "The content on disk is newer" conflicts on the
+next save.
+
+Before a downloaded file is written, EditorService checks every open text
+document (visible or hidden). If one has unsaved changes, the write is
+skipped and a warning is shown. Otherwise clean visible editors for that
+file are closed first, then the file is written.
+
+The path comparison is in editorMatch.ts, which has no vscode dependency,
+and is covered by test/service/editor/editorMatch.test.ts.
+---
+ src/service/editor.service.ts           | 42 +++++++++++++++++++++++++
+ src/service/editorMatch.ts              | 26 +++++++++++++++
+ src/service/github/gist.service.ts      |  3 +-
+ test/service/editor/editorMatch.test.ts | 38 ++++++++++++++++++++++
+ 4 files changed, 108 insertions(+), 1 deletion(-)
+ create mode 100644 src/service/editor.service.ts
+ create mode 100644 src/service/editorMatch.ts
+ create mode 100644 test/service/editor/editorMatch.test.ts
+
+diff --git a/src/service/editor.service.ts b/src/service/editor.service.ts
+new file mode 100644
+index 0000000..39b84b3
+--- /dev/null
++++ b/src/service/editor.service.ts
+@@ -0,0 +1,42 @@
++import * as vscode from "vscode";
++
++import { HasDirtyDocument, normalizeFilePath } from "./editorMatch";
++import { FileService } from "./file.service";
++
++export class EditorService {
++  /**
++   * Overwrites filePath during a download. Clean editors showing the file are
++   * closed first. If any editor (visible or hidden) has unsaved changes for the
++   * file, the write is skipped and the user is told why.
++   */
++  public static async WriteFile(
++    filePath: string,
++    content: string
++  ): Promise<boolean> {
++    if (HasDirtyDocument(vscode.workspace.textDocuments, filePath)) {
++      vscode.window.showWarningMessage(
++        `Sync : ${filePath} has unsaved changes in an editor and was not overwritten. Save or revert it, then download again.`
++      );
++      return false;
++    }
++    await EditorService.CloseCleanEditors(filePath);
++    return FileService.WriteFile(filePath, content);
++  }
++
++  private static async CloseCleanEditors(filePath: string): Promise<void> {
++    const target = normalizeFilePath(filePath);
++    const editors = vscode.window.visibleTextEditors.filter(
++      editor => normalizeFilePath(editor.document.fileName) === target
++    );
++    for (const editor of editors) {
++      await vscode.window.showTextDocument(editor.document, {
++        viewColumn: editor.viewColumn,
++        preserveFocus: true,
++        preview: false
++      });
++      await vscode.commands.executeCommand(
++        "workbench.action.closeActiveEditor"
++      );
++    }
++  }
++}
+diff --git a/src/service/editorMatch.ts b/src/service/editorMatch.ts
+new file mode 100644
+index 0000000..42278be
+--- /dev/null
++++ b/src/service/editorMatch.ts
+@@ -0,0 +1,26 @@
++import * as path from "path";
++
++export interface OpenDocument {
++  fileName: string;
++  isDirty: boolean;
++}
++
++export function normalizeFilePath(filePath: string): string {
++  const resolved = path.resolve(filePath);
++  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
++}
++
++/**
++ * True when an open document for targetPath has unsaved changes. Writing the
++ * file underneath such an editor makes VS Code report "The content on disk is
++ * newer" and would also drop the user's unsaved edits.
++ */
++export function HasDirtyDocument(
++  openDocuments: OpenDocument[],
++  targetPath: string
++): boolean {
++  const target = normalizeFilePath(targetPath);
++  return openDocuments.some(
++    doc => doc.isDirty && normalizeFilePath(doc.fileName) === target
++  );
++}
+diff --git a/src/service/github/gist.service.ts b/src/service/github/gist.service.ts
+index 4a64351..56552f4 100644
+--- a/src/service/github/gist.service.ts
++++ b/src/service/github/gist.service.ts
+@@ -10,6 +10,7 @@ import { ISyncService } from "../../models/ISyncService.model";
+ import { LocalConfig } from "../../models/localConfig.model";
+ import { IExtensionState } from "../../models/state.model";
+ import PragmaUtil from "../../pragmaUtil";
++import { EditorService } from "../editor.service";
+ import { File, FileService } from "../file.service";
+ import {
+   ExtensionInformation,
+@@ -639,7 +640,7 @@ export class GistService implements ISyncService {
+             }
+ 
+             actionList.push(
+-              FileService.WriteFile(filePath, content)
++              EditorService.WriteFile(filePath, content)
+                 .then(() => {
+                   // TODO : add Name attribute in File and show information message here with name , when required.
+                 })
+diff --git a/test/service/editor/editorMatch.test.ts b/test/service/editor/editorMatch.test.ts
+new file mode 100644
+index 0000000..b7ea891
+--- /dev/null
++++ b/test/service/editor/editorMatch.test.ts
+@@ -0,0 +1,38 @@
++import { expect } from "chai";
++import * as path from "path";
++
++import { HasDirtyDocument } from "../../../src/service/editorMatch";
++
++describe("HasDirtyDocument", () => {
++  const target = path.join(__dirname, "settings.json");
++
++  it("returns true when an editor for the file has unsaved changes", () => {
++    expect(
++      HasDirtyDocument([{ fileName: target, isDirty: true }], target)
++    ).to.equal(true);
++  });
++
++  it("returns false when the editor for the file is clean", () => {
++    expect(
++      HasDirtyDocument([{ fileName: target, isDirty: false }], target)
++    ).to.equal(false);
++  });
++
++  it("ignores dirty editors for other files", () => {
++    const other = path.join(__dirname, "keybindings.json");
++    expect(
++      HasDirtyDocument([{ fileName: other, isDirty: true }], target)
++    ).to.equal(false);
++  });
++
++  it("matches relative and absolute spellings of the same path", () => {
++    const relative = path.relative(process.cwd(), target);
++    expect(
++      HasDirtyDocument([{ fileName: target, isDirty: true }], relative)
++    ).to.equal(true);
++  });
++
++  it("returns false for an empty list of open documents", () => {
++    expect(HasDirtyDocument([], target)).to.equal(false);
++  });
++});
+-- 
+2.43.0
+

@@ -1,0 +1,290 @@
+From 23439c9f85124d25a587443ab6aa5de5e51ffb7b Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:26:51 +0000
+Subject: [PATCH] scripts: resolve FW_URI into a cached FW_FILE for regression
+ runs (#980)
+
+When FW_FILE is not set, the regression wrappers now fetch the image named
+by FW_URI (http, https or file) and use the cached copy as FW_FILE. FW_FILE
+keeps working unchanged for local images.
+
+scripts/lib/fw_resolve.py keys the cache by the SHA-256 of the full URI, so
+two URIs with the same file name never share an entry. The download goes to
+a temporary file in the cache directory and is renamed into place only after
+the optional FW_SHA256 check passes and the file is non-empty, so a failed
+download is never served as a cache hit.
+
+scripts/lib/test_fw_resolve.py covers reuse, URI collisions, failed and
+empty downloads, SHA-256 mismatch and unsupported schemes.
+---
+ scripts/lib/fw_resolve.py          | 109 +++++++++++++++++++++++++++++
+ scripts/lib/robot.sh               |  17 +++++
+ scripts/lib/test_fw_resolve.py     |  85 ++++++++++++++++++++++
+ scripts/regression-rerun-failed.sh |   3 +-
+ scripts/regression.sh              |   3 +-
+ 5 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 scripts/lib/fw_resolve.py
+ create mode 100644 scripts/lib/test_fw_resolve.py
+
+diff --git a/scripts/lib/fw_resolve.py b/scripts/lib/fw_resolve.py
+new file mode 100644
+index 0000000..806a2f5
+--- /dev/null
++++ b/scripts/lib/fw_resolve.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++
++# SPDX-FileCopyrightText: 2026 3mdeb <contact@3mdeb.com>
++#
++# SPDX-License-Identifier: Apache-2.0
++
++"""Fetch the firmware image named by FW_URI and cache it locally.
++
++The regression wrappers call this when FW_FILE is not set. The cache entry
++path is derived from the SHA-256 of the full URI, so two URIs that share a file
++name never reuse each other's cache entry. A download goes to a temporary file
++in the same directory and is renamed into place only after the optional
++SHA-256 check passes, so an interrupted or failed download is never served as a
++cache hit.
++
++Prints the local path of the firmware file on stdout. Exits non-zero with a
++message on stderr when the file cannot be obtained.
++"""
++
++import argparse
++import hashlib
++import os
++import shutil
++import sys
++import tempfile
++import urllib.parse
++import urllib.request
++
++ALLOWED_SCHEMES = ("http", "https", "file")
++CHUNK_SIZE = 1024 * 1024
++DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "osfv", "firmware")
++
++
++class FetchError(Exception):
++    """The firmware image could not be fetched or failed verification."""
++
++
++def cache_path(uri, cache_dir):
++    """Return the cache file path for a URI."""
++    digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()
++    name = os.path.basename(urllib.parse.urlsplit(uri).path) or "firmware.rom"
++    return os.path.join(cache_dir, digest[:16], name)
++
++
++def sha256_of(path):
++    """Return the hex SHA-256 of a file's contents."""
++    digest = hashlib.sha256()
++    with open(path, "rb") as handle:
++        for chunk in iter(lambda: handle.read(CHUNK_SIZE), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _matches_expected(path, expected_sha256):
++    return expected_sha256 is None or sha256_of(path) == expected_sha256.lower()
++
++
++def resolve(uri, cache_dir, expected_sha256=None, timeout=60):
++    """Return a local path holding the firmware for uri, downloading it if needed."""
++    scheme = urllib.parse.urlsplit(uri).scheme
++    if scheme not in ALLOWED_SCHEMES:
++        raise FetchError(f"unsupported FW_URI scheme '{scheme}' in {uri}")
++
++    target = cache_path(uri, cache_dir)
++    if os.path.isfile(target) and _matches_expected(target, expected_sha256):
++        return target
++
++    target_dir = os.path.dirname(target)
++    os.makedirs(target_dir, exist_ok=True)
++    fd, partial = tempfile.mkstemp(dir=target_dir, suffix=".part")
++    try:
++        with os.fdopen(fd, "wb") as out:
++            with urllib.request.urlopen(uri, timeout=timeout) as src:
++                shutil.copyfileobj(src, out, CHUNK_SIZE)
++        if os.path.getsize(partial) == 0:
++            raise FetchError(f"downloaded file is empty: {uri}")
++        if not _matches_expected(partial, expected_sha256):
++            raise FetchError(f"SHA-256 mismatch for {uri}")
++        os.replace(partial, target)
++    except OSError as exc:
++        raise FetchError(f"could not fetch {uri}: {exc}") from exc
++    finally:
++        if os.path.exists(partial):
++            os.remove(partial)
++    return target
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    parser.add_argument("uri", help="http, https or file URI of the firmware image")
++    parser.add_argument(
++        "--cache-dir",
++        default=DEFAULT_CACHE_DIR,
++        help="cache directory (default: %(default)s)",
++    )
++    parser.add_argument(
++        "--sha256", help="expected SHA-256 of the image; mismatches are rejected"
++    )
++    args = parser.parse_args(argv)
++    try:
++        print(resolve(args.uri, args.cache_dir, args.sha256))
++    except FetchError as exc:
++        print(f"Error: {exc}", file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/lib/robot.sh b/scripts/lib/robot.sh
+index 5387dab..844ee11 100644
+--- a/scripts/lib/robot.sh
++++ b/scripts/lib/robot.sh
+@@ -374,3 +374,20 @@ execute_robot() {
+   cleanup_and_split
+   return $overall_rc
+ }
++
++# Sets FW_FILE from FW_URI when FW_FILE is not set. The image is cached under
++# FW_CACHE_DIR (default ~/.cache/osfv/firmware). FW_SHA256 is optional and pins the image.
++resolve_fw_file() {
++  if [ -n "${FW_FILE}" ] || [ -z "${FW_URI}" ]; then
++    return 0
++  fi
++  local resolver
++  resolver="$(dirname "${BASH_SOURCE[0]}")/fw_resolve.py"
++  local cache_dir="${FW_CACHE_DIR:-$HOME/.cache/osfv/firmware}"
++  local sha_args=()
++  if [ -n "${FW_SHA256}" ]; then
++    sha_args=(--sha256 "${FW_SHA256}")
++  fi
++  FW_FILE="$(python3 "${resolver}" "${FW_URI}" --cache-dir "${cache_dir}" "${sha_args[@]}")" || exit 1
++  export FW_FILE
++}
+diff --git a/scripts/lib/test_fw_resolve.py b/scripts/lib/test_fw_resolve.py
+new file mode 100644
+index 0000000..6b2f4d3
+--- /dev/null
++++ b/scripts/lib/test_fw_resolve.py
+@@ -0,0 +1,85 @@
++# SPDX-FileCopyrightText: 2026 3mdeb <contact@3mdeb.com>
++#
++# SPDX-License-Identifier: Apache-2.0
++
++"""Focused tests for fw_resolve.py. Run with:
++python3 -m unittest discover -s scripts/lib -p 'test_fw_resolve.py'
++"""
++
++import hashlib
++import os
++import pathlib
++import tempfile
++import unittest
++
++import fw_resolve
++
++
++class ResolveTest(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.root = pathlib.Path(self._tmp.name)
++        self.cache = str(self.root / "cache")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def _source(self, relative, data):
++        path = self.root / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_bytes(data)
++        return path.as_uri()
++
++    def test_downloads_once_and_reuses_cache(self):
++        uri = self._source("a/bios.rom", b"rom-a")
++        first = fw_resolve.resolve(uri, self.cache)
++        os.remove(self.root / "a" / "bios.rom")  # cache hit must not re-read the source
++        second = fw_resolve.resolve(uri, self.cache)
++        self.assertEqual(first, second)
++        with open(second, "rb") as handle:
++            self.assertEqual(handle.read(), b"rom-a")
++
++    def test_same_file_name_from_different_uris_does_not_collide(self):
++        uri_a = self._source("a/bios.rom", b"rom-a")
++        uri_b = self._source("b/bios.rom", b"rom-b")
++        path_a = fw_resolve.resolve(uri_a, self.cache)
++        path_b = fw_resolve.resolve(uri_b, self.cache)
++        self.assertNotEqual(path_a, path_b)
++        with open(path_b, "rb") as handle:
++            self.assertEqual(handle.read(), b"rom-b")
++
++    def test_failed_download_is_not_left_as_a_cache_hit(self):
++        missing = (self.root / "missing.rom").as_uri()
++        with self.assertRaises(fw_resolve.FetchError):
++            fw_resolve.resolve(missing, self.cache)
++        target = fw_resolve.cache_path(missing, self.cache)
++        self.assertFalse(os.path.exists(target))
++        leftovers = [p for p in pathlib.Path(self.cache).rglob("*") if p.is_file()]
++        self.assertEqual(leftovers, [])
++
++    def test_sha256_mismatch_is_rejected_and_not_cached(self):
++        uri = self._source("bios.rom", b"rom-a")
++        with self.assertRaises(fw_resolve.FetchError):
++            fw_resolve.resolve(uri, self.cache, expected_sha256="0" * 64)
++        self.assertFalse(os.path.exists(fw_resolve.cache_path(uri, self.cache)))
++
++    def test_sha256_match_is_accepted(self):
++        data = b"rom-a"
++        uri = self._source("bios.rom", data)
++        path = fw_resolve.resolve(
++            uri, self.cache, expected_sha256=hashlib.sha256(data).hexdigest()
++        )
++        self.assertTrue(os.path.isfile(path))
++
++    def test_empty_download_is_rejected(self):
++        uri = self._source("empty.rom", b"")
++        with self.assertRaises(fw_resolve.FetchError):
++            fw_resolve.resolve(uri, self.cache)
++
++    def test_unsupported_scheme_is_rejected(self):
++        with self.assertRaises(fw_resolve.FetchError):
++            fw_resolve.resolve("ftp://example.invalid/bios.rom", self.cache)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/scripts/regression-rerun-failed.sh b/scripts/regression-rerun-failed.sh
+index 84d463e..a30e403 100755
+--- a/scripts/regression-rerun-failed.sh
++++ b/scripts/regression-rerun-failed.sh
+@@ -7,7 +7,8 @@
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ source "${SCRIPT_DIR}/lib/robot.sh"
+ 
+-# FW_FILE and DEVICE_IP are required for full regression
++# FW_FILE (or FW_URI, fetched and cached first) and DEVICE_IP are required for full regression
++resolve_fw_file
+ check_env_variable "FW_FILE"
+ check_env_variable "DEVICE_IP"
+ 
+diff --git a/scripts/regression.sh b/scripts/regression.sh
+index 6b1e32b..40bc5db 100755
+--- a/scripts/regression.sh
++++ b/scripts/regression.sh
+@@ -7,7 +7,8 @@
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ source "${SCRIPT_DIR}/lib/robot.sh"
+ 
+-# FW_FILE and DEVICE_IP are required for full regression
++# FW_FILE (or FW_URI, fetched and cached first) and DEVICE_IP are required for full regression
++resolve_fw_file
+ check_env_variable "FW_FILE"
+ check_env_variable "DEVICE_IP"
+ 
+-- 
+2.43.0
+

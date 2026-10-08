@@ -1,0 +1,4677 @@
+From 62598e0f52a7a7f8422262a8db2c00ce20c49534 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:55:59 +0000
+Subject: [PATCH] v2/plugin: add subprocess plugin API for language extensions
+
+Gazelle language extensions can now be written in any language. A
+plugin is an executable that Gazelle starts as a subprocess and talks
+to with JSON-RPC 2.0, one JSON message per line, over the plugin's
+stdin and stdout. Plugins take part in a run exactly like extensions
+compiled into a gazelle_binary: their directives are recognized, their
+rules are generated, merged and indexed, and their dependencies are
+resolved against the shared rule index.
+
+* v2/plugin/protocol: the wire schema (Go structs with lowerCamelCase
+  JSON names) and a small JSON-RPC connection. Methods mirror the v2
+  extension interfaces: initialize (name, kinds, known directives,
+  capabilities), configure, fix, generate, imports, resolve, find,
+  onResolve, onFinish and shutdown. While handling resolve or find, a
+  plugin can call back into Gazelle with index/find, which applies
+  gazelle:resolve overrides, then the rule index, then finders.
+* v2/plugin: Language adapts a plugin process to the v2 interfaces.
+  Per-directory configuration is an opaque JSON value stored in
+  Config.Exts, so plugins stay stateless. Errors carry severities;
+  a crashed plugin is reported once as a critical error.
+* v2/plugin: Loader registers plugins with the repeatable -plugin flag
+  (resolved through Bazel runfiles, the current directory, the
+  workspace directory, or PATH) or with "# gazelle:plugin path [args]"
+  in the repository root build file. update.Run starts plugins after
+  flags are parsed and adds them to the set of extensions, so the
+  default gazelle binary and custom gazelle_binary targets both
+  support them.
+* v2/plugin/server: helper for writing plugins in Go.
+* v2/plugin/examples/sh: reference plugin for shell scripts, in Python
+  (standard library only) and in Go. Tests run Gazelle end to end with
+  both and check that they produce the same build files.
+
+Fixes #938
+---
+ extend.md                                     |  23 +
+ gazelle-reference.md                          |   8 +
+ internal/go_repository_tools_srcs.bzl         |  15 +
+ v2/BUILD.bazel                                |   1 +
+ v2/cmd/gazelle/update/BUILD.bazel             |   1 +
+ v2/cmd/gazelle/update/update.go               |  26 +-
+ v2/plugin/BUILD.bazel                         |  65 ++
+ v2/plugin/README.md                           | 211 ++++++
+ v2/plugin/convert.go                          | 362 +++++++++
+ v2/plugin/convert_test.go                     | 212 ++++++
+ v2/plugin/examples/BUILD.bazel                |   9 +
+ v2/plugin/examples/sh/BUILD.bazel             |  26 +
+ v2/plugin/examples/sh/cmd/BUILD.bazel         |   9 +
+ .../examples/sh/cmd/sh_plugin/BUILD.bazel     |  28 +
+ v2/plugin/examples/sh/cmd/sh_plugin/main.go   |  27 +
+ v2/plugin/examples/sh/sh.go                   | 287 +++++++
+ v2/plugin/examples/sh/sh_plugin.py            | 259 +++++++
+ v2/plugin/loader.go                           | 244 ++++++
+ v2/plugin/loader_test.go                      |  66 ++
+ v2/plugin/plugin.go                           | 707 ++++++++++++++++++
+ v2/plugin/plugin_test.go                      | 440 +++++++++++
+ v2/plugin/protocol/BUILD.bazel                |  29 +
+ v2/plugin/protocol/jsonrpc.go                 | 241 ++++++
+ v2/plugin/protocol/jsonrpc_test.go            | 199 +++++
+ v2/plugin/protocol/protocol.go                | 554 ++++++++++++++
+ v2/plugin/server/BUILD.bazel                  |  27 +
+ v2/plugin/server/server.go                    | 203 +++++
+ v2/plugin/server/server_test.go               |  82 ++
+ 28 files changed, 4359 insertions(+), 2 deletions(-)
+ create mode 100644 v2/plugin/BUILD.bazel
+ create mode 100644 v2/plugin/README.md
+ create mode 100644 v2/plugin/convert.go
+ create mode 100644 v2/plugin/convert_test.go
+ create mode 100644 v2/plugin/examples/BUILD.bazel
+ create mode 100644 v2/plugin/examples/sh/BUILD.bazel
+ create mode 100644 v2/plugin/examples/sh/cmd/BUILD.bazel
+ create mode 100644 v2/plugin/examples/sh/cmd/sh_plugin/BUILD.bazel
+ create mode 100644 v2/plugin/examples/sh/cmd/sh_plugin/main.go
+ create mode 100644 v2/plugin/examples/sh/sh.go
+ create mode 100755 v2/plugin/examples/sh/sh_plugin.py
+ create mode 100644 v2/plugin/loader.go
+ create mode 100644 v2/plugin/loader_test.go
+ create mode 100644 v2/plugin/plugin.go
+ create mode 100644 v2/plugin/plugin_test.go
+ create mode 100644 v2/plugin/protocol/BUILD.bazel
+ create mode 100644 v2/plugin/protocol/jsonrpc.go
+ create mode 100644 v2/plugin/protocol/jsonrpc_test.go
+ create mode 100644 v2/plugin/protocol/protocol.go
+ create mode 100644 v2/plugin/server/BUILD.bazel
+ create mode 100644 v2/plugin/server/server.go
+ create mode 100644 v2/plugin/server/server_test.go
+
+diff --git a/extend.md b/extend.md
+index 0419af3..efb0a1c 100644
+--- a/extend.md
++++ b/extend.md
+@@ -77,6 +77,29 @@ gazelle(
+ 
+ You can run this with `bazel run //:gazelle`.
+ 
++Plugins in other languages
++--------------------------
++
++Extensions don't have to be written in Go. Gazelle can also run a *plugin*, an
++executable written in any language, as a subprocess, and talk to it with
++JSON-RPC over stdin and stdout. Plugins implement the same operations as the
++interfaces above (configure, generate, index, resolve, and optionally fix and
++find), and they don't require a custom `gazelle_binary`:
++
++```starlark
++load("@bazel_gazelle//:def.bzl", "gazelle")
++
++gazelle(
++    name = "gazelle",
++    data = ["//tools/gazelle:my_plugin"],
++    extra_args = ["-plugin=$(rlocationpath //tools/gazelle:my_plugin)"],
++)
++```
++
++See [Language plugins in any language](v2/plugin/README.md) for the protocol,
++and [v2/plugin/examples/sh](v2/plugin/examples/sh) for reference plugins
++written in Python and Go.
++
+ Lazy indexing
+ -------------
+ 
+diff --git a/gazelle-reference.md b/gazelle-reference.md
+index 85cb1cb..57f6fb1 100644
+--- a/gazelle-reference.md
++++ b/gazelle-reference.md
+@@ -82,6 +82,10 @@ Whether Gazelle will remove `# keep` comments when the thing being kept would ha
+ **Default:** n/a<br>
+ Selects languages for which to compose and index rules. By default, all languages that this Gazelle was built with are processed.
+ 
++**Flag:** `-plugin=path`<br>
++**Default:** n/a<br>
++Path to a language plugin executable. Gazelle runs the plugin as a subprocess and uses it like a language extension built into Gazelle, so plugins can be written in any language. May be repeated. With Bazel, list the plugin in the `data` attribute of the `gazelle` rule and pass `-plugin=$(rlocationpath //label/of:plugin)` in `extra_args`. See [Language plugins in any language](v2/plugin/README.md).
++
+ **Flag:** `-cpuprofile=filename`<br>
+ **Default:** n/a<br>
+ If specified, gazelle uses [runtime/pprof](https://pkg.go.dev/runtime/pprof#StartCPUProfile) to collect CPU profiling information from the command and save it to the given file. By default, this is disabled.
+@@ -188,6 +192,10 @@ Most commonly, this would be used to replace the rules provided by `rules_go` wi
+ 
+ Existing rules of the old kind will be ignored. To switch your codebase from a builtin kind to a mapped kind, use [buildozer](https://github.com/bazelbuild/buildtools/tree/master/buildozer).
+ 
++**Directive:** `# gazelle:plugin path [args...]`<br>
++**Default:** n/a<br>
++Registers a language plugin: an executable, written in any language, that Gazelle runs as a subprocess and uses like a built-in language extension. `path` is relative to the repository root; any further words are passed to the plugin as command-line arguments. This directive may be repeated, and may only appear in the repository root build file. See the `-plugin` flag and [Language plugins in any language](v2/plugin/README.md).
++
+ **Directive:** `# gazelle:resolve source-lang [import-lang] import-string label`<br>
+ **Default:** n/a<br>
+ Specifies an explicit mapping from an import string to a label for [Dependency resolution](#dependency-resolution). Accepts the following arguments:
+diff --git a/internal/go_repository_tools_srcs.bzl b/internal/go_repository_tools_srcs.bzl
+index d052fa0..22dbf49 100644
+--- a/internal/go_repository_tools_srcs.bzl
++++ b/internal/go_repository_tools_srcs.bzl
+@@ -159,6 +159,21 @@ GO_REPOSITORY_TOOLS_SRCS = [
+     Label("//v2/merger:merger.go"),
+     Label("//v2/pathtools:BUILD.bazel"),
+     Label("//v2/pathtools:path.go"),
++    Label("//v2/plugin:BUILD.bazel"),
++    Label("//v2/plugin:convert.go"),
++    Label("//v2/plugin/examples:BUILD.bazel"),
++    Label("//v2/plugin/examples/sh:BUILD.bazel"),
++    Label("//v2/plugin/examples/sh/cmd:BUILD.bazel"),
++    Label("//v2/plugin/examples/sh/cmd/sh_plugin:BUILD.bazel"),
++    Label("//v2/plugin/examples/sh/cmd/sh_plugin:main.go"),
++    Label("//v2/plugin/examples/sh:sh.go"),
++    Label("//v2/plugin:loader.go"),
++    Label("//v2/plugin:plugin.go"),
++    Label("//v2/plugin/protocol:BUILD.bazel"),
++    Label("//v2/plugin/protocol:jsonrpc.go"),
++    Label("//v2/plugin/protocol:protocol.go"),
++    Label("//v2/plugin/server:BUILD.bazel"),
++    Label("//v2/plugin/server:server.go"),
+     Label("//v2/resolve:BUILD.bazel"),
+     Label("//v2/resolve:config.go"),
+     Label("//v2/resolve:index.go"),
+diff --git a/v2/BUILD.bazel b/v2/BUILD.bazel
+index ac7f9ba..54e0e69 100644
+--- a/v2/BUILD.bazel
++++ b/v2/BUILD.bazel
+@@ -18,6 +18,7 @@ filegroup(
+         "//v2/language:all_files",
+         "//v2/merger:all_files",
+         "//v2/pathtools:all_files",
++        "//v2/plugin:all_files",
+         "//v2/resolve:all_files",
+         "//v2/rule:all_files",
+         "//v2/testtools:all_files",
+diff --git a/v2/cmd/gazelle/update/BUILD.bazel b/v2/cmd/gazelle/update/BUILD.bazel
+index 35d1d6f..a1a17a3 100644
+--- a/v2/cmd/gazelle/update/BUILD.bazel
++++ b/v2/cmd/gazelle/update/BUILD.bazel
+@@ -29,6 +29,7 @@ go_library(
+         "//v2/label",
+         "//v2/language",
+         "//v2/merger",
++        "//v2/plugin",
+         "//v2/resolve",
+         "//v2/rule",
+         "//v2/walk",
+diff --git a/v2/cmd/gazelle/update/update.go b/v2/cmd/gazelle/update/update.go
+index 1c878fd..a46bd15 100644
+--- a/v2/cmd/gazelle/update/update.go
++++ b/v2/cmd/gazelle/update/update.go
+@@ -44,6 +44,7 @@ import (
+ 	"github.com/bazel-contrib/bazel-gazelle/v2/label"
+ 	"github.com/bazel-contrib/bazel-gazelle/v2/language"
+ 	"github.com/bazel-contrib/bazel-gazelle/v2/merger"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin"
+ 	"github.com/bazel-contrib/bazel-gazelle/v2/resolve"
+ 	"github.com/bazel-contrib/bazel-gazelle/v2/rule"
+ 	"github.com/bazel-contrib/bazel-gazelle/v2/walk"
+@@ -364,12 +365,14 @@ func Run(
+ 	}
+ 	sort.Strings(langNames)
+ 
+-	cexts := make([]config.Configurer, 0, len(languagesRaw)+4)
++	pluginLoader := &plugin.Loader{}
++	cexts := make([]config.Configurer, 0, len(languagesRaw)+5)
+ 	cexts = append(cexts,
+ 		&config.CommonConfigurer{},
+ 		&updateConfigurer{knownLanguages: langNames},
+ 		&walk.Configurer{},
+-		&resolve.Configurer{})
++		&resolve.Configurer{},
++		pluginLoader)
+ 	flagExts := make([]compat.FlagConfigurer, 0, cap(cexts))
+ 	for _, cext := range cexts {
+ 		if flagExt, ok := cext.(compat.FlagConfigurer); ok {
+@@ -401,6 +404,25 @@ func Run(
+ 	}
+ 	uc := getUpdateConfig(c)
+ 
++	// Start language plugins registered with -plugin or gazelle:plugin. They
++	// run as subprocesses and are used like extensions compiled into Gazelle.
++	plugins, err := pluginLoader.Start(ctx, c, langNames)
++	defer func() {
++		if cerr := pluginLoader.Close(); cerr != nil {
++			log.Print(cerr)
++		}
++	}()
++	if err != nil {
++		return err
++	}
++	for _, p := range plugins {
++		languages = append(languages, compat.LanguageWithDefaults(p))
++		cexts = append(cexts, p)
++		if p.Capabilities().Find {
++			finders = append(finders, p)
++		}
++	}
++
+ 	errHandler := &errorHandler{strict: c.Strict}
+ 
+ 	mrslv := newMetaResolver()
+diff --git a/v2/plugin/BUILD.bazel b/v2/plugin/BUILD.bazel
+new file mode 100644
+index 0000000..4bc4816
+--- /dev/null
++++ b/v2/plugin/BUILD.bazel
+@@ -0,0 +1,65 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
++
++go_library(
++    name = "plugin",
++    srcs = [
++        "convert.go",
++        "loader.go",
++        "plugin.go",
++    ],
++    importpath = "github.com/bazel-contrib/bazel-gazelle/v2/plugin",
++    visibility = ["//visibility:public"],
++    deps = [
++        "//v2/config",
++        "//v2/errors",
++        "//v2/flag",
++        "//v2/label",
++        "//v2/language",
++        "//v2/plugin/protocol",
++        "//v2/resolve",
++        "//v2/rule",
++        "@com_github_bazelbuild_buildtools//build",
++        "@io_bazel_rules_go//go/runfiles",
++    ],
++)
++
++go_test(
++    name = "plugin_test",
++    srcs = [
++        "convert_test.go",
++        "loader_test.go",
++        "plugin_test.go",
++    ],
++    data = ["//v2/plugin/examples/sh:sh_plugin.py"],
++    embed = [":plugin"],
++    deps = [
++        "//v2/cmd/gazelle/update",
++        "//v2/config",
++        "//v2/language",
++        "//v2/plugin/examples/sh",
++        "//v2/plugin/protocol",
++        "//v2/plugin/server",
++        "//v2/rule",
++        "//v2/testtools",
++        "@com_github_google_go_cmp//cmp",
++    ],
++)
++
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = [
++        "BUILD.bazel",
++        "README.md",
++        "convert.go",
++        "convert_test.go",
++        "loader.go",
++        "loader_test.go",
++        "plugin.go",
++        "plugin_test.go",
++        "//v2/plugin/examples:all_files",
++        "//v2/plugin/protocol:all_files",
++        "//v2/plugin/server:all_files",
++    ],
++    visibility = ["//visibility:public"],
++)
+diff --git a/v2/plugin/README.md b/v2/plugin/README.md
+new file mode 100644
+index 0000000..a384d6d
+--- /dev/null
++++ b/v2/plugin/README.md
+@@ -0,0 +1,211 @@
++# Language plugins in any language
++
++Gazelle can use language extensions that run as separate processes. A plugin
++is an executable written in any language: Gazelle starts it, then exchanges
++JSON-RPC messages with it over the plugin's stdin and stdout. This lets a
++TypeScript plugin use the TypeScript compiler API, a Python plugin use Python's
++`ast` module, and so on, without rebuilding Gazelle and without writing Go.
++
++Plugins are used exactly like extensions compiled into Gazelle with
++`gazelle_binary`: their rules are merged into build files, their directives are
++recognized, their libraries are indexed, and their dependencies are resolved
++against the same index as every other language (in both directions).
++`-lang`, `# gazelle:lang`, `# gazelle:map_kind`, `# gazelle:resolve`, and
++`# keep` all work with plugins.
++
++* [Using a plugin](#using-a-plugin)
++* [Writing a plugin](#writing-a-plugin)
++* [Protocol reference](#protocol-reference)
++* Reference plugins: [examples/sh/sh_plugin.py](examples/sh/sh_plugin.py)
++  (Python, standard library only) and [examples/sh/sh.go](examples/sh/sh.go)
++  (Go, using [server](server)).
++
++## Using a plugin
++
++Pass the plugin executable with `-plugin`. The flag may be repeated.
++
++```sh
++gazelle -plugin=tools/gazelle/sh_plugin.py
++```
++
++With Bazel, list the plugin in the `data` attribute of the `gazelle` rule and
++pass its runfiles path:
++
++```starlark
++load("@gazelle//:def.bzl", "gazelle")
++
++gazelle(
++    name = "gazelle",
++    data = ["//tools/gazelle:sh_plugin"],
++    extra_args = ["-plugin=$(rlocationpath //tools/gazelle:sh_plugin)"],
++)
++```
++
++A relative `-plugin` path is looked up in Bazel runfiles, then relative to the
++current directory, then relative to the workspace directory, then on `PATH`
++(for names without a slash). Gazelle passes its runfiles environment variables
++to the plugin, so plugins built by Bazel (for example, `py_binary` or
++`js_binary` targets) can find their own runfiles.
++
++Plugins may also be registered in the repository root build file. Paths are
++relative to the repository root, and any further words are passed to the plugin
++as arguments:
++
++```starlark
++# gazelle:plugin tools/gazelle/sh_plugin.py
++```
++
++## Writing a plugin
++
++A plugin is a program that reads JSON-RPC 2.0 requests from stdin and writes
++responses to stdout, one JSON object per line. It may log to stderr; Gazelle
++passes stderr through to the user. It must exit when stdin is closed.
++
++A run looks like this:
++
++1. Gazelle parses flags, then starts each plugin and sends `initialize`. The
++   plugin replies with its language name, the kinds of rules it generates, the
++   directives it understands, and optional capabilities.
++2. Gazelle walks the repository. For each directory (parents first), it sends
++   `configure` with the directory's build file and the plugin's configuration
++   value for the parent directory. The plugin returns its configuration value
++   for this directory: any JSON value, which Gazelle stores and sends back with
++   later requests for the directory. Plugins don't need to keep per-directory
++   state.
++3. In each directory Gazelle updates, it sends `fix` (optional) and `generate`.
++   `generate` returns new rules, empty rules (rules that may be deleted), and
++   an opaque `imports` value per rule.
++4. As it indexes rules for dependency resolution, Gazelle sends `imports` for
++   each rule of one of the plugin's kinds. The plugin returns the strings by
++   which the rule may be imported.
++5. After the walk, Gazelle sends `onResolve` (optional), then `resolve` for each
++   rule the plugin generated, with the rule's `imports` value. To find
++   dependencies, the plugin sends `index/find` requests back to Gazelle while
++   handling `resolve`. The result describes changes to the rule, usually
++   setting `deps`.
++6. Gazelle writes build files, sends `onFinish` (optional), then `shutdown`, and
++   closes stdin.
++
++Requests are sent one at a time. Gazelle waits for a response before sending
++the next request, and the only request a plugin may send is `index/find`, while
++it's handling `resolve` or `find`.
++
++Here is a complete exchange for a directory with one script (Gazelle's messages
++are marked `>`, the plugin's `<`; some fields are omitted):
++
++```
++> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"repoRoot":"/src/repo",...}}
++< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"name":"sh","kinds":[{"name":"sh_binary","loadedFrom":"@rules_shell//shell:sh_binary.bzl","mergeableAttrs":["srcs"],"resolveAttrs":["deps"]}],"knownDirectives":["sh_enabled"],"capabilities":{"configure":"directives"}}}
++> {"jsonrpc":"2.0","id":2,"method":"generate","params":{"config":null,"dir":"/src/repo/bin","rel":"bin","file":null,"subdirs":[],"regularFiles":["run.sh"],"genFiles":[]}}
++< {"jsonrpc":"2.0","id":2,"result":{"gen":[{"kind":"sh_binary","name":"run","attrs":{"srcs":["run.sh"]}}],"imports":[["lib/util.sh"]]}}
++> {"jsonrpc":"2.0","id":3,"method":"resolve","params":{"rel":"bin","rule":{"kind":"sh_binary","name":"run","attrs":{"srcs":["run.sh"]}},"from":"//bin:run","imports":["lib/util.sh"]}}
++< {"jsonrpc":"2.0","id":"py-1","method":"index/find","params":{"import":{"lang":"sh","imp":"lib/util.sh"}}}
++> {"jsonrpc":"2.0","id":"py-1","result":{"results":[{"label":"//lib:util","relLabel":"//lib:util"}]}}
++< {"jsonrpc":"2.0","id":3,"result":{"attrs":{"deps":["//lib:util"]}}}
++> {"jsonrpc":"2.0","id":4,"method":"shutdown","params":{}}
++< {"jsonrpc":"2.0","id":4,"result":{}}
++```
++
++Plugins written in Go can use package [server](server), which handles the
++connection and dispatches requests to methods. The Go types in package
++[protocol](protocol) are the schema for every message.
++
++### Rules and attribute values
++
++Rules are sent as `{"kind": ..., "name": ..., "attrs": {...}, "attrExprs": {...}}`.
++Attribute values that can be written as plain JSON (strings, booleans,
++integers, lists, and dicts with string keys) go in `attrs`. Anything else, like
++a `select()` or `glob()` call, goes in `attrExprs` as Starlark source:
++
++```json
++{
++  "kind": "sh_library",
++  "name": "util",
++  "attrs": {"srcs": ["util.sh"], "visibility": ["//visibility:public"]},
++  "attrExprs": {"data": "glob([\"*.txt\"])"}
++}
++```
++
++Rules from existing build files are sent the same way, with `"keep": true` for
++rules marked `# keep`. Results that modify rules (`resolve`, `fix`) use `attrs`,
++`attrExprs`, and `deleteAttrs`.
++
++### Errors
++
++A plugin reports a failed request with a JSON-RPC error response. Problems
++that don't prevent a result (a syntax error in one source file, an
++unresolved import) go in the `errors` list of the result:
++
++```json
++{"errors": [{"message": "bin/run.sh: no rule provides lib/missing.sh", "severity": "warning"}]}
++```
++
++`severity` is `"error"` (the default), `"warning"`, or `"critical"`, with the same
++meaning as for built-in extensions: Gazelle exits non-zero after errors in
++`-strict` mode, never fails for warnings, and stops after critical errors. The
++same severities may be set in a JSON-RPC error's `data.severity`.
++
++If a plugin crashes or writes something that isn't a JSON-RPC message, Gazelle
++reports a critical error, prints the plugin's exit status, and exits without
++writing build files.
++
++### Versioning
++
++`initialize` carries the protocol version. Gazelle sends the highest version it
++supports; the plugin replies with the version it implements, which must not be
++higher. This is version 1. New optional fields may be added to messages without
++changing the version, so plugins and Gazelle must ignore fields they don't
++recognize. Optional features are negotiated with capabilities.
++
++## Protocol reference
++
++The Go types in [protocol/protocol.go](protocol/protocol.go) are the
++authoritative schema; each field is documented there. Field names are
++lowerCamelCase.
++
++| Method | Direction | Sent | Params → Result |
++| --- | --- | --- | --- |
++| `initialize` | Gazelle → plugin | once, first | `InitializeParams` → `InitializeResult` |
++| `configure` | Gazelle → plugin | per directory, parents first (see `capabilities.configure`) | `ConfigureParams` → `ConfigureResult` |
++| `fix` | Gazelle → plugin | per updated directory with a build file, if `capabilities.fix` | `FixParams` → `FixResult` |
++| `generate` | Gazelle → plugin | per updated directory | `GenerateParams` → `GenerateResult` |
++| `imports` | Gazelle → plugin | per indexed rule of the plugin's kinds | `ImportsParams` → `ImportsResult` |
++| `onResolve` | Gazelle → plugin | after the walk, if `capabilities.lifecycle` | `{}` → `{}` |
++| `resolve` | Gazelle → plugin | per rule the plugin generated | `ResolveParams` → `ResolveResult` |
++| `find` | Gazelle → plugin | when an import isn't in the index, if `capabilities.find` | `FindParams` → `FindResult` |
++| `onFinish` | Gazelle → plugin | after build files are written, if `capabilities.lifecycle` | `{}` → `{}` |
++| `shutdown` | Gazelle → plugin | once, last | `{}` → `{}` |
++| `index/find` | plugin → Gazelle | while handling `resolve` or `find` | `IndexFindParams` → `IndexFindResult` |
++
++Capabilities returned by `initialize`:
++
++* `configure`: which directories `configure` is sent for. `"all"` (default),
++  `"buildFiles"` (directories with a build file), `"directives"` (build files
++  containing one of the plugin's known directives), or `"none"`.
++* `fix`: the plugin handles `fix`.
++* `find`: the plugin handles `find`, resolving imports for any language that
++  aren't in the index (like `CrossResolver` in the Go API).
++* `lifecycle`: the plugin handles `onResolve` and `onFinish`.
++
++`index/find` applies `# gazelle:resolve` and `# gazelle:resolve_regexp`
++directives first, then searches the rule index, then asks extensions that
++implement `find`. During `resolve`, each match includes `relLabel`, the label
++written relative to the rule being resolved, and `selfImport`, which is true if
++the match is the rule itself or a rule it embeds.
++
++The protocol mirrors the Go extension API in
++[v2/language](../language), [v2/config](../config), and
++[v2/resolve](../resolve):
++
++| Go API | Protocol |
++| --- | --- |
++| `Language.Name` | `InitializeResult.name` |
++| `Generator.Kinds` | `InitializeResult.kinds` |
++| `Configurer.KnownDirectives` | `InitializeResult.knownDirectives` |
++| `Configurer.Configure` | `configure` (configuration is a JSON value instead of `Config.Exts`) |
++| `Fixer.Fix` | `fix` |
++| `Generator.Generate` | `generate` |
++| `Indexer.Imports` | `imports` |
++| `Resolver.Resolve` | `resolve`, with `RuleIndex.Find` available as `index/find` |
++| `Finder.Find` | `find` |
++| `OnResolver`, `OnFinisher` | `onResolve`, `onFinish` |
+diff --git a/v2/plugin/convert.go b/v2/plugin/convert.go
+new file mode 100644
+index 0000000..eda0103
+--- /dev/null
++++ b/v2/plugin/convert.go
+@@ -0,0 +1,362 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package plugin
++
++import (
++	"encoding/json"
++	"fmt"
++	"math"
++	"slices"
++	"strconv"
++	"strings"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/label"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol"
++	"github.com/bazel-contrib/bazel-gazelle/v2/rule"
++	bzl "github.com/bazelbuild/buildtools/build"
++)
++
++// fileToProtocol converts a build file to its wire representation.
++// It returns nil if f is nil.
++func fileToProtocol(f *rule.File) *protocol.File {
++	if f == nil {
++		return nil
++	}
++	pf := &protocol.File{
++		Path: f.Path,
++		Pkg:  f.Pkg,
++	}
++	for _, d := range f.Directives {
++		pf.Directives = append(pf.Directives, protocol.Directive{Key: d.Key, Value: d.Value})
++	}
++	for _, l := range f.Loads {
++		pf.Loads = append(pf.Loads, protocol.Load{Name: l.Name(), Symbols: l.Symbols()})
++	}
++	pf.Rules = rulesToProtocol(f.Rules)
++	return pf
++}
++
++func rulesToProtocol(rs []*rule.Rule) []protocol.Rule {
++	if len(rs) == 0 {
++		return nil
++	}
++	prs := make([]protocol.Rule, len(rs))
++	for i, r := range rs {
++		prs[i] = ruleToProtocol(r)
++	}
++	return prs
++}
++
++// ruleToProtocol converts a rule to its wire representation. Attribute values
++// that can be represented as JSON are placed in Attrs; others are formatted
++// as Starlark and placed in AttrExprs.
++func ruleToProtocol(r *rule.Rule) protocol.Rule {
++	pr := protocol.Rule{
++		Kind: r.Kind(),
++		Name: r.Name(),
++		Keep: r.ShouldKeep(),
++	}
++	for _, key := range r.AttrKeys() {
++		if key == "name" {
++			continue
++		}
++		expr := r.Attr(key)
++		if v, ok := exprToJSON(expr); ok {
++			if pr.Attrs == nil {
++				pr.Attrs = make(map[string]any)
++			}
++			pr.Attrs[key] = v
++		} else {
++			if pr.AttrExprs == nil {
++				pr.AttrExprs = make(map[string]string)
++			}
++			pr.AttrExprs[key] = bzl.FormatString(expr)
++		}
++	}
++	return pr
++}
++
++// exprToJSON converts a Starlark expression to a value that can be marshaled
++// as JSON. It returns false if the expression has no JSON equivalent.
++func exprToJSON(expr bzl.Expr) (any, bool) {
++	switch e := expr.(type) {
++	case *bzl.StringExpr:
++		return e.Value, true
++
++	case *bzl.Ident:
++		switch e.Name {
++		case "True":
++			return true, true
++		case "False":
++			return false, true
++		}
++		return nil, false
++
++	case *bzl.LiteralExpr:
++		return literalToJSON(e.Token, false)
++
++	case *bzl.UnaryExpr:
++		if lit, ok := e.X.(*bzl.LiteralExpr); ok && e.Op == "-" {
++			return literalToJSON(lit.Token, true)
++		}
++		return nil, false
++
++	case *bzl.ListExpr:
++		list := make([]any, len(e.List))
++		for i, elem := range e.List {
++			v, ok := exprToJSON(elem)
++			if !ok {
++				return nil, false
++			}
++			list[i] = v
++		}
++		return list, true
++
++	case *bzl.DictExpr:
++		dict := make(map[string]any, len(e.List))
++		for _, kv := range e.List {
++			k, ok := kv.Key.(*bzl.StringExpr)
++			if !ok {
++				return nil, false
++			}
++			if _, dup := dict[k.Value]; dup {
++				return nil, false
++			}
++			v, ok := exprToJSON(kv.Value)
++			if !ok {
++				return nil, false
++			}
++			dict[k.Value] = v
++		}
++		return dict, true
++
++	default:
++		return nil, false
++	}
++}
++
++func literalToJSON(token string, negate bool) (any, bool) {
++	if negate {
++		token = "-" + token
++	}
++	if n, err := strconv.ParseInt(token, 0, 64); err == nil {
++		return n, true
++	}
++	if f, err := strconv.ParseFloat(token, 64); err == nil && !math.IsInf(f, 0) && !math.IsNaN(f) {
++		return f, true
++	}
++	return nil, false
++}
++
++// jsonToValue converts a decoded JSON value (from [protocol.Unmarshal]) to a
++// value accepted by [rule.Rule.SetAttr].
++func jsonToValue(v any) (any, error) {
++	switch v := v.(type) {
++	case string, bool:
++		return v, nil
++
++	case json.Number:
++		if n, err := v.Int64(); err == nil {
++			return n, nil
++		}
++		f, err := v.Float64()
++		if err != nil {
++			return nil, fmt.Errorf("invalid number %s", v)
++		}
++		return f, nil
++
++	case float64:
++		if v == math.Trunc(v) && math.Abs(v) < 1<<53 {
++			return int64(v), nil
++		}
++		return v, nil
++
++	case []any:
++		allStrings := true
++		for _, elem := range v {
++			if _, ok := elem.(string); !ok {
++				allStrings = false
++				break
++			}
++		}
++		if allStrings {
++			strs := make([]string, len(v))
++			for i, elem := range v {
++				strs[i] = elem.(string)
++			}
++			return strs, nil
++		}
++		list := make([]any, len(v))
++		for i, elem := range v {
++			ev, err := jsonToValue(elem)
++			if err != nil {
++				return nil, err
++			}
++			list[i] = ev
++		}
++		return list, nil
++
++	case map[string]any:
++		// Build the dict expression directly so that values of mixed types are
++		// supported. Keys are sorted for deterministic output.
++		keys := make([]string, 0, len(v))
++		for k := range v {
++			keys = append(keys, k)
++		}
++		slices.Sort(keys)
++		dict := &bzl.DictExpr{ForceMultiLine: true}
++		for _, k := range keys {
++			ev, err := jsonToValue(v[k])
++			if err != nil {
++				return nil, err
++			}
++			dict.List = append(dict.List, &bzl.KeyValueExpr{
++				Key:   &bzl.StringExpr{Value: k},
++				Value: rule.ExprFromValue(ev),
++			})
++		}
++		return dict, nil
++
++	case nil:
++		return nil, fmt.Errorf("null is not a valid attribute value; use deleteAttrs to remove an attribute")
++
++	default:
++		return nil, fmt.Errorf("unsupported attribute value of type %T", v)
++	}
++}
++
++// parseExpr parses a Starlark expression.
++func parseExpr(src string) (bzl.Expr, error) {
++	f, err := bzl.ParseBuild("expr", []byte("_ = "+src+"\n"))
++	if err != nil {
++		return nil, fmt.Errorf("parsing expression %q: %v", src, err)
++	}
++	if len(f.Stmt) != 1 {
++		return nil, fmt.Errorf("parsing expression %q: expected a single expression", src)
++	}
++	assign, ok := f.Stmt[0].(*bzl.AssignExpr)
++	if !ok {
++		return nil, fmt.Errorf("parsing expression %q: expected a single expression", src)
++	}
++	return assign.RHS, nil
++}
++
++// applyAttrEdit applies attribute changes from a plugin to a rule.
++func applyAttrEdit(r *rule.Rule, e protocol.AttrEdit) error {
++	var errs []string
++	for _, key := range sortedKeys(e.Attrs) {
++		if _, dup := e.AttrExprs[key]; dup {
++			errs = append(errs, fmt.Sprintf("attribute %q set in both attrs and attrExprs", key))
++			continue
++		}
++		v, err := jsonToValue(e.Attrs[key])
++		if err != nil {
++			errs = append(errs, fmt.Sprintf("attribute %q: %v", key, err))
++			continue
++		}
++		if key == "name" {
++			name, ok := v.(string)
++			if !ok {
++				errs = append(errs, "attribute \"name\" must be a string")
++				continue
++			}
++			r.SetName(name)
++			continue
++		}
++		r.SetAttr(key, v)
++	}
++	for _, key := range sortedKeys(e.AttrExprs) {
++		if _, dup := e.Attrs[key]; dup {
++			continue // reported above
++		}
++		expr, err := parseExpr(e.AttrExprs[key])
++		if err != nil {
++			errs = append(errs, fmt.Sprintf("attribute %q: %v", key, err))
++			continue
++		}
++		r.SetAttr(key, expr)
++	}
++	for _, key := range e.DeleteAttrs {
++		if key == "name" {
++			errs = append(errs, "attribute \"name\" can't be deleted")
++			continue
++		}
++		r.DelAttr(key)
++	}
++	if len(errs) > 0 {
++		return fmt.Errorf("%s", strings.Join(errs, "; "))
++	}
++	return nil
++}
++
++// ruleFromProtocol creates a new rule from its wire representation.
++func ruleFromProtocol(pr protocol.Rule) (*rule.Rule, error) {
++	if pr.Kind == "" {
++		return nil, fmt.Errorf("rule %q has no kind", pr.Name)
++	}
++	r := rule.NewRule(pr.Kind, pr.Name)
++	if err := applyAttrEdit(r, protocol.AttrEdit{Attrs: pr.Attrs, AttrExprs: pr.AttrExprs}); err != nil {
++		return nil, fmt.Errorf("rule %s %q: %v", pr.Kind, pr.Name, err)
++	}
++	return r, nil
++}
++
++// kindFromProtocol converts a plugin's kind description.
++func kindFromProtocol(k protocol.KindInfo) (rule.KindInfo, error) {
++	if k.Name == "" {
++		return rule.KindInfo{}, fmt.Errorf("kind has no name")
++	}
++	ki := rule.KindInfo{
++		Name:            k.Name,
++		MatchAny:        k.MatchAny,
++		MatchAttrs:      k.MatchAttrs,
++		NonEmptyAttrs:   toSet(k.NonEmptyAttrs),
++		SubstituteAttrs: toSet(k.SubstituteAttrs),
++		MergeableAttrs:  toSet(k.MergeableAttrs),
++		ResolveAttrs:    toSet(k.ResolveAttrs),
++	}
++	if k.LoadedFrom != "" {
++		l, err := label.Parse(k.LoadedFrom)
++		if err != nil {
++			return rule.KindInfo{}, fmt.Errorf("kind %s: invalid loadedFrom label %q: %v", k.Name, k.LoadedFrom, err)
++		}
++		if l.Relative {
++			return rule.KindInfo{}, fmt.Errorf("kind %s: loadedFrom label %q must be absolute", k.Name, k.LoadedFrom)
++		}
++		ki.LoadedFrom = l
++	}
++	return ki, nil
++}
++
++func toSet(keys []string) map[string]bool {
++	if len(keys) == 0 {
++		return nil
++	}
++	m := make(map[string]bool, len(keys))
++	for _, k := range keys {
++		m[k] = true
++	}
++	return m
++}
++
++func sortedKeys[V any](m map[string]V) []string {
++	keys := make([]string, 0, len(m))
++	for k := range m {
++		keys = append(keys, k)
++	}
++	slices.Sort(keys)
++	return keys
++}
+diff --git a/v2/plugin/convert_test.go b/v2/plugin/convert_test.go
+new file mode 100644
+index 0000000..0d09492
+--- /dev/null
++++ b/v2/plugin/convert_test.go
+@@ -0,0 +1,212 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package plugin
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol"
++	"github.com/bazel-contrib/bazel-gazelle/v2/rule"
++	"github.com/google/go-cmp/cmp"
++)
++
++const roundTripBuild = `# gazelle:sh_enabled true
++
++load("@rules_shell//shell:sh_library.bzl", "sh_library")
++
++sh_library(
++    name = "lib",
++    testonly = True,
++    srcs = ["lib.sh"],
++    data = glob(["*.txt"]),
++    env = {
++        "A": "1",
++        "B": "2",
++    },
++    shard_count = 2,
++    size_delta = -3,
++    deps = select({
++        "//conditions:default": [":other"],
++    }),
++)
++`
++
++func TestRuleRoundTrip(t *testing.T) {
++	f, err := rule.LoadData("BUILD.bazel", "pkg", []byte(roundTripBuild))
++	if err != nil {
++		t.Fatal(err)
++	}
++	pf := fileToProtocol(f)
++	if diff := cmp.Diff([]protocol.Directive{{Key: "sh_enabled", Value: "true"}}, pf.Directives); diff != "" {
++		t.Errorf("directives (-want,+got):\n%s", diff)
++	}
++	if diff := cmp.Diff([]protocol.Load{{Name: "@rules_shell//shell:sh_library.bzl", Symbols: []string{"sh_library"}}}, pf.Loads); diff != "" {
++		t.Errorf("loads (-want,+got):\n%s", diff)
++	}
++	if len(pf.Rules) != 1 {
++		t.Fatalf("got %d rules; want 1", len(pf.Rules))
++	}
++	pr := pf.Rules[0]
++	wantAttrs := map[string]any{
++		"srcs":        []any{"lib.sh"},
++		"env":         map[string]any{"A": "1", "B": "2"},
++		"shard_count": int64(2),
++		"size_delta":  int64(-3),
++		"testonly":    true,
++	}
++	if diff := cmp.Diff(wantAttrs, pr.Attrs); diff != "" {
++		t.Errorf("attrs (-want,+got):\n%s", diff)
++	}
++	wantExprs := map[string]string{
++		"data": `glob(["*.txt"])`,
++		"deps": "select({\n    \"//conditions:default\": [\":other\"],\n})",
++	}
++	if diff := cmp.Diff(wantExprs, pr.AttrExprs); diff != "" {
++		t.Errorf("attr exprs (-want,+got):\n%s", diff)
++	}
++
++	// Send the rule over the wire and back, as a plugin that echoes it would.
++	data, err := json.Marshal(pr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var decoded protocol.Rule
++	if err := protocol.Unmarshal(data, &decoded); err != nil {
++		t.Fatal(err)
++	}
++	r, err := ruleFromProtocol(decoded)
++	if err != nil {
++		t.Fatal(err)
++	}
++	out := rule.EmptyFile("BUILD.bazel", "pkg")
++	out.Loads = f.Loads
++	r.Insert(out)
++	got := string(out.Format())
++	want := roundTripBuild[strings.Index(roundTripBuild, "sh_library("):]
++	if !strings.HasSuffix(got, want) {
++		t.Errorf("round trip changed the rule. got:\n%s\nwant:\n%s", got, want)
++	}
++}
++
++func TestApplyAttrEditErrors(t *testing.T) {
++	for _, tc := range []struct {
++		desc    string
++		edit    protocol.AttrEdit
++		wantErr string
++	}{
++		{
++			desc:    "null",
++			edit:    protocol.AttrEdit{Attrs: map[string]any{"deps": nil}},
++			wantErr: "null is not a valid attribute value",
++		},
++		{
++			desc: "both",
++			edit: protocol.AttrEdit{
++				Attrs:     map[string]any{"deps": []any{}},
++				AttrExprs: map[string]string{"deps": "[]"},
++			},
++			wantErr: `attribute "deps" set in both attrs and attrExprs`,
++		},
++		{
++			desc:    "bad_expr",
++			edit:    protocol.AttrEdit{AttrExprs: map[string]string{"deps": "select("}},
++			wantErr: `attribute "deps": parsing expression`,
++		},
++		{
++			desc:    "two_exprs",
++			edit:    protocol.AttrEdit{AttrExprs: map[string]string{"deps": "[]\nx = 1"}},
++			wantErr: "expected a single expression",
++		},
++		{
++			desc:    "delete_name",
++			edit:    protocol.AttrEdit{DeleteAttrs: []string{"name"}},
++			wantErr: `attribute "name" can't be deleted`,
++		},
++	} {
++		t.Run(tc.desc, func(t *testing.T) {
++			r := rule.NewRule("sh_library", "lib")
++			err := applyAttrEdit(r, tc.edit)
++			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
++				t.Fatalf("got error %v; want error containing %q", err, tc.wantErr)
++			}
++		})
++	}
++}
++
++func TestApplyAttrEdit(t *testing.T) {
++	r := rule.NewRule("sh_library", "lib")
++	r.SetAttr("deps", []string{":old"})
++	r.SetAttr("tags", []string{"manual"})
++	edit := protocol.AttrEdit{
++		Attrs: map[string]any{
++			"name": "renamed",
++			"srcs": []any{"a.sh", "b.sh"},
++			"size": json.Number("7"),
++			"meta": map[string]any{"k": []any{"v", json.Number("1")}},
++		},
++		AttrExprs:   map[string]string{"deps": `select({"//conditions:default": [":new"]})`},
++		DeleteAttrs: []string{"tags"},
++	}
++	if err := applyAttrEdit(r, edit); err != nil {
++		t.Fatal(err)
++	}
++	f := rule.EmptyFile("BUILD.bazel", "")
++	r.Insert(f)
++	got := strings.TrimSpace(string(f.Format()))
++	want := strings.TrimSpace(`
++sh_library(
++    name = "renamed",
++    size = 7,
++    srcs = [
++        "a.sh",
++        "b.sh",
++    ],
++    meta = {
++        "k": [
++            "v",
++            1,
++        ],
++    },
++    deps = select({"//conditions:default": [":new"]}),
++)
++`)
++	if diff := cmp.Diff(want, got); diff != "" {
++		t.Errorf("(-want,+got):\n%s", diff)
++	}
++}
++
++func TestKindFromProtocol(t *testing.T) {
++	ki, err := kindFromProtocol(protocol.KindInfo{
++		Name:          "sh_library",
++		LoadedFrom:    "@rules_shell//shell:sh_library.bzl",
++		NonEmptyAttrs: []string{"srcs"},
++		ResolveAttrs:  []string{"deps"},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ki.LoadedFrom.String() != "@rules_shell//shell:sh_library.bzl" || !ki.NonEmptyAttrs["srcs"] || !ki.ResolveAttrs["deps"] {
++		t.Errorf("unexpected kind info: %#v", ki)
++	}
++	if _, err := kindFromProtocol(protocol.KindInfo{Name: "x", LoadedFrom: ":relative.bzl"}); err == nil {
++		t.Error("expected error for relative loadedFrom label")
++	}
++	if _, err := kindFromProtocol(protocol.KindInfo{}); err == nil {
++		t.Error("expected error for kind without name")
++	}
++}
+diff --git a/v2/plugin/examples/BUILD.bazel b/v2/plugin/examples/BUILD.bazel
+new file mode 100644
+index 0000000..6264a22
+--- /dev/null
++++ b/v2/plugin/examples/BUILD.bazel
+@@ -0,0 +1,9 @@
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = [
++        "BUILD.bazel",
++        "//v2/plugin/examples/sh:all_files",
++    ],
++    visibility = ["//visibility:public"],
++)
+diff --git a/v2/plugin/examples/sh/BUILD.bazel b/v2/plugin/examples/sh/BUILD.bazel
+new file mode 100644
+index 0000000..a58f88a
+--- /dev/null
++++ b/v2/plugin/examples/sh/BUILD.bazel
+@@ -0,0 +1,26 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library")
++
++exports_files(["sh_plugin.py"])
++
++go_library(
++    name = "sh",
++    srcs = ["sh.go"],
++    importpath = "github.com/bazel-contrib/bazel-gazelle/v2/plugin/examples/sh",
++    visibility = ["//visibility:public"],
++    deps = [
++        "//v2/plugin/protocol",
++        "//v2/plugin/server",
++    ],
++)
++
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = [
++        "BUILD.bazel",
++        "sh.go",
++        "sh_plugin.py",
++        "//v2/plugin/examples/sh/cmd:all_files",
++    ],
++    visibility = ["//visibility:public"],
++)
+diff --git a/v2/plugin/examples/sh/cmd/BUILD.bazel b/v2/plugin/examples/sh/cmd/BUILD.bazel
+new file mode 100644
+index 0000000..c10573b
+--- /dev/null
++++ b/v2/plugin/examples/sh/cmd/BUILD.bazel
+@@ -0,0 +1,9 @@
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = [
++        "BUILD.bazel",
++        "//v2/plugin/examples/sh/cmd/sh_plugin:all_files",
++    ],
++    visibility = ["//visibility:public"],
++)
+diff --git a/v2/plugin/examples/sh/cmd/sh_plugin/BUILD.bazel b/v2/plugin/examples/sh/cmd/sh_plugin/BUILD.bazel
+new file mode 100644
+index 0000000..7cb9c01
+--- /dev/null
++++ b/v2/plugin/examples/sh/cmd/sh_plugin/BUILD.bazel
+@@ -0,0 +1,28 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
++
++go_library(
++    name = "sh_plugin_lib",
++    srcs = ["main.go"],
++    importpath = "github.com/bazel-contrib/bazel-gazelle/v2/plugin/examples/sh/cmd/sh_plugin",
++    visibility = ["//visibility:private"],
++    deps = [
++        "//v2/plugin/examples/sh",
++        "//v2/plugin/server",
++    ],
++)
++
++go_binary(
++    name = "sh_plugin",
++    embed = [":sh_plugin_lib"],
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = [
++        "BUILD.bazel",
++        "main.go",
++    ],
++    visibility = ["//visibility:public"],
++)
+diff --git a/v2/plugin/examples/sh/cmd/sh_plugin/main.go b/v2/plugin/examples/sh/cmd/sh_plugin/main.go
+new file mode 100644
+index 0000000..718cc3f
+--- /dev/null
++++ b/v2/plugin/examples/sh/cmd/sh_plugin/main.go
+@@ -0,0 +1,27 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// sh_plugin is a Gazelle plugin for shell scripts. Run Gazelle with
++// -plugin=path/to/sh_plugin to use it.
++package main
++
++import (
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/examples/sh"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/server"
++)
++
++func main() {
++	server.Main(sh.New())
++}
+diff --git a/v2/plugin/examples/sh/sh.go b/v2/plugin/examples/sh/sh.go
+new file mode 100644
+index 0000000..9a3aadf
+--- /dev/null
++++ b/v2/plugin/examples/sh/sh.go
+@@ -0,0 +1,287 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package sh is a reference Gazelle plugin for shell scripts, written with
++// package [github.com/bazel-contrib/bazel-gazelle/v2/plugin/server]. The same
++// plugin is implemented in Python, without any dependencies, in sh_plugin.py.
++//
++// For each *.sh file in a directory, the plugin generates an sh_test if the
++// file name ends with _test.sh, an sh_binary if the file starts with "#!",
++// and an sh_library otherwise. A script's dependencies are the libraries
++// that provide the files it sources with "source path" or ". path". Paths
++// starting with ./ or ../ are relative to the script's directory; other paths
++// are relative to the repository root. Paths containing variables are
++// ignored.
++//
++// The directive "# gazelle:sh_enabled false" disables rule generation in a
++// directory and its subdirectories.
++package sh
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path"
++	"path/filepath"
++	"slices"
++	"strings"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/server"
++)
++
++const (
++	langName         = "sh"
++	enabledDirective = "sh_enabled"
++)
++
++// Plugin implements the shell plugin.
++type Plugin struct{}
++
++// New returns a new shell plugin.
++func New() *Plugin { return &Plugin{} }
++
++var (
++	_ server.Plugin     = (*Plugin)(nil)
++	_ server.Configurer = (*Plugin)(nil)
++	_ server.Generator  = (*Plugin)(nil)
++	_ server.Indexer    = (*Plugin)(nil)
++	_ server.Resolver   = (*Plugin)(nil)
++)
++
++// shConfig is the plugin's per-directory configuration. Gazelle stores it
++// and sends it back with each request for the directory.
++type shConfig struct {
++	Enabled bool `json:"enabled"`
++}
++
++func parseConfig(raw json.RawMessage) (shConfig, error) {
++	cfg := shConfig{Enabled: true}
++	if len(raw) == 0 || string(raw) == "null" {
++		return cfg, nil
++	}
++	err := json.Unmarshal(raw, &cfg)
++	return cfg, err
++}
++
++func kind(name, bzl string) protocol.KindInfo {
++	return protocol.KindInfo{
++		Name:           name,
++		LoadedFrom:     "@rules_shell//shell:" + bzl,
++		NonEmptyAttrs:  []string{"srcs", "deps"},
++		MergeableAttrs: []string{"srcs"},
++		ResolveAttrs:   []string{"deps"},
++	}
++}
++
++var kinds = []protocol.KindInfo{
++	kind("sh_binary", "sh_binary.bzl"),
++	kind("sh_library", "sh_library.bzl"),
++	kind("sh_test", "sh_test.bzl"),
++}
++
++func isShKind(k string) bool {
++	return slices.ContainsFunc(kinds, func(ki protocol.KindInfo) bool { return ki.Name == k })
++}
++
++// Initialize implements [server.Plugin].
++func (*Plugin) Initialize(ctx context.Context, p protocol.InitializeParams) (protocol.InitializeResult, error) {
++	return protocol.InitializeResult{
++		ProtocolVersion: protocol.Version,
++		Name:            langName,
++		Kinds:           kinds,
++		KnownDirectives: []string{enabledDirective},
++		Capabilities: protocol.Capabilities{
++			// Configure only needs to run where the sh_enabled directive appears.
++			Configure: protocol.ConfigureDirectives,
++		},
++	}, nil
++}
++
++// Configure implements [server.Configurer].
++func (*Plugin) Configure(ctx context.Context, p protocol.ConfigureParams) (protocol.ConfigureResult, error) {
++	cfg, err := parseConfig(p.Config)
++	if err != nil {
++		return protocol.ConfigureResult{}, err
++	}
++	var res protocol.ConfigureResult
++	if p.File != nil {
++		for _, d := range p.File.Directives {
++			if d.Key != enabledDirective {
++				continue
++			}
++			switch v := strings.TrimSpace(d.Value); v {
++			case "true", "false":
++				cfg.Enabled = v == "true"
++			default:
++				res.Errors = append(res.Errors, protocol.Diagnostic{
++					Message: fmt.Sprintf("%s: gazelle:%s: expected true or false, got %q", p.File.Path, enabledDirective, d.Value),
++				})
++			}
++		}
++	}
++	res.Config, err = json.Marshal(cfg)
++	return res, err
++}
++
++// Generate implements [server.Generator].
++func (*Plugin) Generate(ctx context.Context, p protocol.GenerateParams) (protocol.GenerateResult, error) {
++	cfg, err := parseConfig(p.Config)
++	if err != nil {
++		return protocol.GenerateResult{}, err
++	}
++	var res protocol.GenerateResult
++	if !cfg.Enabled {
++		return res, nil
++	}
++	var scripts []string
++	for _, f := range p.RegularFiles {
++		if strings.HasSuffix(f, ".sh") {
++			scripts = append(scripts, f)
++		}
++	}
++	slices.Sort(scripts)
++
++	generated := make(map[string]bool)
++	for _, script := range scripts {
++		content, err := os.ReadFile(filepath.Join(p.Dir, filepath.FromSlash(script)))
++		if err != nil {
++			res.Errors = append(res.Errors, protocol.Diagnostic{Message: err.Error()})
++			continue
++		}
++		name := strings.TrimSuffix(path.Base(script), ".sh")
++		k := "sh_library"
++		if strings.HasSuffix(name, "_test") {
++			k = "sh_test"
++		} else if strings.HasPrefix(string(content), "#!") {
++			k = "sh_binary"
++		}
++		r := protocol.Rule{
++			Kind:  k,
++			Name:  name,
++			Attrs: map[string]any{"srcs": []string{script}},
++		}
++		if k == "sh_library" {
++			r.Attrs["visibility"] = []string{"//visibility:public"}
++		}
++		imports, err := json.Marshal(parseSources(string(content), p.Rel))
++		if err != nil {
++			return protocol.GenerateResult{}, err
++		}
++		res.Gen = append(res.Gen, r)
++		res.Imports = append(res.Imports, imports)
++		generated[name] = true
++	}
++
++	// Rules for scripts that no longer exist are reported as empty, so Gazelle
++	// can delete them.
++	if p.File != nil {
++		for _, r := range p.File.Rules {
++			if isShKind(r.Kind) && r.Name != "" && !generated[r.Name] {
++				res.Empty = append(res.Empty, protocol.Rule{Kind: r.Kind, Name: r.Name})
++			}
++		}
++	}
++	return res, nil
++}
++
++// parseSources returns the repository-relative paths of files sourced by a
++// script in the directory rel.
++func parseSources(content, rel string) []string {
++	var paths []string
++	for _, line := range strings.Split(content, "\n") {
++		fields := strings.Fields(line)
++		if len(fields) < 2 || (fields[0] != "source" && fields[0] != ".") {
++			continue
++		}
++		p := strings.Trim(fields[1], `"'`)
++		if p == "" || strings.Contains(p, "$") || strings.HasPrefix(p, "/") {
++			continue
++		}
++		if strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") {
++			p = path.Join(rel, p)
++		}
++		paths = append(paths, p)
++	}
++	slices.Sort(paths)
++	paths = slices.Compact(paths)
++	if paths == nil {
++		paths = []string{}
++	}
++	return paths
++}
++
++// Imports implements [server.Indexer]. Libraries are indexed by the
++// repository-relative paths of their sources.
++func (*Plugin) Imports(ctx context.Context, p protocol.ImportsParams) (protocol.ImportsResult, error) {
++	switch p.Rule.Kind {
++	case "sh_library":
++		var res protocol.ImportsResult
++		srcs, _ := p.Rule.Attrs["srcs"].([]any)
++		for _, src := range srcs {
++			if s, ok := src.(string); ok {
++				res.Imports = append(res.Imports, protocol.ImportSpec{Lang: langName, Imp: path.Join(p.Rel, s)})
++			}
++		}
++		return res, nil
++	case "sh_binary", "sh_test":
++		return protocol.ImportsResult{NotImportable: true}, nil
++	default:
++		return protocol.ImportsResult{}, nil
++	}
++}
++
++// Resolve implements [server.Resolver]. It looks up each sourced file in
++// Gazelle's rule index and sets deps.
++func (*Plugin) Resolve(ctx context.Context, p protocol.ResolveParams) (protocol.ResolveResult, error) {
++	var imports []string
++	if len(p.Imports) > 0 {
++		if err := json.Unmarshal(p.Imports, &imports); err != nil {
++			return protocol.ResolveResult{}, err
++		}
++	}
++	var res protocol.ResolveResult
++	var deps []string
++	for _, imp := range imports {
++		found, err := server.IndexFind(ctx, protocol.IndexFindParams{
++			Import: protocol.ImportSpec{Lang: langName, Imp: imp},
++		})
++		if err != nil {
++			return protocol.ResolveResult{}, err
++		}
++		self := false
++		var matched []string
++		for _, m := range found.Results {
++			if m.SelfImport {
++				self = true
++				continue
++			}
++			matched = append(matched, m.RelLabel)
++		}
++		if len(matched) == 0 && !self {
++			res.Errors = append(res.Errors, protocol.Diagnostic{
++				Message:  fmt.Sprintf("%s: no rule provides sourced file %s", p.From, imp),
++				Severity: "warning",
++			})
++		}
++		deps = append(deps, matched...)
++	}
++	if len(deps) > 0 {
++		slices.Sort(deps)
++		res.Attrs = map[string]any{"deps": slices.Compact(deps)}
++	}
++	return res, nil
++}
+diff --git a/v2/plugin/examples/sh/sh_plugin.py b/v2/plugin/examples/sh/sh_plugin.py
+new file mode 100755
+index 0000000..45f1107
+--- /dev/null
++++ b/v2/plugin/examples/sh/sh_plugin.py
+@@ -0,0 +1,259 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Bazel Authors. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Reference Gazelle plugin for shell scripts, written in Python.
++
++This is the same plugin as sh.go, written without any dependencies beyond
++the Python standard library, to show how a plugin implements Gazelle's
++subprocess plugin protocol directly. Run Gazelle with
++-plugin=path/to/sh_plugin.py to use it.
++
++The protocol is JSON-RPC 2.0. Each message is one line of JSON on stdin
++(requests from Gazelle) or stdout (responses, and index/find requests sent
++back to Gazelle). Logs go to stderr. See v2/plugin/README.md.
++"""
++
++import json
++import os
++import posixpath
++import sys
++
++PROTOCOL_VERSION = 1
++LANG = "sh"
++ENABLED_DIRECTIVE = "sh_enabled"
++
++
++def kind(name, bzl):
++    return {
++        "name": name,
++        "loadedFrom": "@rules_shell//shell:" + bzl,
++        "nonEmptyAttrs": ["srcs", "deps"],
++        "mergeableAttrs": ["srcs"],
++        "resolveAttrs": ["deps"],
++    }
++
++
++KINDS = [
++    kind("sh_binary", "sh_binary.bzl"),
++    kind("sh_library", "sh_library.bzl"),
++    kind("sh_test", "sh_test.bzl"),
++]
++KIND_NAMES = {k["name"] for k in KINDS}
++
++
++class RpcError(Exception):
++    def __init__(self, code, message):
++        super().__init__(message)
++        self.code = code
++        self.message = message
++
++
++class Conn:
++    """A JSON-RPC 2.0 connection framed as JSON Lines."""
++
++    def __init__(self, infile, outfile):
++        self.infile = infile
++        self.outfile = outfile
++        self.next_id = 0
++
++    def read(self):
++        while True:
++            line = self.infile.readline()
++            if not line:
++                return None
++            if line.strip():
++                return json.loads(line)
++
++    def write(self, msg):
++        msg["jsonrpc"] = "2.0"
++        self.outfile.write(json.dumps(msg, separators=(",", ":")) + "\n")
++        self.outfile.flush()
++
++    def call(self, method, params):
++        """Sends a request to Gazelle and waits for the response."""
++        self.next_id += 1
++        req_id = "py-%d" % self.next_id
++        self.write({"id": req_id, "method": method, "params": params})
++        msg = self.read()
++        if msg is None:
++            raise EOFError("Gazelle closed the connection")
++        if msg.get("id") != req_id or "method" in msg:
++            raise RuntimeError("unexpected message while waiting for %s: %r" % (method, msg))
++        if "error" in msg:
++            raise RpcError(msg["error"].get("code", -32603), msg["error"].get("message", ""))
++        return msg.get("result") or {}
++
++
++def parse_config(raw):
++    cfg = {"enabled": True}
++    if isinstance(raw, dict):
++        cfg.update(raw)
++    return cfg
++
++
++def initialize(conn, params):
++    return {
++        "protocolVersion": PROTOCOL_VERSION,
++        "name": LANG,
++        "kinds": KINDS,
++        "knownDirectives": [ENABLED_DIRECTIVE],
++        "capabilities": {"configure": "directives"},
++    }
++
++
++def configure(conn, params):
++    cfg = parse_config(params.get("config"))
++    errors = []
++    f = params.get("file")
++    for d in (f or {}).get("directives") or []:
++        if d["key"] != ENABLED_DIRECTIVE:
++            continue
++        value = d["value"].strip()
++        if value in ("true", "false"):
++            cfg["enabled"] = value == "true"
++        else:
++            errors.append({
++                "message": "%s: gazelle:%s: expected true or false, got %s"
++                % (f["path"], ENABLED_DIRECTIVE, json.dumps(d["value"])),
++            })
++    return {"config": cfg, "errors": errors}
++
++
++def parse_sources(content, rel):
++    paths = set()
++    for line in content.split("\n"):
++        fields = line.split()
++        if len(fields) < 2 or fields[0] not in ("source", "."):
++            continue
++        p = fields[1].strip("\"'")
++        if not p or "$" in p or p.startswith("/"):
++            continue
++        if p.startswith("./") or p.startswith("../"):
++            p = posixpath.normpath(posixpath.join(rel, p))
++        paths.add(p)
++    return sorted(paths)
++
++
++def generate(conn, params):
++    cfg = parse_config(params.get("config"))
++    if not cfg["enabled"]:
++        return {}
++    rel = params["rel"]
++    gen, imports, errors = [], [], []
++    generated = set()
++    for script in sorted(f for f in params.get("regularFiles") or [] if f.endswith(".sh")):
++        try:
++            with open(os.path.join(params["dir"], script), encoding="utf-8", errors="replace") as fh:
++                content = fh.read()
++        except OSError as e:
++            errors.append({"message": str(e)})
++            continue
++        name = posixpath.basename(script)[: -len(".sh")]
++        if name.endswith("_test"):
++            k = "sh_test"
++        elif content.startswith("#!"):
++            k = "sh_binary"
++        else:
++            k = "sh_library"
++        attrs = {"srcs": [script]}
++        if k == "sh_library":
++            attrs["visibility"] = ["//visibility:public"]
++        gen.append({"kind": k, "name": name, "attrs": attrs})
++        imports.append(parse_sources(content, rel))
++        generated.add(name)
++
++    # Rules for scripts that no longer exist are reported as empty, so Gazelle
++    # can delete them.
++    empty = []
++    for r in (params.get("file") or {}).get("rules") or []:
++        if r["kind"] in KIND_NAMES and r.get("name") and r["name"] not in generated:
++            empty.append({"kind": r["kind"], "name": r["name"]})
++    return {"gen": gen, "empty": empty, "imports": imports, "errors": errors}
++
++
++def imports(conn, params):
++    r = params["rule"]
++    if r["kind"] == "sh_library":
++        srcs = (r.get("attrs") or {}).get("srcs") or []
++        rel = params["rel"]
++        return {
++            "imports": [
++                {"lang": LANG, "imp": posixpath.normpath(posixpath.join(rel, s))}
++                for s in srcs
++                if isinstance(s, str)
++            ]
++        }
++    if r["kind"] in ("sh_binary", "sh_test"):
++        return {"notImportable": True}
++    return {}
++
++
++def resolve(conn, params):
++    deps, errors = set(), []
++    for imp in params.get("imports") or []:
++        found = conn.call("index/find", {"import": {"lang": LANG, "imp": imp}})
++        results = found.get("results") or []
++        matched = [m["relLabel"] for m in results if not m.get("selfImport")]
++        if not matched and not any(m.get("selfImport") for m in results):
++            errors.append({
++                "message": "%s: no rule provides sourced file %s" % (params["from"], imp),
++                "severity": "warning",
++            })
++        deps.update(matched)
++    result = {"errors": errors}
++    if deps:
++        result["attrs"] = {"deps": sorted(deps)}
++    return result
++
++
++def empty(conn, params):
++    return {}
++
++
++HANDLERS = {
++    "initialize": initialize,
++    "configure": configure,
++    "generate": generate,
++    "imports": imports,
++    "resolve": resolve,
++    "shutdown": empty,
++}
++
++
++def main():
++    conn = Conn(sys.stdin, sys.stdout)
++    while True:
++        msg = conn.read()
++        if msg is None:
++            return 0
++        if "method" not in msg:
++            print("sh_plugin: unexpected response: %r" % msg, file=sys.stderr)
++            return 1
++        handler = HANDLERS.get(msg["method"])
++        try:
++            if handler is None:
++                raise RpcError(-32601, "method not found: " + msg["method"])
++            response = {"result": handler(conn, msg.get("params") or {})}
++        except RpcError as e:
++            response = {"error": {"code": e.code, "message": e.message}}
++        except Exception as e:  # Report bugs to Gazelle instead of crashing.
++            response = {"error": {"code": -32603, "message": "%s: %s" % (type(e).__name__, e)}}
++        if "id" in msg:
++            response["id"] = msg["id"]
++            conn.write(response)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/v2/plugin/loader.go b/v2/plugin/loader.go
+new file mode 100644
+index 0000000..61fdac6
+--- /dev/null
++++ b/v2/plugin/loader.go
+@@ -0,0 +1,244 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package plugin
++
++import (
++	"context"
++	"errors"
++	"flag"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"slices"
++	"strings"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/config"
++	gzflag "github.com/bazel-contrib/bazel-gazelle/v2/flag"
++	"github.com/bazel-contrib/bazel-gazelle/v2/rule"
++	"github.com/bazelbuild/rules_go/go/runfiles"
++)
++
++// pluginDirective is the directive that registers a plugin in the repository
++// root build file.
++const pluginDirective = "plugin"
++
++// Loader starts the plugins a user registered, either with the -plugin
++// command-line flag (which may be repeated) or with
++// "# gazelle:plugin path [args...]" directives in the repository root build
++// file.
++//
++// Loader implements [config.Configurer] and the RegisterFlags / CheckFlags
++// methods of [github.com/bazel-contrib/bazel-gazelle/v2/compat.FlagConfigurer].
++// Gazelle registers its flags with the other built-in configurers, then calls
++// [Loader.Start] after flags have been parsed and adds the returned languages
++// to the set of extensions for the run.
++type Loader struct {
++	flagValues []string
++	languages  []*Language
++}
++
++var _ config.Configurer = (*Loader)(nil)
++
++// RegisterFlags registers the -plugin flag.
++func (ld *Loader) RegisterFlags(fs *flag.FlagSet, cmd string, c *config.Config) {
++	fs.Var(&gzflag.MultiFlag{Values: &ld.flagValues}, "plugin", "path to a language plugin executable that Gazelle runs as a subprocess (may be repeated)")
++}
++
++// CheckFlags does nothing. Plugins are located and started by Start.
++func (ld *Loader) CheckFlags(fs *flag.FlagSet, c *config.Config) error { return nil }
++
++// KnownDirectives returns the plugin directive.
++func (ld *Loader) KnownDirectives() []string { return []string{pluginDirective} }
++
++// Configure reports an error if the plugin directive appears anywhere other
++// than the repository root build file. The directive itself is read by Start.
++func (ld *Loader) Configure(ctx context.Context, args config.ConfigureArgs) error {
++	if args.Rel == "" || args.File == nil {
++		return nil
++	}
++	for _, d := range args.File.Directives {
++		if d.Key == pluginDirective {
++			return fmt.Errorf("%s: gazelle:plugin may only be used in the repository root build file", args.File.Path)
++		}
++	}
++	return nil
++}
++
++// spec describes a plugin to start.
++type spec struct {
++	origin string // for error messages
++	path   string
++	args   []string
++}
++
++// Start starts each registered plugin and returns them in the order they were
++// registered: plugins named on the command line first, then plugins named by
++// directives. c must have been initialized from command-line flags.
++// reservedNames lists the names of extensions compiled into Gazelle; plugin
++// names must not collide with them or with each other.
++//
++// Start returns an error if any plugin can't be started. The caller must call
++// Close when the plugins are no longer needed, even if Start fails.
++func (ld *Loader) Start(ctx context.Context, c *config.Config, reservedNames []string) ([]*Language, error) {
++	specs, err := ld.specs(c)
++	if err != nil {
++		return nil, err
++	}
++	if len(specs) == 0 {
++		return nil, nil
++	}
++	env := pluginEnv()
++	names := make(map[string]string)
++	for _, n := range reservedNames {
++		names[n] = "a built-in extension"
++	}
++	for _, s := range specs {
++		lang, err := Start(ctx, c, Options{Path: s.path, Args: s.args, Env: env})
++		if err != nil {
++			return nil, fmt.Errorf("%s: %w", s.origin, err)
++		}
++		ld.languages = append(ld.languages, lang)
++		if other, ok := names[lang.Name()]; ok {
++			return nil, fmt.Errorf("%s: plugin %s uses the language name %q, which is already used by %s", s.origin, s.path, lang.Name(), other)
++		}
++		names[lang.Name()] = "plugin " + s.path
++	}
++	return slices.Clone(ld.languages), nil
++}
++
++// Close shuts down all plugins started by Start.
++func (ld *Loader) Close() error {
++	var errs []error
++	for _, l := range ld.languages {
++		errs = append(errs, l.Close())
++	}
++	return errors.Join(errs...)
++}
++
++func (ld *Loader) specs(c *config.Config) ([]spec, error) {
++	var specs []spec
++	for _, v := range ld.flagValues {
++		path, err := findFlagPlugin(c, v)
++		if err != nil {
++			return nil, err
++		}
++		specs = append(specs, spec{origin: "-plugin=" + v, path: path})
++	}
++
++	f, err := loadRootBuildFile(c)
++	if err != nil {
++		return nil, err
++	}
++	if f != nil {
++		for _, d := range f.Directives {
++			if d.Key != pluginDirective {
++				continue
++			}
++			origin := fmt.Sprintf("%s: gazelle:plugin %s", f.Path, d.Value)
++			fields := strings.Fields(d.Value)
++			if len(fields) == 0 {
++				return nil, fmt.Errorf("%s: expected a path to a plugin executable", origin)
++			}
++			path := filepath.FromSlash(fields[0])
++			if !filepath.IsAbs(path) {
++				path = filepath.Join(c.RepoRoot, path)
++			}
++			specs = append(specs, spec{origin: origin, path: path, args: fields[1:]})
++		}
++	}
++	return specs, nil
++}
++
++// findFlagPlugin locates a plugin executable named with -plugin. Absolute
++// paths are used as is. Relative paths are looked up, in order:
++//
++//   - in Bazel runfiles, for paths written with $(rlocationpath ...);
++//   - relative to the current directory, for paths written with
++//     $(rootpath ...) when Gazelle is run with 'bazel run';
++//   - relative to the workspace directory (c.WorkDir);
++//   - on PATH, for names without a directory separator.
++func findFlagPlugin(c *config.Config, value string) (string, error) {
++	if value == "" {
++		return "", fmt.Errorf("-plugin: expected a path to a plugin executable")
++	}
++	p := filepath.FromSlash(value)
++	if filepath.IsAbs(p) {
++		return p, nil
++	}
++	if loc, err := runfiles.Rlocation(value); err == nil && loc != "" && isFile(loc) {
++		return loc, nil
++	}
++	if wd, err := os.Getwd(); err == nil {
++		if cand := filepath.Join(wd, p); isFile(cand) {
++			return cand, nil
++		}
++	}
++	if c.WorkDir != "" {
++		if cand := filepath.Join(c.WorkDir, p); isFile(cand) {
++			return cand, nil
++		}
++	}
++	if !strings.ContainsAny(value, `/\`) {
++		if lp, err := exec.LookPath(value); err == nil {
++			return lp, nil
++		}
++	}
++	return "", fmt.Errorf("-plugin=%s: plugin executable not found in runfiles, the current directory, %s, or PATH", value, c.WorkDir)
++}
++
++// loadRootBuildFile reads the repository root build file to find plugin
++// directives. Gazelle hasn't walked the repository yet when plugins are
++// started, since plugins may declare directives and kinds that affect the
++// walk. Returns nil if there is no root build file.
++func loadRootBuildFile(c *config.Config) (*rule.File, error) {
++	dir := c.RepoRoot
++	if c.ReadBuildFilesDir != "" {
++		dir = c.ReadBuildFilesDir
++	}
++	ents, err := os.ReadDir(dir)
++	if err != nil {
++		return nil, err
++	}
++	path := rule.MatchBuildFile(dir, c.ValidBuildFileNames, ents)
++	if path == "" {
++		return nil, nil
++	}
++	f, err := rule.LoadFile(path, "")
++	if err != nil {
++		// Gazelle reports syntax errors when it walks the repository.
++		return nil, nil
++	}
++	return f, nil
++}
++
++// pluginEnv returns the environment for plugin processes. When Gazelle runs
++// with Bazel runfiles (for example, with 'bazel run //:gazelle'), the runfiles
++// variables are passed on, so plugins built by Bazel (which are usually
++// listed in the data attribute of the gazelle rule) can find their own
++// runfiles.
++func pluginEnv() []string {
++	env := os.Environ()
++	if rfEnv, err := runfiles.Env(); err == nil {
++		env = append(env, rfEnv...)
++	}
++	return env
++}
++
++func isFile(path string) bool {
++	fi, err := os.Stat(path)
++	return err == nil && !fi.IsDir()
++}
+diff --git a/v2/plugin/loader_test.go b/v2/plugin/loader_test.go
+new file mode 100644
+index 0000000..eac8ed7
+--- /dev/null
++++ b/v2/plugin/loader_test.go
+@@ -0,0 +1,66 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package plugin
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/config"
++)
++
++func TestFindFlagPlugin(t *testing.T) {
++	workDir := t.TempDir()
++	binDir := filepath.Join(workDir, "tools")
++	if err := os.MkdirAll(binDir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	exe := filepath.Join(binDir, "my_plugin")
++	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	c := config.New()
++	c.WorkDir = workDir
++	t.Setenv("PATH", binDir)
++
++	for _, tc := range []struct {
++		desc, value, want, wantErr string
++	}{
++		{desc: "absolute", value: exe, want: exe},
++		{desc: "relative_to_workdir", value: "tools/my_plugin", want: exe},
++		{desc: "path_lookup", value: "my_plugin", want: exe},
++		{desc: "missing", value: "tools/missing", wantErr: "plugin executable not found"},
++		{desc: "empty", value: "", wantErr: "expected a path"},
++	} {
++		t.Run(tc.desc, func(t *testing.T) {
++			got, err := findFlagPlugin(c, tc.value)
++			if tc.wantErr != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
++					t.Fatalf("got %q, %v; want error containing %q", got, err, tc.wantErr)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got != tc.want {
++				t.Errorf("got %q; want %q", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/v2/plugin/plugin.go b/v2/plugin/plugin.go
+new file mode 100644
+index 0000000..b63e8e5
+--- /dev/null
++++ b/v2/plugin/plugin.go
+@@ -0,0 +1,707 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package plugin lets Gazelle use language extensions that run as separate
++// processes. Such plugins can be written in any language: Gazelle starts the
++// plugin executable and exchanges JSON-RPC messages with it over stdin and
++// stdout. See package [github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol]
++// for the protocol, and package
++// [github.com/bazel-contrib/bazel-gazelle/v2/plugin/server] for a helper that
++// implements the plugin side in Go.
++//
++// Users register plugins with the -plugin command-line flag or with a
++// "# gazelle:plugin" directive in the repository root build file; see
++// [Loader]. Each plugin is adapted by [Language] to the extension interfaces
++// in packages [github.com/bazel-contrib/bazel-gazelle/v2/language],
++// [github.com/bazel-contrib/bazel-gazelle/v2/config], and
++// [github.com/bazel-contrib/bazel-gazelle/v2/resolve].
++package plugin
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"regexp"
++	"slices"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/config"
++	gzerrors "github.com/bazel-contrib/bazel-gazelle/v2/errors"
++	"github.com/bazel-contrib/bazel-gazelle/v2/label"
++	"github.com/bazel-contrib/bazel-gazelle/v2/language"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol"
++	"github.com/bazel-contrib/bazel-gazelle/v2/resolve"
++	"github.com/bazel-contrib/bazel-gazelle/v2/rule"
++)
++
++// shutdownTimeout is how long Close waits for a plugin to exit before
++// killing it.
++const shutdownTimeout = 5 * time.Second
++
++// Options describes how to start a plugin process.
++type Options struct {
++	// Path is the path to the plugin executable.
++	Path string
++
++	// Args are additional command-line arguments for the plugin.
++	Args []string
++
++	// Env is the plugin's environment. If nil, Gazelle's environment is used.
++	Env []string
++
++	// Dir is the plugin's working directory. If empty, the repository root
++	// is used.
++	Dir string
++
++	// Stderr receives the plugin's standard error output. If nil, it is
++	// written to Gazelle's standard error.
++	Stderr io.Writer
++}
++
++// Language is a Gazelle extension implemented by a plugin process.
++//
++// Language implements [language.Language], [language.Generator],
++// [language.Fixer], [language.OnResolver], [language.OnFinisher],
++// [config.Configurer], [resolve.Indexer], [resolve.Resolver], and
++// [resolve.Finder]. Calls are forwarded to the plugin process one at a time.
++type Language struct {
++	path  string
++	cmd   *exec.Cmd
++	stdin io.WriteCloser
++	conn  *protocol.Conn
++
++	name            string
++	kinds           []rule.KindInfo
++	knownDirectives []string
++	caps            protocol.Capabilities
++
++	// mu serializes access to the connection and the fields below.
++	mu sync.Mutex
++
++	// busy is set while a request is in flight. It's read without holding mu
++	// to detect re-entrant calls (see Find).
++	busy atomic.Bool
++
++	// failed is set when the plugin process exits unexpectedly or breaks the
++	// protocol. The call that fails returns it as a critical error; later
++	// calls do nothing.
++	failed error
++
++	// waited is set after cmd.Wait has been called; exitErr is its result.
++	waited  bool
++	exitErr error
++
++	closed bool
++
++	// callback holds state needed to answer index/find requests from the
++	// plugin. It's only set while a resolve or find request is in flight.
++	callback *callbackState
++}
++
++type callbackState struct {
++	ctx    context.Context
++	config *config.Config
++	index  *resolve.RuleIndex
++
++	// from is the label of the rule being resolved. hasFrom is false during
++	// find requests.
++	from    label.Label
++	hasFrom bool
++}
++
++var (
++	_ language.Language   = (*Language)(nil)
++	_ language.Generator  = (*Language)(nil)
++	_ language.Fixer      = (*Language)(nil)
++	_ language.OnResolver = (*Language)(nil)
++	_ language.OnFinisher = (*Language)(nil)
++	_ config.Configurer   = (*Language)(nil)
++	_ resolve.Indexer     = (*Language)(nil)
++	_ resolve.Resolver    = (*Language)(nil)
++	_ resolve.Finder      = (*Language)(nil)
++)
++
++var validName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
++
++// Start starts a plugin process and initializes it with the repository-wide
++// configuration in c. c must have been initialized from command-line flags.
++// The caller must call Close when the plugin is no longer needed.
++func Start(ctx context.Context, c *config.Config, opts Options) (_ *Language, err error) {
++	cmd := exec.CommandContext(ctx, opts.Path, opts.Args...)
++	cmd.Dir = opts.Dir
++	if cmd.Dir == "" {
++		cmd.Dir = c.RepoRoot
++	}
++	cmd.Env = opts.Env
++	cmd.Stderr = opts.Stderr
++	if cmd.Stderr == nil {
++		cmd.Stderr = os.Stderr
++	}
++	stdin, err := cmd.StdinPipe()
++	if err != nil {
++		return nil, fmt.Errorf("plugin %s: %w", opts.Path, err)
++	}
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		return nil, fmt.Errorf("plugin %s: %w", opts.Path, err)
++	}
++	if err := cmd.Start(); err != nil {
++		return nil, fmt.Errorf("plugin %s: %w", opts.Path, err)
++	}
++	l := &Language{
++		path:  opts.Path,
++		cmd:   cmd,
++		stdin: stdin,
++		conn:  protocol.NewConn(stdout, stdin),
++		name:  opts.Path,
++	}
++	defer func() {
++		if err != nil {
++			l.kill()
++		}
++	}()
++
++	params := protocol.InitializeParams{
++		ProtocolVersion:     protocol.Version,
++		RepoRoot:            c.RepoRoot,
++		RepoName:            c.RepoName,
++		WorkDir:             c.WorkDir,
++		ValidBuildFileNames: nonNil(c.ValidBuildFileNames),
++		IndexLibraries:      c.IndexLibraries,
++		IndexLazy:           c.IndexLazy,
++		ShouldFix:           c.ShouldFix,
++		Strict:              c.Strict,
++		Bzlmod:              c.Bzlmod,
++	}
++	var res protocol.InitializeResult
++	if err := l.call(ctx, protocol.MethodInitialize, &params, &res, nil); err != nil {
++		return nil, fmt.Errorf("plugin %s: initialize: %w", opts.Path, err)
++	}
++	if res.ProtocolVersion < 1 || res.ProtocolVersion > protocol.Version {
++		return nil, fmt.Errorf("plugin %s: unsupported protocol version %d (this version of Gazelle supports versions 1 through %d)", opts.Path, res.ProtocolVersion, protocol.Version)
++	}
++	if !validName.MatchString(res.Name) {
++		return nil, fmt.Errorf("plugin %s: invalid language name %q", opts.Path, res.Name)
++	}
++	l.name = res.Name
++	switch res.Capabilities.Configure {
++	case "":
++		res.Capabilities.Configure = protocol.ConfigureAll
++	case protocol.ConfigureAll, protocol.ConfigureBuildFiles, protocol.ConfigureDirectives, protocol.ConfigureNone:
++	default:
++		return nil, fmt.Errorf("plugin %s (%s): unknown configure mode %q", res.Name, opts.Path, res.Capabilities.Configure)
++	}
++	l.caps = res.Capabilities
++	seenKinds := make(map[string]bool)
++	for _, k := range res.Kinds {
++		ki, err := kindFromProtocol(k)
++		if err != nil {
++			return nil, fmt.Errorf("plugin %s (%s): %w", res.Name, opts.Path, err)
++		}
++		if seenKinds[ki.Name] {
++			return nil, fmt.Errorf("plugin %s (%s): kind %s declared more than once", res.Name, opts.Path, ki.Name)
++		}
++		seenKinds[ki.Name] = true
++		l.kinds = append(l.kinds, ki)
++	}
++	l.knownDirectives = slices.Clone(res.KnownDirectives)
++	return l, nil
++}
++
++// Name returns the language name reported by the plugin.
++func (l *Language) Name() string { return l.name }
++
++// Path returns the path to the plugin executable.
++func (l *Language) Path() string { return l.path }
++
++// Capabilities returns the optional features the plugin supports.
++func (l *Language) Capabilities() protocol.Capabilities { return l.caps }
++
++// Kinds returns the kinds of rules the plugin generates.
++func (l *Language) Kinds() []rule.KindInfo { return l.kinds }
++
++// KnownDirectives returns the directives the plugin interprets.
++func (l *Language) KnownDirectives() []string { return l.knownDirectives }
++
++// configKey is the key in config.Config.Exts where a plugin's configuration
++// value is stored. It can't collide with an extension name, since names can't
++// contain ':'.
++func (l *Language) configKey() string { return "plugin:" + l.name }
++
++// configValue returns the plugin's configuration value for a directory.
++func (l *Language) configValue(c *config.Config) json.RawMessage {
++	if c == nil {
++		return nil
++	}
++	v, _ := c.Exts[l.configKey()].(json.RawMessage)
++	return v
++}
++
++// Configure implements [config.Configurer].
++func (l *Language) Configure(ctx context.Context, args config.ConfigureArgs) error {
++	switch l.caps.Configure {
++	case protocol.ConfigureNone:
++		return nil
++	case protocol.ConfigureBuildFiles:
++		if args.File == nil {
++			return nil
++		}
++	case protocol.ConfigureDirectives:
++		if args.File == nil || !slices.ContainsFunc(args.File.Directives, func(d rule.Directive) bool {
++			return slices.Contains(l.knownDirectives, d.Key)
++		}) {
++			return nil
++		}
++	}
++	params := protocol.ConfigureParams{
++		Config: l.configValue(args.Config),
++		Rel:    args.Rel,
++		File:   fileToProtocol(args.File),
++	}
++	var res protocol.ConfigureResult
++	if err := l.call(ctx, protocol.MethodConfigure, &params, &res, nil); err != nil {
++		return err
++	}
++	if len(res.Config) > 0 {
++		args.Config.Exts[l.configKey()] = slices.Clone(res.Config)
++	}
++	return diagnosticsError(res.Errors)
++}
++
++// Fix implements [language.Fixer]. It is a no-op unless the plugin declared
++// the fix capability.
++func (l *Language) Fix(ctx context.Context, args language.FixArgs) error {
++	if !l.caps.Fix || args.File == nil {
++		return nil
++	}
++	params := protocol.FixParams{
++		Config:    l.configValue(args.Config),
++		Rel:       args.Rel,
++		File:      *fileToProtocol(args.File),
++		ShouldFix: args.Config.ShouldFix,
++	}
++	var res protocol.FixResult
++	if err := l.call(ctx, protocol.MethodFix, &params, &res, nil); err != nil {
++		return err
++	}
++	errs := []error{diagnosticsError(res.Errors)}
++	rules := args.File.Rules
++	for _, e := range res.Edits {
++		if e.Index < 0 || e.Index >= len(rules) {
++			errs = append(errs, fmt.Errorf("%s: fix: rule index %d out of range", args.File.Path, e.Index))
++			continue
++		}
++		r := rules[e.Index]
++		if e.Delete {
++			r.Delete()
++			continue
++		}
++		if e.Kind != "" {
++			r.SetKind(e.Kind)
++		}
++		if e.Name != "" {
++			r.SetName(e.Name)
++		}
++		if err := applyAttrEdit(r, e.AttrEdit); err != nil {
++			errs = append(errs, fmt.Errorf("%s: fix: rule %s: %w", args.File.Path, r.Name(), err))
++		}
++	}
++	return errors.Join(errs...)
++}
++
++// Generate implements [language.Generator].
++func (l *Language) Generate(ctx context.Context, args language.GenerateArgs) (language.GenerateResult, error) {
++	params := protocol.GenerateParams{
++		Config:       l.configValue(args.Config),
++		Dir:          args.Dir,
++		Rel:          args.Rel,
++		File:         fileToProtocol(args.File),
++		Subdirs:      nonNil(args.Subdirs),
++		RegularFiles: nonNil(args.RegularFiles),
++		GenFiles:     nonNil(args.GenFiles),
++		OtherGen:     rulesToProtocol(args.OtherGen),
++		OtherEmpty:   rulesToProtocol(args.OtherEmpty),
++	}
++	var res protocol.GenerateResult
++	if err := l.call(ctx, protocol.MethodGenerate, &params, &res, nil); err != nil {
++		return language.GenerateResult{}, err
++	}
++	errs := []error{diagnosticsError(res.Errors)}
++	if len(res.Imports) > 0 && len(res.Imports) != len(res.Gen) {
++		errs = append(errs, fmt.Errorf("%s: generate returned %d rules but %d imports", relOrRoot(args.Rel), len(res.Gen), len(res.Imports)))
++		return language.GenerateResult{}, errors.Join(errs...)
++	}
++	result := language.GenerateResult{RelsToIndex: res.RelsToIndex}
++	for i, pr := range res.Gen {
++		r, err := ruleFromProtocol(pr)
++		if err != nil {
++			errs = append(errs, fmt.Errorf("%s: %w", relOrRoot(args.Rel), err))
++			continue
++		}
++		result.Gen = append(result.Gen, r)
++		if len(res.Imports) > 0 {
++			result.Imports = append(result.Imports, slices.Clone(res.Imports[i]))
++		}
++	}
++	for _, pr := range res.Empty {
++		r, err := ruleFromProtocol(pr)
++		if err != nil {
++			errs = append(errs, fmt.Errorf("%s: %w", relOrRoot(args.Rel), err))
++			continue
++		}
++		result.Empty = append(result.Empty, r)
++	}
++	return result, errors.Join(errs...)
++}
++
++// Imports implements [resolve.Indexer].
++func (l *Language) Imports(ctx context.Context, args resolve.ImportsArgs) (resolve.ImportsResult, error) {
++	var rel string
++	if args.File != nil {
++		rel = args.File.Pkg
++	}
++	params := protocol.ImportsParams{
++		Config: l.configValue(args.Config),
++		Rel:    rel,
++		Rule:   ruleToProtocol(args.Rule),
++	}
++	var res protocol.ImportsResult
++	if err := l.call(ctx, protocol.MethodImports, &params, &res, nil); err != nil {
++		return resolve.ImportsResult{}, err
++	}
++	errs := []error{diagnosticsError(res.Errors)}
++	result := resolve.ImportsResult{NotImportable: res.NotImportable}
++	for _, imp := range res.Imports {
++		result.Imports = append(result.Imports, resolve.ImportSpec{Lang: imp.Lang, Imp: imp.Imp})
++	}
++	for _, s := range res.Embeds {
++		lbl, err := label.Parse(s)
++		if err != nil {
++			errs = append(errs, fmt.Errorf("%s: rule %s: invalid embed label %q: %w", relOrRoot(rel), args.Rule.Name(), s, err))
++			continue
++		}
++		result.Embeds = append(result.Embeds, lbl.Abs(args.Config.RepoName, rel))
++	}
++	return result, errors.Join(errs...)
++}
++
++// Resolve implements [resolve.Resolver]. While the plugin handles the
++// request, it may look up imports in args.Index with index/find requests.
++func (l *Language) Resolve(ctx context.Context, args resolve.ResolveArgs) error {
++	imports, _ := args.Imports.(json.RawMessage)
++	params := protocol.ResolveParams{
++		Config:  l.configValue(args.Config),
++		Rel:     args.From.Pkg,
++		Rule:    ruleToProtocol(args.Rule),
++		From:    args.From.String(),
++		Imports: imports,
++	}
++	cb := &callbackState{
++		ctx:     ctx,
++		config:  args.Config,
++		index:   args.Index,
++		from:    args.From,
++		hasFrom: true,
++	}
++	var res protocol.ResolveResult
++	if err := l.call(ctx, protocol.MethodResolve, &params, &res, cb); err != nil {
++		return err
++	}
++	errs := []error{diagnosticsError(res.Errors)}
++	if err := applyAttrEdit(args.Rule, res.AttrEdit); err != nil {
++		errs = append(errs, fmt.Errorf("resolving %s: %w", args.From, err))
++	}
++	return errors.Join(errs...)
++}
++
++// Find implements [resolve.Finder]. It is a no-op unless the plugin declared
++// the find capability. Find is also a no-op when called while the plugin is
++// handling another request (for example, when the plugin's own index/find
++// request couldn't be satisfied by the rule index), since the plugin can't
++// handle nested requests.
++func (l *Language) Find(ctx context.Context, args resolve.FindArgs) ([]resolve.FindResult, error) {
++	if !l.caps.Find || l.busy.Load() {
++		return nil, nil
++	}
++	params := protocol.FindParams{
++		Config: l.configValue(args.Config),
++		Import: protocol.ImportSpec{Lang: args.Import.Lang, Imp: args.Import.Imp},
++		Lang:   args.Lang,
++	}
++	cb := &callbackState{
++		ctx:    ctx,
++		config: args.Config,
++		index:  args.Index,
++	}
++	var res protocol.FindResult
++	if err := l.call(ctx, protocol.MethodFind, &params, &res, cb); err != nil {
++		return nil, err
++	}
++	errs := []error{diagnosticsError(res.Errors)}
++	var results []resolve.FindResult
++	for _, m := range res.Results {
++		fr, err := findResultFromProtocol(m)
++		if err != nil {
++			errs = append(errs, err)
++			continue
++		}
++		results = append(results, fr)
++	}
++	return results, errors.Join(errs...)
++}
++
++// OnResolve implements [language.OnResolver].
++func (l *Language) OnResolve(ctx context.Context) error {
++	if !l.caps.Lifecycle {
++		return nil
++	}
++	return l.call(ctx, protocol.MethodOnResolve, nil, nil, nil)
++}
++
++// OnFinish implements [language.OnFinisher].
++func (l *Language) OnFinish(ctx context.Context) error {
++	if !l.caps.Lifecycle {
++		return nil
++	}
++	return l.call(ctx, protocol.MethodOnFinish, nil, nil, nil)
++}
++
++// Close asks the plugin to shut down and waits for it to exit. If the plugin
++// doesn't exit promptly, it's killed. Close returns an error if the plugin
++// exits with a non-zero status after a clean shutdown.
++func (l *Language) Close() error {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if l.closed {
++		return nil
++	}
++	l.closed = true
++	if l.waited {
++		return nil
++	}
++
++	done := make(chan error, 1)
++	failed := l.failed
++	go func() {
++		if failed == nil {
++			// Ignore errors: the plugin may exit without answering.
++			_ = l.conn.Call(context.Background(), protocol.MethodShutdown, nil, nil, nil)
++		}
++		l.stdin.Close()
++		done <- l.cmd.Wait()
++	}()
++	var err error
++	select {
++	case err = <-done:
++	case <-time.After(shutdownTimeout):
++		_ = l.cmd.Process.Kill()
++		err = <-done
++		err = fmt.Errorf("did not exit within %v after shutdown; killed: %w", shutdownTimeout, err)
++	}
++	l.waited = true
++	l.exitErr = err
++	if err != nil && failed == nil {
++		return fmt.Errorf("plugin %s (%s): %w", l.name, l.path, err)
++	}
++	return nil
++}
++
++// call sends a request to the plugin and waits for its response. cb, if not
++// nil, enables index/find requests from the plugin while the request is in
++// flight.
++func (l *Language) call(ctx context.Context, method string, params, result any, cb *callbackState) error {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if l.failed != nil {
++		// The failure was already reported as a critical error, so Gazelle
++		// will exit without writing files. Don't report it again for every
++		// remaining directory and rule.
++		return nil
++	}
++	if l.closed {
++		return fmt.Errorf("plugin %s: %s called after Close", l.name, method)
++	}
++	l.busy.Store(true)
++	l.callback = cb
++	defer func() {
++		l.callback = nil
++		l.busy.Store(false)
++	}()
++
++	err := l.conn.Call(ctx, method, params, result, l.handleCallback)
++	if err == nil {
++		return nil
++	}
++	var rpcErr *protocol.Error
++	if errors.As(err, &rpcErr) {
++		return withSeverity(rpcErrorSeverity(rpcErr), fmt.Errorf("%s: %s", method, rpcErr.Message))
++	}
++
++	// The connection is broken: the plugin crashed or wrote something that
++	// isn't a protocol message. Kill it and report its exit status, since
++	// that's usually more informative than the I/O error.
++	l.kill()
++	msg := err.Error()
++	if errors.Is(err, io.EOF) {
++		msg = "plugin closed its output"
++	}
++	if l.exitErr != nil {
++		msg = fmt.Sprintf("%s (%v)", msg, l.exitErr)
++	}
++	l.failed = gzerrors.SeverityErrorf(gzerrors.Critical, "plugin %s (%s) failed during %s: %s", l.name, l.path, method, msg)
++	return l.failed
++}
++
++// handleCallback answers requests the plugin sends while Gazelle is waiting
++// for a response.
++func (l *Language) handleCallback(_ context.Context, method string, params json.RawMessage) (any, error) {
++	switch method {
++	case protocol.MethodIndexFind:
++		cb := l.callback
++		if cb == nil || cb.index == nil {
++			return nil, &protocol.Error{
++				Code:    protocol.CodeInvalidRequest,
++				Message: "index/find may only be called while handling resolve or find",
++			}
++		}
++		var p protocol.IndexFindParams
++		if err := protocol.Unmarshal(params, &p); err != nil {
++			return nil, &protocol.Error{Code: protocol.CodeInvalidParams, Message: err.Error()}
++		}
++		lang := p.Lang
++		if lang == "" {
++			lang = l.name
++		}
++		imp := resolve.ImportSpec{Lang: p.Import.Lang, Imp: p.Import.Imp}
++		var results []resolve.FindResult
++		if dep, ok := resolve.FindRuleWithOverride(cb.config, imp, lang); ok {
++			// gazelle:resolve and gazelle:resolve_regexp directives take
++			// precedence over the index, as they do for built-in extensions.
++			if dep.Relative {
++				dep = dep.Abs(cb.config.RepoName, cb.from.Pkg)
++			}
++			results = []resolve.FindResult{{Label: dep}}
++		} else {
++			var err error
++			results, err = cb.index.Find(cb.ctx, cb.config, imp, lang)
++			if err != nil && len(results) == 0 {
++				return nil, err
++			}
++		}
++		res := protocol.IndexFindResult{}
++		for _, r := range results {
++			m := protocol.FindMatch{Label: r.Label.String()}
++			for _, e := range r.Embeds {
++				m.Embeds = append(m.Embeds, e.String())
++			}
++			if cb.hasFrom {
++				m.RelLabel = r.Label.Rel(cb.from.Repo, cb.from.Pkg).String()
++				m.SelfImport = r.IsSelfImport(cb.from)
++			}
++			res.Results = append(res.Results, m)
++		}
++		return res, nil
++
++	default:
++		return nil, &protocol.Error{
++			Code:    protocol.CodeMethodNotFound,
++			Message: fmt.Sprintf("method not found: %s", method),
++		}
++	}
++}
++
++// kill stops the plugin process and records its exit status. mu must be held
++// or the Language must not be shared yet.
++func (l *Language) kill() {
++	if l.waited {
++		return
++	}
++	_ = l.stdin.Close()
++	_ = l.cmd.Process.Kill()
++	l.exitErr = l.cmd.Wait()
++	l.waited = true
++}
++
++func findResultFromProtocol(m protocol.FindMatch) (resolve.FindResult, error) {
++	lbl, err := label.Parse(m.Label)
++	if err != nil {
++		return resolve.FindResult{}, fmt.Errorf("find: invalid label %q: %w", m.Label, err)
++	}
++	fr := resolve.FindResult{Label: lbl}
++	for _, s := range m.Embeds {
++		e, err := label.Parse(s)
++		if err != nil {
++			return resolve.FindResult{}, fmt.Errorf("find: invalid embed label %q: %w", s, err)
++		}
++		fr.Embeds = append(fr.Embeds, e)
++	}
++	return fr, nil
++}
++
++// diagnosticsError converts diagnostics returned by a plugin into an error
++// that Gazelle's error handler understands.
++func diagnosticsError(diags []protocol.Diagnostic) error {
++	var errs []error
++	for _, d := range diags {
++		errs = append(errs, withSeverity(parseSeverity(d.Severity), errors.New(d.Message)))
++	}
++	return errors.Join(errs...)
++}
++
++func rpcErrorSeverity(e *protocol.Error) gzerrors.Severity {
++	if e.Data == nil {
++		return gzerrors.Error
++	}
++	return parseSeverity(e.Data.Severity)
++}
++
++func parseSeverity(s string) gzerrors.Severity {
++	switch strings.ToLower(s) {
++	case "warning":
++		return gzerrors.Warning
++	case "critical":
++		return gzerrors.Critical
++	default:
++		return gzerrors.Error
++	}
++}
++
++func withSeverity(sev gzerrors.Severity, err error) error {
++	if sev == gzerrors.Error {
++		return err
++	}
++	return gzerrors.WithSeverity(sev, err)
++}
++
++func nonNil(s []string) []string {
++	if s == nil {
++		return []string{}
++	}
++	return s
++}
++
++func relOrRoot(rel string) string {
++	if rel == "" {
++		return "."
++	}
++	return rel
++}
+diff --git a/v2/plugin/plugin_test.go b/v2/plugin/plugin_test.go
+new file mode 100644
+index 0000000..9577ce5
+--- /dev/null
++++ b/v2/plugin/plugin_test.go
+@@ -0,0 +1,440 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package plugin_test
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/cmd/gazelle/update"
++	"github.com/bazel-contrib/bazel-gazelle/v2/language"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/examples/sh"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol"
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/server"
++	"github.com/bazel-contrib/bazel-gazelle/v2/testtools"
++)
++
++// pluginEnv is set in the environment of plugin processes started by these
++// tests. The test binary itself acts as the plugin: when pluginEnv is set,
++// TestMain serves the plugin named by the first argument (default "sh")
++// instead of running tests.
++const pluginEnv = "GAZELLE_PLUGIN_TEST_SERVE"
++
++func TestMain(m *testing.M) {
++	if os.Getenv(pluginEnv) == "" {
++		os.Exit(m.Run())
++	}
++	mode := "sh"
++	if len(os.Args) > 1 {
++		mode = os.Args[1]
++	}
++	switch mode {
++	case "sh":
++		server.Main(sh.New())
++	case "fake":
++		server.Main(&fakePlugin{})
++	case "badversion":
++		server.Main(&badVersionPlugin{})
++	case "crash":
++		server.Main(&crashPlugin{})
++	default:
++		fmt.Fprintf(os.Stderr, "unknown test plugin %q\n", mode)
++		os.Exit(2)
++	}
++}
++
++// testExecutable returns the path to the test binary and arranges for it to
++// act as a plugin when Gazelle starts it.
++func testExecutable(t *testing.T) string {
++	t.Helper()
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv(pluginEnv, "1")
++	return exe
++}
++
++func runGazelle(t *testing.T, dir string, langs []language.Language, args ...string) error {
++	t.Helper()
++	return update.Run(context.Background(), langs, dir, args)
++}
++
++// shRepo is a small repository with shell scripts. The sh plugin (in Go or
++// Python) should produce shRepoWant from it.
++var shRepo = []testtools.FileSpec{
++	{Path: "WORKSPACE"},
++	{Path: "BUILD.bazel"},
++	{Path: "lib/util.sh", Content: "util() { echo util; }\n"},
++	{
++		Path: "bin/run.sh",
++		Content: `#!/bin/bash
++source lib/util.sh
++. ./helpers.sh
++source "$HOME/.profile"
++`,
++	},
++	{Path: "bin/helpers.sh", Content: "helper() { :; }\n"},
++	{
++		Path: "bin/run_test.sh",
++		Content: `source lib/util.sh
++source lib/missing.sh
++`,
++	},
++	{Path: "off/BUILD.bazel", Content: "# gazelle:sh_enabled false\n"},
++	{Path: "off/skip.sh", Content: "echo skip\n"},
++	{
++		Path: "stale/BUILD.bazel",
++		Content: `load("@rules_shell//shell:sh_library.bzl", "sh_library")
++
++sh_library(
++    name = "gone",
++    srcs = ["gone.sh"],
++)
++`,
++	},
++	{Path: "stale/kept.sh", Content: "kept() { :; }\n"},
++}
++
++var shRepoWant = []testtools.FileSpec{
++	{
++		Path: "lib/BUILD.bazel",
++		Content: `load("@rules_shell//shell:sh_library.bzl", "sh_library")
++
++sh_library(
++    name = "util",
++    srcs = ["util.sh"],
++    visibility = ["//visibility:public"],
++)
++`,
++	},
++	{
++		Path: "bin/BUILD.bazel",
++		Content: `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
++load("@rules_shell//shell:sh_library.bzl", "sh_library")
++load("@rules_shell//shell:sh_test.bzl", "sh_test")
++
++sh_library(
++    name = "helpers",
++    srcs = ["helpers.sh"],
++    visibility = ["//visibility:public"],
++)
++
++sh_binary(
++    name = "run",
++    srcs = ["run.sh"],
++    deps = [
++        ":helpers",
++        "//lib:util",
++    ],
++)
++
++sh_test(
++    name = "run_test",
++    srcs = ["run_test.sh"],
++    deps = ["//lib:util"],
++)
++`,
++	},
++	{Path: "off/BUILD.bazel", Content: "# gazelle:sh_enabled false\n"},
++	{
++		Path: "stale/BUILD.bazel",
++		Content: `load("@rules_shell//shell:sh_library.bzl", "sh_library")
++
++sh_library(
++    name = "kept",
++    srcs = ["kept.sh"],
++    visibility = ["//visibility:public"],
++)
++`,
++	},
++}
++
++func TestGoReferencePlugin(t *testing.T) {
++	exe := testExecutable(t)
++	dir, cleanup := testtools.CreateFiles(t, shRepo)
++	defer cleanup()
++	if err := runGazelle(t, dir, nil, "-plugin="+exe); err != nil {
++		t.Fatal(err)
++	}
++	testtools.CheckFiles(t, dir, shRepoWant)
++}
++
++func TestResolveOverride(t *testing.T) {
++	exe := testExecutable(t)
++	dir, cleanup := testtools.CreateFiles(t, []testtools.FileSpec{
++		{Path: "WORKSPACE"},
++		{Path: "BUILD.bazel", Content: "# gazelle:resolve sh vendor/lib.sh //third_party/shlib\n"},
++		{Path: "app/main.sh", Content: "#!/bin/sh\nsource vendor/lib.sh\n"},
++	})
++	defer cleanup()
++	if err := runGazelle(t, dir, nil, "-plugin="+exe); err != nil {
++		t.Fatal(err)
++	}
++	testtools.CheckFiles(t, dir, []testtools.FileSpec{{
++		Path: "app/BUILD.bazel",
++		Content: `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
++
++sh_binary(
++    name = "main",
++    srcs = ["main.sh"],
++    deps = ["//third_party/shlib"],
++)
++`,
++	}})
++}
++
++func TestPythonReferencePlugin(t *testing.T) {
++	if _, err := exec.LookPath("python3"); err != nil {
++		t.Skip("python3 not found")
++	}
++	script, err := filepath.Abs(filepath.FromSlash("examples/sh/sh_plugin.py"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(script); err != nil {
++		t.Skipf("reference plugin not available: %v", err)
++	}
++	dir, cleanup := testtools.CreateFiles(t, shRepo)
++	defer cleanup()
++	if err := runGazelle(t, dir, nil, "-plugin="+script); err != nil {
++		t.Fatal(err)
++	}
++	testtools.CheckFiles(t, dir, shRepoWant)
++}
++
++func TestPluginDirective(t *testing.T) {
++	exe := testExecutable(t)
++	files := append([]testtools.FileSpec{}, shRepo...)
++	files[1] = testtools.FileSpec{Path: "BUILD.bazel", Content: "# gazelle:plugin " + filepath.ToSlash(exe) + " sh\n"}
++	dir, cleanup := testtools.CreateFiles(t, files)
++	defer cleanup()
++	if err := runGazelle(t, dir, nil); err != nil {
++		t.Fatal(err)
++	}
++	testtools.CheckFiles(t, dir, shRepoWant)
++}
++
++func TestPluginDirectiveOutsideRoot(t *testing.T) {
++	exe := testExecutable(t)
++	dir, cleanup := testtools.CreateFiles(t, []testtools.FileSpec{
++		{Path: "WORKSPACE"},
++		{Path: "sub/BUILD.bazel", Content: "# gazelle:plugin " + filepath.ToSlash(exe) + " sh\n"},
++	})
++	defer cleanup()
++	err := runGazelle(t, dir, nil, "-strict")
++	if !errors.Is(err, update.ExitError) {
++		t.Fatalf("got error %v; want %v", err, update.ExitError)
++	}
++}
++
++func TestFixFindLifecycle(t *testing.T) {
++	exe := filepath.ToSlash(testExecutable(t))
++	dir, cleanup := testtools.CreateFiles(t, []testtools.FileSpec{
++		{Path: "WORKSPACE"},
++		{Path: "BUILD.bazel", Content: "# gazelle:plugin " + exe + " sh\n# gazelle:plugin " + exe + " fake\n"},
++		{
++			Path: "fix/BUILD.bazel",
++			Content: `old_fake_library(name = "a")
++
++fake_obsolete(name = "b")
++`,
++		},
++		{Path: "app/main.sh", Content: "#!/bin/sh\nsource ext/thing.sh\n"},
++	})
++	defer cleanup()
++	if err := runGazelle(t, dir, nil, "fix"); err != nil {
++		t.Fatal(err)
++	}
++	testtools.CheckFiles(t, dir, []testtools.FileSpec{
++		{
++			Path: "fix/BUILD.bazel",
++			Content: `load("//tools:fake.bzl", "fake_library")
++
++fake_library(name = "a")
++`,
++		},
++		{
++			Path: "app/BUILD.bazel",
++			Content: `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
++
++sh_binary(
++    name = "main",
++    srcs = ["main.sh"],
++    deps = ["@ext//:thing"],
++)
++`,
++		},
++		{Path: "fake_events", Content: "onResolve\nonFinish\n"},
++	})
++}
++
++func TestStartErrors(t *testing.T) {
++	exe := filepath.ToSlash(testExecutable(t))
++	for _, tc := range []struct {
++		desc, rootBuild string
++		args            []string
++		langs           []language.Language
++		wantErr         string
++	}{
++		{
++			desc:    "missing_executable",
++			args:    []string{"-plugin=does/not/exist"},
++			wantErr: "plugin executable not found",
++		},
++		{
++			desc:      "bad_version",
++			rootBuild: "# gazelle:plugin " + exe + " badversion\n",
++			wantErr:   "unsupported protocol version 99",
++		},
++		{
++			desc:      "duplicate_name",
++			rootBuild: "# gazelle:plugin " + exe + " sh\n# gazelle:plugin " + exe + " sh\n",
++			wantErr:   `uses the language name "sh", which is already used by plugin`,
++		},
++		{
++			desc:      "builtin_name",
++			rootBuild: "# gazelle:plugin " + exe + " sh\n",
++			langs:     []language.Language{namedLanguage("sh")},
++			wantErr:   `uses the language name "sh", which is already used by a built-in extension`,
++		},
++	} {
++		t.Run(tc.desc, func(t *testing.T) {
++			dir, cleanup := testtools.CreateFiles(t, []testtools.FileSpec{
++				{Path: "WORKSPACE"},
++				{Path: "BUILD.bazel", Content: tc.rootBuild},
++			})
++			defer cleanup()
++			err := runGazelle(t, dir, tc.langs, tc.args...)
++			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
++				t.Fatalf("got error %v; want error containing %q", err, tc.wantErr)
++			}
++		})
++	}
++}
++
++func TestPluginCrash(t *testing.T) {
++	exe := filepath.ToSlash(testExecutable(t))
++	dir, cleanup := testtools.CreateFiles(t, []testtools.FileSpec{
++		{Path: "WORKSPACE"},
++		{Path: "BUILD.bazel", Content: "# gazelle:plugin " + exe + " crash\n"},
++		{Path: "pkg/x.sh"},
++	})
++	defer cleanup()
++	err := runGazelle(t, dir, nil)
++	if !errors.Is(err, update.ExitError) {
++		t.Fatalf("got error %v; want %v", err, update.ExitError)
++	}
++	testtools.CheckFiles(t, dir, []testtools.FileSpec{{Path: "pkg/BUILD.bazel", NotExist: true}})
++}
++
++type namedLanguage string
++
++func (n namedLanguage) Name() string { return string(n) }
++
++// fakePlugin tests the optional fix, find, and lifecycle capabilities.
++type fakePlugin struct {
++	repoRoot string
++}
++
++func (p *fakePlugin) Initialize(ctx context.Context, params protocol.InitializeParams) (protocol.InitializeResult, error) {
++	p.repoRoot = params.RepoRoot
++	return protocol.InitializeResult{
++		ProtocolVersion: protocol.Version,
++		Name:            "fake",
++		Kinds: []protocol.KindInfo{{
++			Name:           "fake_library",
++			LoadedFrom:     "//tools:fake.bzl",
++			MergeableAttrs: []string{"srcs"},
++		}},
++		Capabilities: protocol.Capabilities{
++			Configure: protocol.ConfigureNone,
++			Fix:       true,
++			Find:      true,
++			Lifecycle: true,
++		},
++	}, nil
++}
++
++// Fix renames old_fake_library to fake_library and deletes fake_obsolete.
++func (p *fakePlugin) Fix(ctx context.Context, params protocol.FixParams) (protocol.FixResult, error) {
++	var res protocol.FixResult
++	if !params.ShouldFix {
++		return res, nil
++	}
++	for i, r := range params.File.Rules {
++		switch r.Kind {
++		case "old_fake_library":
++			res.Edits = append(res.Edits, protocol.RuleEdit{Index: i, Kind: "fake_library"})
++		case "fake_obsolete":
++			res.Edits = append(res.Edits, protocol.RuleEdit{Index: i, Delete: true})
++		}
++	}
++	return res, nil
++}
++
++// Find resolves shell scripts under ext/ to an external repository.
++func (p *fakePlugin) Find(ctx context.Context, params protocol.FindParams) (protocol.FindResult, error) {
++	var res protocol.FindResult
++	if params.Import.Lang == "sh" && strings.HasPrefix(params.Import.Imp, "ext/") {
++		name := strings.TrimSuffix(path.Base(params.Import.Imp), ".sh")
++		res.Results = append(res.Results, protocol.FindMatch{Label: "@ext//:" + name})
++	}
++	return res, nil
++}
++
++func (p *fakePlugin) OnResolve(ctx context.Context) error { return p.recordEvent("onResolve") }
++
++func (p *fakePlugin) OnFinish(ctx context.Context) error { return p.recordEvent("onFinish") }
++
++func (p *fakePlugin) recordEvent(event string) error {
++	f, err := os.OpenFile(filepath.Join(p.repoRoot, "fake_events"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o666)
++	if err != nil {
++		return err
++	}
++	if _, err := fmt.Fprintln(f, event); err != nil {
++		f.Close()
++		return err
++	}
++	return f.Close()
++}
++
++type badVersionPlugin struct{}
++
++func (badVersionPlugin) Initialize(ctx context.Context, params protocol.InitializeParams) (protocol.InitializeResult, error) {
++	return protocol.InitializeResult{ProtocolVersion: 99, Name: "bad"}, nil
++}
++
++// crashPlugin exits abruptly while generating rules.
++type crashPlugin struct{}
++
++func (crashPlugin) Initialize(ctx context.Context, params protocol.InitializeParams) (protocol.InitializeResult, error) {
++	return protocol.InitializeResult{ProtocolVersion: protocol.Version, Name: "crash"}, nil
++}
++
++func (crashPlugin) Generate(ctx context.Context, params protocol.GenerateParams) (protocol.GenerateResult, error) {
++	if len(params.RegularFiles) > 0 {
++		os.Exit(3)
++	}
++	return protocol.GenerateResult{}, nil
++}
+diff --git a/v2/plugin/protocol/BUILD.bazel b/v2/plugin/protocol/BUILD.bazel
+new file mode 100644
+index 0000000..2f59851
+--- /dev/null
++++ b/v2/plugin/protocol/BUILD.bazel
+@@ -0,0 +1,29 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
++
++go_library(
++    name = "protocol",
++    srcs = [
++        "jsonrpc.go",
++        "protocol.go",
++    ],
++    importpath = "github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol",
++    visibility = ["//visibility:public"],
++)
++
++go_test(
++    name = "protocol_test",
++    srcs = ["jsonrpc_test.go"],
++    embed = [":protocol"],
++)
++
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = [
++        "BUILD.bazel",
++        "jsonrpc.go",
++        "jsonrpc_test.go",
++        "protocol.go",
++    ],
++    visibility = ["//visibility:public"],
++)
+diff --git a/v2/plugin/protocol/jsonrpc.go b/v2/plugin/protocol/jsonrpc.go
+new file mode 100644
+index 0000000..738479a
+--- /dev/null
++++ b/v2/plugin/protocol/jsonrpc.go
+@@ -0,0 +1,241 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package protocol
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"strconv"
++)
++
++// Message is a JSON-RPC 2.0 request, notification, or response.
++type Message struct {
++	JSONRPC string          `json:"jsonrpc"`
++	ID      json.RawMessage `json:"id,omitempty"`
++	Method  string          `json:"method,omitempty"`
++	Params  json.RawMessage `json:"params,omitempty"`
++	Result  json.RawMessage `json:"result,omitempty"`
++	Error   *Error          `json:"error,omitempty"`
++}
++
++// IsRequest returns true if the message is a request or notification
++// (as opposed to a response).
++func (m *Message) IsRequest() bool {
++	return m.Method != ""
++}
++
++// JSON-RPC 2.0 error codes.
++const (
++	CodeParseError     = -32700
++	CodeInvalidRequest = -32600
++	CodeMethodNotFound = -32601
++	CodeInvalidParams  = -32602
++	CodeInternalError  = -32603
++)
++
++// Error is a JSON-RPC error object. It is returned by [Conn.Call] when the
++// peer answers a request with an error.
++type Error struct {
++	Code    int        `json:"code"`
++	Message string     `json:"message"`
++	Data    *ErrorData `json:"data,omitempty"`
++}
++
++// ErrorData is the optional data member of an [Error].
++type ErrorData struct {
++	// Severity is "error" (the default), "warning", or "critical".
++	Severity string `json:"severity,omitempty"`
++}
++
++func (e *Error) Error() string {
++	return e.Message
++}
++
++// Handler handles a request received by a [Conn]. It returns a value to be
++// marshaled as the result or an error. If the error is an [*Error], it is
++// sent as is; other errors are sent with [CodeInternalError].
++type Handler func(ctx context.Context, method string, params json.RawMessage) (any, error)
++
++// Conn sends and receives JSON-RPC 2.0 messages framed as JSON Lines: one
++// JSON value per line, terminated by '\n'. Conn is not safe for concurrent
++// use; the protocol never has more than one outstanding request in each
++// direction.
++type Conn struct {
++	r      *bufio.Reader
++	w      *bufio.Writer
++	nextID int64
++}
++
++// NewConn returns a Conn that reads messages from r and writes them to w.
++func NewConn(r io.Reader, w io.Writer) *Conn {
++	return &Conn{
++		r: bufio.NewReaderSize(r, 64*1024),
++		w: bufio.NewWriterSize(w, 64*1024),
++	}
++}
++
++// ReadMessage reads the next message. Blank lines are skipped. ReadMessage
++// returns io.EOF if the peer closed the stream cleanly.
++func (c *Conn) ReadMessage() (*Message, error) {
++	for {
++		line, err := c.r.ReadBytes('\n')
++		if len(bytes.TrimSpace(line)) == 0 {
++			if err != nil {
++				if errors.Is(err, io.EOF) {
++					return nil, io.EOF
++				}
++				return nil, err
++			}
++			continue
++		}
++		if err != nil && !errors.Is(err, io.EOF) {
++			return nil, err
++		}
++		msg := &Message{}
++		if jerr := json.Unmarshal(line, msg); jerr != nil {
++			return nil, fmt.Errorf("parsing message: %w: %q", jerr, truncate(line))
++		}
++		return msg, nil
++	}
++}
++
++// WriteMessage writes a message on its own line and flushes it.
++func (c *Conn) WriteMessage(msg *Message) error {
++	msg.JSONRPC = "2.0"
++	data, err := json.Marshal(msg)
++	if err != nil {
++		return err
++	}
++	data = append(data, '\n')
++	if _, err := c.w.Write(data); err != nil {
++		return err
++	}
++	return c.w.Flush()
++}
++
++// Call sends a request and waits for the response, which is unmarshaled into
++// result (unless result is nil). Requests the peer sends while Call is
++// waiting are passed to handler, and their responses are written before
++// Call continues waiting. If handler is nil, such requests are answered with
++// [CodeMethodNotFound].
++func (c *Conn) Call(ctx context.Context, method string, params, result any, handler Handler) error {
++	c.nextID++
++	id := json.RawMessage(strconv.FormatInt(c.nextID, 10))
++	if params == nil {
++		params = Empty{}
++	}
++	rawParams, err := json.Marshal(params)
++	if err != nil {
++		return fmt.Errorf("marshaling %s params: %w", method, err)
++	}
++	if err := c.WriteMessage(&Message{ID: id, Method: method, Params: rawParams}); err != nil {
++		return err
++	}
++	for {
++		msg, err := c.ReadMessage()
++		if err != nil {
++			return err
++		}
++		if msg.IsRequest() {
++			if err := c.serve(ctx, msg, handler); err != nil {
++				return err
++			}
++			continue
++		}
++		if !sameID(msg.ID, id) {
++			return fmt.Errorf("received response with id %s while waiting for response to %s request with id %s", msg.ID, method, id)
++		}
++		if msg.Error != nil {
++			return msg.Error
++		}
++		if result == nil {
++			return nil
++		}
++		if err := Unmarshal(msg.Result, result); err != nil {
++			return fmt.Errorf("parsing %s result: %w", method, err)
++		}
++		return nil
++	}
++}
++
++// serve handles one request or notification from the peer.
++func (c *Conn) serve(ctx context.Context, msg *Message, handler Handler) error {
++	var result any
++	var err error
++	if handler == nil {
++		err = &Error{Code: CodeMethodNotFound, Message: fmt.Sprintf("method not found: %s", msg.Method)}
++	} else {
++		result, err = handler(ctx, msg.Method, msg.Params)
++	}
++	if len(msg.ID) == 0 {
++		// Notification: no response.
++		return nil
++	}
++	return c.Reply(msg.ID, result, err)
++}
++
++// Reply sends the response to the request with the given id. If err is not
++// nil, an error response is sent and result is ignored.
++func (c *Conn) Reply(id json.RawMessage, result any, err error) error {
++	resp := &Message{ID: id}
++	if err != nil {
++		var rpcErr *Error
++		if !errors.As(err, &rpcErr) {
++			rpcErr = &Error{Code: CodeInternalError, Message: err.Error()}
++		}
++		resp.Error = rpcErr
++	} else {
++		if result == nil {
++			result = Empty{}
++		}
++		data, merr := json.Marshal(result)
++		if merr != nil {
++			resp.Error = &Error{Code: CodeInternalError, Message: fmt.Sprintf("marshaling result: %v", merr)}
++		} else {
++			resp.Result = data
++		}
++	}
++	return c.WriteMessage(resp)
++}
++
++// Unmarshal decodes JSON data into v. Numbers stored in interface values
++// (like [Rule.Attrs]) are decoded as [json.Number] so integers are preserved
++// exactly. Empty data and null leave v unchanged.
++func Unmarshal(data json.RawMessage, v any) error {
++	if len(bytes.TrimSpace(data)) == 0 {
++		return nil
++	}
++	dec := json.NewDecoder(bytes.NewReader(data))
++	dec.UseNumber()
++	return dec.Decode(v)
++}
++
++func sameID(a, b json.RawMessage) bool {
++	return bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b))
++}
++
++func truncate(b []byte) []byte {
++	const max = 200
++	if len(b) > max {
++		return b[:max]
++	}
++	return b
++}
+diff --git a/v2/plugin/protocol/jsonrpc_test.go b/v2/plugin/protocol/jsonrpc_test.go
+new file mode 100644
+index 0000000..0614c35
+--- /dev/null
++++ b/v2/plugin/protocol/jsonrpc_test.go
+@@ -0,0 +1,199 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package protocol
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"strings"
++	"testing"
++)
++
++// pipePair returns two connections wired to each other.
++func pipePair() (a, b *Conn, closeAll func()) {
++	ar, bw := io.Pipe()
++	br, aw := io.Pipe()
++	return NewConn(ar, aw), NewConn(br, bw), func() {
++		ar.Close()
++		aw.Close()
++		br.Close()
++		bw.Close()
++	}
++}
++
++func TestCallWithCallback(t *testing.T) {
++	gazelle, plugin, closeAll := pipePair()
++	defer closeAll()
++
++	// The plugin answers a resolve request after looking up an import with an
++	// index/find request back to Gazelle.
++	pluginErr := make(chan error, 1)
++	go func() {
++		pluginErr <- func() error {
++			msg, err := plugin.ReadMessage()
++			if err != nil {
++				return err
++			}
++			if msg.Method != MethodResolve {
++				return errors.New("unexpected method " + msg.Method)
++			}
++			var params ResolveParams
++			if err := Unmarshal(msg.Params, &params); err != nil {
++				return err
++			}
++			var found IndexFindResult
++			if err := plugin.Call(context.Background(), MethodIndexFind, IndexFindParams{Import: ImportSpec{Lang: "sh", Imp: "lib/util.sh"}}, &found, nil); err != nil {
++				return err
++			}
++			result := ResolveResult{AttrEdit: AttrEdit{Attrs: map[string]any{"deps": []string{found.Results[0].RelLabel}}}}
++			return plugin.Reply(msg.ID, result, nil)
++		}()
++	}()
++
++	handler := func(ctx context.Context, method string, params json.RawMessage) (any, error) {
++		if method != MethodIndexFind {
++			return nil, &Error{Code: CodeMethodNotFound, Message: method}
++		}
++		var p IndexFindParams
++		if err := Unmarshal(params, &p); err != nil {
++			return nil, err
++		}
++		return IndexFindResult{Results: []FindMatch{{Label: "//lib:util", RelLabel: "//lib:" + strings.TrimSuffix(strings.TrimPrefix(p.Import.Imp, "lib/"), ".sh")}}}, nil
++	}
++	var res ResolveResult
++	if err := gazelle.Call(context.Background(), MethodResolve, ResolveParams{From: "//bin:run"}, &res, handler); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-pluginErr; err != nil {
++		t.Fatal(err)
++	}
++	deps, _ := res.Attrs["deps"].([]any)
++	if len(deps) != 1 || deps[0] != "//lib:util" {
++		t.Errorf("got deps %#v; want [//lib:util]", res.Attrs["deps"])
++	}
++}
++
++func TestCallError(t *testing.T) {
++	gazelle, plugin, closeAll := pipePair()
++	defer closeAll()
++	go func() {
++		msg, err := plugin.ReadMessage()
++		if err != nil {
++			return
++		}
++		plugin.Reply(msg.ID, nil, &Error{Code: 1, Message: "bad file", Data: &ErrorData{Severity: "warning"}})
++	}()
++	err := gazelle.Call(context.Background(), MethodGenerate, GenerateParams{}, &GenerateResult{}, nil)
++	var rpcErr *Error
++	if !errors.As(err, &rpcErr) {
++		t.Fatalf("got error %v; want *Error", err)
++	}
++	if rpcErr.Message != "bad file" || rpcErr.Data == nil || rpcErr.Data.Severity != "warning" {
++		t.Errorf("got %#v", rpcErr)
++	}
++}
++
++func TestCallbackWithoutHandler(t *testing.T) {
++	gazelle, plugin, closeAll := pipePair()
++	defer closeAll()
++	gotErr := make(chan error, 1)
++	go func() {
++		msg, err := plugin.ReadMessage()
++		if err != nil {
++			gotErr <- err
++			return
++		}
++		gotErr <- plugin.Call(context.Background(), MethodIndexFind, IndexFindParams{}, nil, nil)
++		plugin.Reply(msg.ID, nil, nil)
++	}()
++	if err := gazelle.Call(context.Background(), MethodResolve, ResolveParams{}, nil, nil); err != nil {
++		t.Fatal(err)
++	}
++	var rpcErr *Error
++	if err := <-gotErr; !errors.As(err, &rpcErr) || rpcErr.Code != CodeMethodNotFound {
++		t.Errorf("got error %v; want method not found", err)
++	}
++}
++
++func TestReadMessage(t *testing.T) {
++	long := strings.Repeat("x", 1<<20)
++	input := "\n" + `{"jsonrpc":"2.0","id":1,"method":"generate","params":{"rel":"` + long + `"}}` + "\n\n" +
++		`{"jsonrpc":"2.0","id":2,"result":{}}`
++	c := NewConn(strings.NewReader(input), io.Discard)
++
++	msg, err := c.ReadMessage()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var p GenerateParams
++	if err := Unmarshal(msg.Params, &p); err != nil {
++		t.Fatal(err)
++	}
++	if msg.Method != MethodGenerate || len(p.Rel) != len(long) {
++		t.Errorf("first message not read correctly")
++	}
++
++	// The last line has no trailing newline.
++	msg, err = c.ReadMessage()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if msg.IsRequest() || string(msg.ID) != "2" {
++		t.Errorf("got %#v; want response with id 2", msg)
++	}
++
++	if _, err := c.ReadMessage(); !errors.Is(err, io.EOF) {
++		t.Errorf("got error %v; want io.EOF", err)
++	}
++}
++
++func TestReadMessageInvalid(t *testing.T) {
++	c := NewConn(strings.NewReader("not json\n"), io.Discard)
++	if _, err := c.ReadMessage(); err == nil {
++		t.Fatal("expected error")
++	}
++}
++
++func TestWriteMessageOneLine(t *testing.T) {
++	var buf bytes.Buffer
++	c := NewConn(strings.NewReader(""), &buf)
++	if err := c.Reply(json.RawMessage("7"), Rule{Kind: "sh_library", Attrs: map[string]any{"srcs": []string{"a\nb.sh"}}}, nil); err != nil {
++		t.Fatal(err)
++	}
++	out := buf.String()
++	if strings.Count(out, "\n") != 1 || !strings.HasSuffix(out, "\n") {
++		t.Errorf("message is not a single line: %q", out)
++	}
++	if !strings.Contains(out, `"jsonrpc":"2.0"`) || !strings.Contains(out, `"id":7`) {
++		t.Errorf("unexpected message: %s", out)
++	}
++}
++
++func TestUnmarshalNumbers(t *testing.T) {
++	var r Rule
++	if err := Unmarshal(json.RawMessage(`{"kind":"k","attrs":{"size":9007199254740993,"ratio":1.5}}`), &r); err != nil {
++		t.Fatal(err)
++	}
++	if n, ok := r.Attrs["size"].(json.Number); !ok || n.String() != "9007199254740993" {
++		t.Errorf("size: got %#v; want exact json.Number", r.Attrs["size"])
++	}
++	if n, ok := r.Attrs["ratio"].(json.Number); !ok || n.String() != "1.5" {
++		t.Errorf("ratio: got %#v", r.Attrs["ratio"])
++	}
++}
+diff --git a/v2/plugin/protocol/protocol.go b/v2/plugin/protocol/protocol.go
+new file mode 100644
+index 0000000..55216d8
+--- /dev/null
++++ b/v2/plugin/protocol/protocol.go
+@@ -0,0 +1,554 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package protocol defines the wire protocol between Gazelle and language
++// plugins that run as separate processes.
++//
++// A plugin is an executable written in any language. Gazelle starts it once
++// per run and talks to it over the plugin's stdin and stdout using JSON-RPC
++// 2.0. Each message is a single line of UTF-8 JSON terminated by '\n'
++// (JSON Lines framing). The plugin's stderr is passed through to the user.
++//
++// Gazelle sends the requests named by the Method* constants below and the
++// plugin answers each one. While handling resolve or find, a plugin may send
++// an [MethodIndexFind] request back to Gazelle to look up an import in the
++// rule index; Gazelle answers it before the plugin answers the original
++// request. Requests are never sent concurrently: Gazelle waits for each
++// response before sending its next request.
++//
++// The types in this package are the schema. Fields use lowerCamelCase JSON
++// names, which also match the JSON mapping of an equivalent proto3 schema.
++// New optional fields may be added in later versions of the protocol;
++// implementations must ignore fields they don't recognize.
++package protocol
++
++import "encoding/json"
++
++// Version is the protocol version implemented by this package. Gazelle sends
++// it in [InitializeParams.ProtocolVersion]; the plugin echoes the version it
++// implements in [InitializeResult.ProtocolVersion].
++const Version = 1
++
++// Methods sent by Gazelle to a plugin.
++const (
++	// MethodInitialize is the first request. Params: [InitializeParams].
++	// Result: [InitializeResult].
++	MethodInitialize = "initialize"
++
++	// MethodConfigure is sent for directories according to
++	// [Capabilities.Configure]. Params: [ConfigureParams].
++	// Result: [ConfigureResult].
++	MethodConfigure = "configure"
++
++	// MethodFix is sent for each existing build file Gazelle will update, if
++	// [Capabilities.Fix] is set. Params: [FixParams]. Result: [FixResult].
++	MethodFix = "fix"
++
++	// MethodGenerate is sent for each directory Gazelle will update.
++	// Params: [GenerateParams]. Result: [GenerateResult].
++	MethodGenerate = "generate"
++
++	// MethodImports is sent for each rule of one of the plugin's kinds that
++	// Gazelle adds to the rule index. Params: [ImportsParams].
++	// Result: [ImportsResult].
++	MethodImports = "imports"
++
++	// MethodResolve is sent for each rule the plugin generated, after the rule
++	// index is complete. Params: [ResolveParams]. Result: [ResolveResult].
++	MethodResolve = "resolve"
++
++	// MethodFind is sent when an import can't be found in the rule index, if
++	// [Capabilities.Find] is set. Params: [FindParams]. Result: [FindResult].
++	MethodFind = "find"
++
++	// MethodOnResolve is sent after rules have been generated in all
++	// directories, before dependency resolution, if [Capabilities.Lifecycle]
++	// is set. Params and result are empty objects.
++	MethodOnResolve = "onResolve"
++
++	// MethodOnFinish is sent after build files have been written, if
++	// [Capabilities.Lifecycle] is set. Params and result are empty objects.
++	MethodOnFinish = "onFinish"
++
++	// MethodShutdown is the last request. After answering it, the plugin
++	// should exit when its stdin is closed. Params and result are empty
++	// objects. Plugins must also exit if stdin is closed without a shutdown
++	// request.
++	MethodShutdown = "shutdown"
++)
++
++// Methods sent by a plugin to Gazelle.
++const (
++	// MethodIndexFind looks up an import in Gazelle's rule index. It may only
++	// be sent while the plugin is handling a resolve or find request. Gazelle
++	// applies gazelle:resolve and gazelle:resolve_regexp directives first; if
++	// none matches, it searches the index, then asks extensions that
++	// implement find. Params: [IndexFindParams]. Result: [IndexFindResult].
++	MethodIndexFind = "index/find"
++)
++
++// InitializeParams is sent with [MethodInitialize]. It describes the
++// repository-wide configuration after command-line flags are parsed.
++type InitializeParams struct {
++	// ProtocolVersion is the highest protocol version Gazelle supports.
++	ProtocolVersion int `json:"protocolVersion"`
++
++	// RepoRoot is the absolute path to the repository root directory.
++	RepoRoot string `json:"repoRoot"`
++
++	// RepoName is the name of the repository, if known.
++	RepoName string `json:"repoName,omitempty"`
++
++	// WorkDir is the directory used to resolve relative paths on the command
++	// line (usually BUILD_WORKSPACE_DIRECTORY).
++	WorkDir string `json:"workDir"`
++
++	// ValidBuildFileNames lists the build file names Gazelle recognizes.
++	// The first is used for new files.
++	ValidBuildFileNames []string `json:"validBuildFileNames"`
++
++	// IndexLibraries is true if Gazelle builds a rule index for dependency
++	// resolution. IndexLazy is true if only selected directories are indexed
++	// (see [GenerateResult.RelsToIndex]).
++	IndexLibraries bool `json:"indexLibraries"`
++	IndexLazy      bool `json:"indexLazy"`
++
++	// ShouldFix is true if destructive fixes are allowed (gazelle fix, or
++	// gazelle update -fix).
++	ShouldFix bool `json:"shouldFix"`
++
++	// Strict is true if Gazelle exits non-zero after reporting errors.
++	Strict bool `json:"strict"`
++
++	// Bzlmod is true if the repository uses Bzlmod.
++	Bzlmod bool `json:"bzlmod"`
++}
++
++// InitializeResult is the plugin's answer to [MethodInitialize].
++type InitializeResult struct {
++	// ProtocolVersion is the protocol version the plugin implements. It must
++	// be between 1 and [InitializeParams.ProtocolVersion].
++	ProtocolVersion int `json:"protocolVersion"`
++
++	// Name is the name of the language, like "sh" or "python". It is used in
++	// log messages, in the gazelle:lang directive and -lang flag, and to
++	// associate rules with the plugin. It must not collide with another
++	// extension's name.
++	Name string `json:"name"`
++
++	// Kinds lists the kinds of rules the plugin generates.
++	Kinds []KindInfo `json:"kinds,omitempty"`
++
++	// KnownDirectives lists the directive keys the plugin interprets.
++	// Gazelle reports directives not known by any extension as errors.
++	KnownDirectives []string `json:"knownDirectives,omitempty"`
++
++	// Capabilities lists optional features the plugin supports.
++	Capabilities Capabilities `json:"capabilities"`
++}
++
++// ConfigureMode selects the directories for which Gazelle sends
++// [MethodConfigure].
++type ConfigureMode string
++
++const (
++	// ConfigureAll sends configure for every directory Gazelle visits. This
++	// is the default.
++	ConfigureAll ConfigureMode = "all"
++
++	// ConfigureBuildFiles sends configure only for directories that have a
++	// build file.
++	ConfigureBuildFiles ConfigureMode = "buildFiles"
++
++	// ConfigureDirectives sends configure only for directories whose build
++	// file contains at least one of the plugin's known directives.
++	ConfigureDirectives ConfigureMode = "directives"
++
++	// ConfigureNone never sends configure. The config value is always null.
++	ConfigureNone ConfigureMode = "none"
++)
++
++// Capabilities lists optional protocol features a plugin supports.
++type Capabilities struct {
++	// Configure selects the directories configure is sent for. Plugins that
++	// only read their own directives should use [ConfigureDirectives] to
++	// avoid a round trip for every directory.
++	Configure ConfigureMode `json:"configure,omitempty"`
++
++	// Fix is true if the plugin handles [MethodFix].
++	Fix bool `json:"fix,omitempty"`
++
++	// Find is true if the plugin handles [MethodFind].
++	Find bool `json:"find,omitempty"`
++
++	// Lifecycle is true if the plugin handles [MethodOnResolve] and
++	// [MethodOnFinish].
++	Lifecycle bool `json:"lifecycle,omitempty"`
++}
++
++// KindInfo describes a kind of rule a plugin generates, and how Gazelle should
++// match and merge rules of that kind with existing rules.
++type KindInfo struct {
++	// Name is the rule kind, like "sh_library".
++	Name string `json:"name"`
++
++	// LoadedFrom is the label of the .bzl file that defines the kind, using
++	// the module name as the repository name, like
++	// "@rules_shell//shell:sh_library.bzl". Gazelle adds load statements for
++	// generated rules. Empty for native rules.
++	LoadedFrom string `json:"loadedFrom,omitempty"`
++
++	// MatchAny is true if a generated rule may match any existing rule of the
++	// same kind when there is exactly one.
++	MatchAny bool `json:"matchAny,omitempty"`
++
++	// MatchAttrs lists attributes used to match generated and existing rules.
++	MatchAttrs []string `json:"matchAttrs,omitempty"`
++
++	// NonEmptyAttrs lists attributes that prevent an existing rule from being
++	// deleted when it matches an empty rule.
++	NonEmptyAttrs []string `json:"nonEmptyAttrs,omitempty"`
++
++	// SubstituteAttrs lists attributes containing labels of other generated
++	// rules that must be updated when those rules are renamed by matching.
++	SubstituteAttrs []string `json:"substituteAttrs,omitempty"`
++
++	// MergeableAttrs lists attributes Gazelle merges into existing rules
++	// before dependency resolution.
++	MergeableAttrs []string `json:"mergeableAttrs,omitempty"`
++
++	// ResolveAttrs lists attributes Gazelle merges into existing rules after
++	// dependency resolution.
++	ResolveAttrs []string `json:"resolveAttrs,omitempty"`
++}
++
++// File is an existing build file.
++type File struct {
++	// Path is the absolute path to the file.
++	Path string `json:"path"`
++
++	// Pkg is the Bazel package name (the slash-separated directory path
++	// relative to the repository root, "" for the root).
++	Pkg string `json:"pkg"`
++
++	// Directives lists the gazelle directives in the file, in order.
++	Directives []Directive `json:"directives,omitempty"`
++
++	// Loads lists the file's load statements.
++	Loads []Load `json:"loads,omitempty"`
++
++	// Rules lists the rules (and other top-level calls) in the file, in order.
++	Rules []Rule `json:"rules,omitempty"`
++}
++
++// Directive is a "# gazelle:key value" comment.
++type Directive struct {
++	Key   string `json:"key"`
++	Value string `json:"value"`
++}
++
++// Load is a load statement.
++type Load struct {
++	// Name is the label of the loaded .bzl file.
++	Name string `json:"name"`
++
++	// Symbols lists the names bound by the load statement.
++	Symbols []string `json:"symbols,omitempty"`
++}
++
++// Rule is a rule (a top-level call) in a build file.
++//
++// Attribute values are encoded in one of two ways. Values that can be written
++// as plain JSON go in Attrs: strings, booleans, integers, lists, and dicts with
++// string keys (as JSON objects). Any other value, like a select() or glob()
++// expression, goes in AttrExprs as Starlark source code. An attribute must not
++// appear in both maps.
++type Rule struct {
++	// Kind is the name of the rule's function, like "sh_library".
++	Kind string `json:"kind"`
++
++	// Name is the value of the rule's name attribute. It may be empty for
++	// calls like package().
++	Name string `json:"name,omitempty"`
++
++	// Attrs holds attributes with JSON-representable values.
++	Attrs map[string]any `json:"attrs,omitempty"`
++
++	// AttrExprs holds attributes whose values are Starlark expressions.
++	AttrExprs map[string]string `json:"attrExprs,omitempty"`
++
++	// Keep is true if the rule has a "# keep" comment. Only set by Gazelle.
++	Keep bool `json:"keep,omitempty"`
++}
++
++// AttrEdit is a set of changes to a rule's attributes.
++type AttrEdit struct {
++	// Attrs sets attributes to JSON-representable values.
++	Attrs map[string]any `json:"attrs,omitempty"`
++
++	// AttrExprs sets attributes to Starlark expressions.
++	AttrExprs map[string]string `json:"attrExprs,omitempty"`
++
++	// DeleteAttrs removes attributes.
++	DeleteAttrs []string `json:"deleteAttrs,omitempty"`
++}
++
++// Diagnostic is a problem reported by a plugin along with a result.
++type Diagnostic struct {
++	// Message describes the problem. Include the file path if relevant.
++	Message string `json:"message"`
++
++	// Severity is "error" (the default), "warning", or "critical". Gazelle
++	// stops early after a critical error and exits non-zero after an error in
++	// strict mode.
++	Severity string `json:"severity,omitempty"`
++}
++
++// ConfigureParams is sent with [MethodConfigure]. Configure is sent for
++// parent directories before their subdirectories.
++type ConfigureParams struct {
++	// Config is the plugin's configuration value for the parent directory,
++	// as returned by an earlier configure call. It is null for the
++	// repository root, or if no configure call has returned a value yet.
++	Config json.RawMessage `json:"config"`
++
++	// Rel is the slash-separated path to the directory, relative to the
++	// repository root ("" for the root).
++	Rel string `json:"rel"`
++
++	// File is the directory's build file, or null if there is none.
++	File *File `json:"file"`
++}
++
++// ConfigureResult is the plugin's answer to [MethodConfigure].
++type ConfigureResult struct {
++	// Config is the plugin's configuration value for the directory. It may be
++	// any JSON value. Gazelle stores it and sends it back in later requests
++	// for this directory, and as the parent configuration when configuring
++	// subdirectories. If omitted, the parent's value is kept.
++	Config json.RawMessage `json:"config,omitempty"`
++
++	Errors []Diagnostic `json:"errors,omitempty"`
++}
++
++// FixParams is sent with [MethodFix].
++type FixParams struct {
++	// Config is the plugin's configuration value for the directory.
++	Config json.RawMessage `json:"config"`
++
++	// Rel is the slash-separated path to the directory, relative to the
++	// repository root.
++	Rel string `json:"rel"`
++
++	// File is the directory's existing build file.
++	File File `json:"file"`
++
++	// ShouldFix is true if destructive changes (deleting or renaming rules)
++	// are allowed.
++	ShouldFix bool `json:"shouldFix"`
++}
++
++// FixResult is the plugin's answer to [MethodFix].
++type FixResult struct {
++	// Edits lists changes to existing rules.
++	Edits []RuleEdit `json:"edits,omitempty"`
++
++	Errors []Diagnostic `json:"errors,omitempty"`
++}
++
++// RuleEdit changes an existing rule.
++type RuleEdit struct {
++	// Index identifies the rule by its position in [File.Rules].
++	Index int `json:"index"`
++
++	// Delete removes the rule.
++	Delete bool `json:"delete,omitempty"`
++
++	// Kind, if set, renames the rule's kind.
++	Kind string `json:"kind,omitempty"`
++
++	// Name, if set, renames the rule.
++	Name string `json:"name,omitempty"`
++
++	AttrEdit
++}
++
++// GenerateParams is sent with [MethodGenerate].
++type GenerateParams struct {
++	// Config is the plugin's configuration value for the directory.
++	Config json.RawMessage `json:"config"`
++
++	// Dir is the absolute path to the directory.
++	Dir string `json:"dir"`
++
++	// Rel is the slash-separated path to the directory, relative to the
++	// repository root ("" for the root). It is also the package name.
++	Rel string `json:"rel"`
++
++	// File is the directory's existing build file, or null.
++	File *File `json:"file"`
++
++	// Subdirs lists subdirectories, RegularFiles lists regular files, and
++	// GenFiles lists files generated by rules in the existing build file.
++	// Paths are relative to Dir. RegularFiles and Subdirs include entries from
++	// subdirectories without build files when Gazelle is configured to
++	// generate only in existing packages.
++	Subdirs      []string `json:"subdirs"`
++	RegularFiles []string `json:"regularFiles"`
++	GenFiles     []string `json:"genFiles"`
++
++	// OtherGen and OtherEmpty list rules generated in this directory by
++	// extensions that ran before this plugin.
++	OtherGen   []Rule `json:"otherGen,omitempty"`
++	OtherEmpty []Rule `json:"otherEmpty,omitempty"`
++}
++
++// GenerateResult is the plugin's answer to [MethodGenerate].
++type GenerateResult struct {
++	// Gen lists generated rules. Gazelle merges them into the build file.
++	Gen []Rule `json:"gen,omitempty"`
++
++	// Empty lists rules that can't be built from the files in the directory.
++	// Matching existing rules are deleted if they are left empty after
++	// merging.
++	Empty []Rule `json:"empty,omitempty"`
++
++	// Imports, if set, has one element per rule in Gen. Each is an arbitrary
++	// JSON value describing the rule's imports. Gazelle sends it back in
++	// [ResolveParams.Imports].
++	Imports []json.RawMessage `json:"imports,omitempty"`
++
++	// RelsToIndex lists slash-separated repository-relative directories to
++	// index for dependency resolution when lazy indexing is enabled.
++	RelsToIndex []string `json:"relsToIndex,omitempty"`
++
++	Errors []Diagnostic `json:"errors,omitempty"`
++}
++
++// ImportSpec is a string by which a rule may be imported in a given language.
++type ImportSpec struct {
++	Lang string `json:"lang"`
++	Imp  string `json:"imp"`
++}
++
++// ImportsParams is sent with [MethodImports].
++type ImportsParams struct {
++	// Config is the plugin's configuration value for the directory containing
++	// the rule.
++	Config json.RawMessage `json:"config"`
++
++	// Rel is the package containing the rule.
++	Rel string `json:"rel"`
++
++	// Rule is the rule to index.
++	Rule Rule `json:"rule"`
++}
++
++// ImportsResult is the plugin's answer to [MethodImports].
++type ImportsResult struct {
++	// Imports lists the import strings for the rule.
++	Imports []ImportSpec `json:"imports,omitempty"`
++
++	// Embeds lists labels of rules this rule embeds.
++	Embeds []string `json:"embeds,omitempty"`
++
++	// NotImportable is true for rules that can't be imported, like tests.
++	NotImportable bool `json:"notImportable,omitempty"`
++
++	Errors []Diagnostic `json:"errors,omitempty"`
++}
++
++// ResolveParams is sent with [MethodResolve].
++type ResolveParams struct {
++	// Config is the plugin's configuration value for the rule's directory.
++	Config json.RawMessage `json:"config"`
++
++	// Rel is the package containing the rule.
++	Rel string `json:"rel"`
++
++	// Rule is the generated rule, after merging with the existing build file.
++	Rule Rule `json:"rule"`
++
++	// From is the rule's absolute label.
++	From string `json:"from"`
++
++	// Imports is the value returned for this rule in
++	// [GenerateResult.Imports], or null.
++	Imports json.RawMessage `json:"imports"`
++}
++
++// ResolveResult is the plugin's answer to [MethodResolve]. It describes
++// changes to the rule's attributes, usually setting "deps".
++type ResolveResult struct {
++	AttrEdit
++
++	Errors []Diagnostic `json:"errors,omitempty"`
++}
++
++// FindParams is sent with [MethodFind].
++type FindParams struct {
++	// Config is the plugin's configuration value for the directory where the
++	// import was found.
++	Config json.RawMessage `json:"config"`
++
++	// Import is the import to find.
++	Import ImportSpec `json:"import"`
++
++	// Lang is the language of the source file containing the import.
++	Lang string `json:"lang"`
++}
++
++// FindResult is the plugin's answer to [MethodFind].
++type FindResult struct {
++	Results []FindMatch `json:"results,omitempty"`
++
++	Errors []Diagnostic `json:"errors,omitempty"`
++}
++
++// FindMatch is a rule that may be imported with a given import string.
++type FindMatch struct {
++	// Label is the absolute label of the rule.
++	Label string `json:"label"`
++
++	// Embeds lists labels of rules the matched rule embeds, transitively.
++	Embeds []string `json:"embeds,omitempty"`
++
++	// RelLabel is Label written relative to the rule being resolved, suitable
++	// for use in its deps. Only set by Gazelle in [IndexFindResult] during
++	// resolve.
++	RelLabel string `json:"relLabel,omitempty"`
++
++	// SelfImport is true if the match is the rule being resolved, or a rule it
++	// embeds. Only set by Gazelle in [IndexFindResult] during resolve.
++	SelfImport bool `json:"selfImport,omitempty"`
++}
++
++// IndexFindParams is sent by a plugin with [MethodIndexFind].
++type IndexFindParams struct {
++	// Import is the import to look up.
++	Import ImportSpec `json:"import"`
++
++	// Lang is the language of the source file containing the import. If
++	// empty, the plugin's name is used.
++	Lang string `json:"lang,omitempty"`
++}
++
++// IndexFindResult is Gazelle's answer to [MethodIndexFind].
++type IndexFindResult struct {
++	Results []FindMatch `json:"results,omitempty"`
++}
++
++// Empty is used as the params and result of requests that carry no data.
++type Empty struct{}
+diff --git a/v2/plugin/server/BUILD.bazel b/v2/plugin/server/BUILD.bazel
+new file mode 100644
+index 0000000..bac92c2
+--- /dev/null
++++ b/v2/plugin/server/BUILD.bazel
+@@ -0,0 +1,27 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
++
++go_library(
++    name = "server",
++    srcs = ["server.go"],
++    importpath = "github.com/bazel-contrib/bazel-gazelle/v2/plugin/server",
++    visibility = ["//visibility:public"],
++    deps = ["//v2/plugin/protocol"],
++)
++
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = [
++        "BUILD.bazel",
++        "server.go",
++        "server_test.go",
++    ],
++    visibility = ["//visibility:public"],
++)
++
++go_test(
++    name = "server_test",
++    srcs = ["server_test.go"],
++    embed = [":server"],
++    deps = ["//v2/plugin/protocol"],
++)
+diff --git a/v2/plugin/server/server.go b/v2/plugin/server/server.go
+new file mode 100644
+index 0000000..ea7baad
+--- /dev/null
++++ b/v2/plugin/server/server.go
+@@ -0,0 +1,203 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package server implements the plugin side of Gazelle's subprocess plugin
++// protocol in Go. It's useful for plugins that are written in Go but built
++// and released separately from Gazelle. Plugins in other languages implement
++// the protocol described in package
++// [github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol] directly.
++//
++// A plugin implements [Plugin] and any of the optional interfaces in this
++// package, then calls [Main] from its main function:
++//
++//	func main() {
++//		server.Main(&myPlugin{})
++//	}
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol"
++)
++
++// Plugin is the interface all plugins implement.
++type Plugin interface {
++	// Initialize is called once before any other method. It returns the
++	// plugin's name, kinds, directives, and capabilities.
++	Initialize(context.Context, protocol.InitializeParams) (protocol.InitializeResult, error)
++}
++
++// Configurer handles configure requests.
++type Configurer interface {
++	Configure(context.Context, protocol.ConfigureParams) (protocol.ConfigureResult, error)
++}
++
++// Fixer handles fix requests. Plugins must also set the fix capability.
++type Fixer interface {
++	Fix(context.Context, protocol.FixParams) (protocol.FixResult, error)
++}
++
++// Generator handles generate requests.
++type Generator interface {
++	Generate(context.Context, protocol.GenerateParams) (protocol.GenerateResult, error)
++}
++
++// Indexer handles imports requests.
++type Indexer interface {
++	Imports(context.Context, protocol.ImportsParams) (protocol.ImportsResult, error)
++}
++
++// Resolver handles resolve requests. Resolve may call [IndexFind].
++type Resolver interface {
++	Resolve(context.Context, protocol.ResolveParams) (protocol.ResolveResult, error)
++}
++
++// Finder handles find requests. Plugins must also set the find capability.
++// Find may call [IndexFind].
++type Finder interface {
++	Find(context.Context, protocol.FindParams) (protocol.FindResult, error)
++}
++
++// LifecycleHandler handles onResolve and onFinish requests. Plugins must also
++// set the lifecycle capability.
++type LifecycleHandler interface {
++	OnResolve(context.Context) error
++	OnFinish(context.Context) error
++}
++
++// Main serves p on stdin and stdout until Gazelle closes stdin, then exits
++// the process. If serving fails, Main prints the error to stderr and exits
++// with a non-zero status.
++func Main(p Plugin) {
++	if err := Serve(context.Background(), p, os.Stdin, os.Stdout); err != nil {
++		fmt.Fprintf(os.Stderr, "plugin: %v\n", err)
++		os.Exit(1)
++	}
++	os.Exit(0)
++}
++
++// Serve reads requests from r and writes responses to w until r reaches
++// end of file. Requests are handled one at a time.
++func Serve(ctx context.Context, p Plugin, r io.Reader, w io.Writer) error {
++	conn := protocol.NewConn(r, w)
++	ctx = context.WithValue(ctx, connKey{}, conn)
++	for {
++		msg, err := conn.ReadMessage()
++		if errors.Is(err, io.EOF) {
++			return nil
++		} else if err != nil {
++			return err
++		}
++		if !msg.IsRequest() {
++			return fmt.Errorf("unexpected response with id %s", msg.ID)
++		}
++		result, err := dispatch(ctx, p, msg.Method, msg.Params)
++		if len(msg.ID) == 0 {
++			continue // notification
++		}
++		if err := conn.Reply(msg.ID, result, err); err != nil {
++			return err
++		}
++	}
++}
++
++// IndexFind asks Gazelle to look up an import in its rule index. It may only
++// be called with the context passed to Resolve or Find.
++func IndexFind(ctx context.Context, params protocol.IndexFindParams) (protocol.IndexFindResult, error) {
++	conn, ok := ctx.Value(connKey{}).(*protocol.Conn)
++	if !ok {
++		return protocol.IndexFindResult{}, errors.New("IndexFind called without a plugin request context")
++	}
++	var res protocol.IndexFindResult
++	err := conn.Call(ctx, protocol.MethodIndexFind, params, &res, nil)
++	return res, err
++}
++
++type connKey struct{}
++
++func dispatch(ctx context.Context, p Plugin, method string, raw json.RawMessage) (any, error) {
++	switch method {
++	case protocol.MethodInitialize:
++		return handle(ctx, raw, p.Initialize)
++
++	case protocol.MethodConfigure:
++		if h, ok := p.(Configurer); ok {
++			return handle(ctx, raw, h.Configure)
++		}
++		return protocol.ConfigureResult{}, nil
++
++	case protocol.MethodFix:
++		if h, ok := p.(Fixer); ok {
++			return handle(ctx, raw, h.Fix)
++		}
++
++	case protocol.MethodGenerate:
++		if h, ok := p.(Generator); ok {
++			return handle(ctx, raw, h.Generate)
++		}
++		return protocol.GenerateResult{}, nil
++
++	case protocol.MethodImports:
++		if h, ok := p.(Indexer); ok {
++			return handle(ctx, raw, h.Imports)
++		}
++		return protocol.ImportsResult{}, nil
++
++	case protocol.MethodResolve:
++		if h, ok := p.(Resolver); ok {
++			return handle(ctx, raw, h.Resolve)
++		}
++		return protocol.ResolveResult{}, nil
++
++	case protocol.MethodFind:
++		if h, ok := p.(Finder); ok {
++			return handle(ctx, raw, h.Find)
++		}
++
++	case protocol.MethodOnResolve:
++		if h, ok := p.(LifecycleHandler); ok {
++			return protocol.Empty{}, h.OnResolve(ctx)
++		}
++		return protocol.Empty{}, nil
++
++	case protocol.MethodOnFinish:
++		if h, ok := p.(LifecycleHandler); ok {
++			return protocol.Empty{}, h.OnFinish(ctx)
++		}
++		return protocol.Empty{}, nil
++
++	case protocol.MethodShutdown:
++		return protocol.Empty{}, nil
++	}
++	return nil, &protocol.Error{Code: protocol.CodeMethodNotFound, Message: fmt.Sprintf("method not found: %s", method)}
++}
++
++func handle[P, R any](ctx context.Context, raw json.RawMessage, f func(context.Context, P) (R, error)) (any, error) {
++	var params P
++	if err := protocol.Unmarshal(raw, &params); err != nil {
++		return nil, &protocol.Error{Code: protocol.CodeInvalidParams, Message: err.Error()}
++	}
++	res, err := f(ctx, params)
++	if err != nil {
++		return nil, err
++	}
++	return res, nil
++}
+diff --git a/v2/plugin/server/server_test.go b/v2/plugin/server/server_test.go
+new file mode 100644
+index 0000000..1cbd3ac
+--- /dev/null
++++ b/v2/plugin/server/server_test.go
+@@ -0,0 +1,82 @@
++/* Copyright 2026 The Bazel Authors. All rights reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package server
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/bazel-contrib/bazel-gazelle/v2/plugin/protocol"
++)
++
++type minimalPlugin struct{}
++
++func (minimalPlugin) Initialize(ctx context.Context, p protocol.InitializeParams) (protocol.InitializeResult, error) {
++	return protocol.InitializeResult{ProtocolVersion: protocol.Version, Name: "minimal:" + p.RepoRoot}, nil
++}
++
++func TestServe(t *testing.T) {
++	input := strings.Join([]string{
++		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"repoRoot":"/repo"}}`,
++		`{"jsonrpc":"2.0","method":"onResolve"}`, // notification: no response
++		`{"jsonrpc":"2.0","id":2,"method":"generate","params":{"rel":""}}`,
++		`{"jsonrpc":"2.0","id":3,"method":"fix","params":{}}`,
++		`{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"repoRoot":7}}`,
++		`{"jsonrpc":"2.0","id":5,"method":"shutdown"}`,
++	}, "\n") + "\n"
++	var out bytes.Buffer
++	if err := Serve(context.Background(), minimalPlugin{}, strings.NewReader(input), &out); err != nil {
++		t.Fatal(err)
++	}
++
++	var responses []protocol.Message
++	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
++		var msg protocol.Message
++		if err := json.Unmarshal([]byte(line), &msg); err != nil {
++			t.Fatalf("invalid response %q: %v", line, err)
++		}
++		responses = append(responses, msg)
++	}
++	if len(responses) != 5 {
++		t.Fatalf("got %d responses; want 5:\n%s", len(responses), out.String())
++	}
++
++	var init protocol.InitializeResult
++	if err := json.Unmarshal(responses[0].Result, &init); err != nil || init.Name != "minimal:/repo" {
++		t.Errorf("initialize: got %s, %v", responses[0].Result, err)
++	}
++	if string(responses[1].ID) != "2" || responses[1].Error != nil {
++		t.Errorf("generate: unimplemented optional methods should return an empty result, got %+v", responses[1])
++	}
++	if e := responses[2].Error; e == nil || e.Code != protocol.CodeMethodNotFound {
++		t.Errorf("fix: got %+v; want method not found", responses[2])
++	}
++	if e := responses[3].Error; string(responses[3].ID) != "4" || e == nil || e.Code != protocol.CodeInvalidParams {
++		t.Errorf("initialize with bad params: got %+v; want invalid params", responses[3])
++	}
++	if string(responses[4].ID) != "5" || responses[4].Error != nil {
++		t.Errorf("shutdown: got %+v", responses[4])
++	}
++}
++
++func TestIndexFindOutsideRequest(t *testing.T) {
++	if _, err := IndexFind(context.Background(), protocol.IndexFindParams{}); err == nil {
++		t.Fatal("expected error")
++	}
++}
+-- 
+2.43.0
+

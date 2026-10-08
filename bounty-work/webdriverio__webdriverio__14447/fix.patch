@@ -1,0 +1,245 @@
+From fe7e6f6a3c50f6cc947e2b2f3e3d5ad96cb2caf4 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:20:57 +0000
+Subject: [PATCH] fix(@wdio/config): resolve --spec glob patterns from the
+ current working directory
+
+The docs say a `--spec` path is resolved from the current working
+directory. That was true for a file, but a glob pattern with a directory
+was kept relative and globbed from the directory of the config file. With
+the config in a sub folder, `--spec ./specs/*.js` found nothing while
+`--spec ./specs/login.js` worked, and the glob needed `../specs/*.js`
+instead.
+
+`makeRelativeToCWD` now resolves every `--spec` value with a directory
+from the current working directory, also a glob pattern. A value without
+a directory (`login`, `*.e2e.js`) still matches spec files by name.
+
+A CLI file that `isFile()` finds relative to the current working
+directory is now also made absolute from there, not from the config
+directory, so a bare file name of the working directory points to the
+right file.
+
+The v10 migration guide and the migration skill describe the change.
+
+Fix #14447
+---
+ .agents/skills/wdio-v10-migration/SKILL.md    |  1 +
+ packages/wdio-config/src/node/ConfigParser.ts |  6 +-
+ packages/wdio-config/src/node/utils.ts        |  8 ++-
+ .../tests/node/configparser.test.ts           | 55 +++++++++++++++++++
+ packages/wdio-config/tests/node/utils.test.ts | 47 ++++++++++++++++
+ website/docs/v10Migration.md                  | 12 ++++
+ 6 files changed, 127 insertions(+), 2 deletions(-)
+ create mode 100644 packages/wdio-config/tests/node/utils.test.ts
+
+diff --git a/.agents/skills/wdio-v10-migration/SKILL.md b/.agents/skills/wdio-v10-migration/SKILL.md
+index 2eaf9d2c4..4d7666013 100644
+--- a/.agents/skills/wdio-v10-migration/SKILL.md
++++ b/.agents/skills/wdio-v10-migration/SKILL.md
+@@ -51,6 +51,7 @@ Do not set `strictSelectors: false` unless the user asks to keep the v9 behavior
+ | `multiremote(` | `multiRemote(` |
+ | `MultiremoteConfig` | `MultiRemoteConfig` |
+ | capability `specs` / `exclude` | `wdio:specs` / `wdio:exclude`. Top-level config keys stay `specs` and `exclude`. A bare capability list is ignored. |
++| `--spec "../dir/*.js"` written relative to the config file | `--spec "./dir/*.js"` relative to the current working directory. A `--spec` glob with a directory now resolves like a file path. |
+ | Sauce `tunnelIdentifier` / `parentTunnel` | `tunnelName` / `tunnelOwner` |
+ | `import type { Element }` from `webdriverio` | `WebdriverIO.Element` (also `MultiRemoteBrowser`, `MultiRemoteElement`) |
+ | `onAfterCommand` argument `name` | `command` |
+diff --git a/packages/wdio-config/src/node/ConfigParser.ts b/packages/wdio-config/src/node/ConfigParser.ts
+index 90edfcba7..bfbc811cc 100644
+--- a/packages/wdio-config/src/node/ConfigParser.ts
++++ b/packages/wdio-config/src/node/ConfigParser.ts
+@@ -411,10 +411,14 @@ export default class ConfigParser {
+                 this._pathService
+             )
+             if (this._pathService.isFile(filteredFile)) {
++                /**
++                 * `isFile` found a relative path from the current working directory,
++                 * so it has to become absolute from there, not from the config file (#14447)
++                 */
+                 filesToFilter.add(
+                     this._pathService.ensureAbsolutePath(
+                         filteredFile,
+-                        path.dirname(this.#configFilePath)
++                        process.cwd()
+                     )
+                 )
+             } else if (globMatchedFiles.length) {
+diff --git a/packages/wdio-config/src/node/utils.ts b/packages/wdio-config/src/node/utils.ts
+index 92dc53a49..bf12ac2e2 100644
+--- a/packages/wdio-config/src/node/utils.ts
++++ b/packages/wdio-config/src/node/utils.ts
+@@ -1,6 +1,12 @@
+ import url from 'node:url'
+ import path from 'node:path'
+ 
++/**
++ * `--spec` values are resolved from the current working directory. A value with a
++ * directory becomes an absolute path, the same for a file (`./specs/login.js`) and
++ * for a glob pattern (`./specs/*.js`), see #14447. A value without a directory
++ * (`login`, `*.spec.js`) stays as it is, as it matches spec files by name.
++ */
+ export function makeRelativeToCWD (files: (string | string[])[] = []): (string | string[])[] {
+     const returnFiles: (string | string[])[] = []
+ 
+@@ -12,7 +18,7 @@ export function makeRelativeToCWD (files: (string | string[])[] = []): (string |
+ 
+         returnFiles.push(file.startsWith('file:///')
+             ? url.fileURLToPath(file)
+-            : file.includes('/') && !file.includes('*')
++            : file.includes('/') || file.includes(path.sep)
+                 ? path.resolve(process.cwd(), file)
+                 : file
+         )
+diff --git a/packages/wdio-config/tests/node/configparser.test.ts b/packages/wdio-config/tests/node/configparser.test.ts
+index c6c323877..1eee41928 100644
+--- a/packages/wdio-config/tests/node/configparser.test.ts
++++ b/packages/wdio-config/tests/node/configparser.test.ts
+@@ -4,6 +4,7 @@ import path from 'node:path'
+ import { vi, describe, it, expect, } from 'vitest'
+ 
+ import ConfigParser from '../../src/node/ConfigParser.js'
++import FileSystemPathService from '../../src/node/FileSystemPathService.js'
+ import type { MockFileContent } from '../lib/MockFileContentBuilder.js'
+ import MockFileContentBuilder from '../lib/MockFileContentBuilder.js'
+ import type { FilePathsAndContents, MockSystemFilePath, MockSystemFolderPath } from '../lib/MockPathService.js'
+@@ -613,6 +614,60 @@ describe('ConfigParser', () => {
+         })
+     })
+ 
++    describe('--spec from a working directory that is not the config directory (#14447)', () => {
++        /**
++         * run from `tests/`, the parent of the config directory `tests/__fixtures__`
++         */
++        const cwd = path.resolve(FIXTURES_PATH, '..')
++        const fileUrl = (...segments: string[]) => url.pathToFileURL(path.resolve(...segments)).href
++        const prefixSpecs = [
++            fileUrl(FIXTURES_PATH, 'prefix-test-01.ts'),
++            fileUrl(FIXTURES_PATH, 'prefix-test-02.ts')
++        ]
++
++        /**
++         * `fs` reads a relative path from the real working directory, which a
++         * worker thread cannot change, so read it from the mocked one
++         */
++        class CwdPathService extends FileSystemPathService {
++            isFile (filepath: string) {
++                return super.isFile(path.resolve(process.cwd(), filepath))
++            }
++        }
++
++        async function getSpecsFor (spec: string[]) {
++            vi.spyOn(process, 'cwd').mockReturnValue(cwd)
++            try {
++                const args = { spec }
++                const configParser = new ConfigParser(FIXTURES_CONF, args, new CwdPathService())
++                await configParser.initialize(args)
++                return configParser.getSpecs()
++            } finally {
++                vi.mocked(process.cwd).mockRestore()
++            }
++        }
++
++        it('resolves a glob pattern with a directory from the working directory', async () => {
++            expect(await getSpecsFor(['./__fixtures__/prefix-test-0*.ts'])).toEqual(prefixSpecs)
++        })
++
++        it('resolves a file with a directory from the working directory', async () => {
++            expect(await getSpecsFor(['./__fixtures__/prefix-test-01.ts'])).toEqual([prefixSpecs[0]])
++        })
++
++        it('resolves a file without a directory from the working directory', async () => {
++            expect(await getSpecsFor(['utils.test.ts'])).toEqual([fileUrl(cwd, 'utils.test.ts')])
++        })
++
++        it('still matches a glob pattern without a directory by file name', async () => {
++            expect(await getSpecsFor(['prefix-test-0*.ts'])).toEqual(prefixSpecs)
++        })
++
++        it('does not resolve a glob pattern from the config directory', async () => {
++            await expect(getSpecsFor(['./prefix-test-0*.ts'])).rejects.toThrow('not found')
++        })
++    })
++
+     describe('addService', () => {
+         it('should only add functions', async () => {
+             const configParser = new ConfigParser(FIXTURES_CONF)
+diff --git a/packages/wdio-config/tests/node/utils.test.ts b/packages/wdio-config/tests/node/utils.test.ts
+new file mode 100644
+index 000000000..de361f338
+--- /dev/null
++++ b/packages/wdio-config/tests/node/utils.test.ts
+@@ -0,0 +1,47 @@
++import url from 'node:url'
++import path from 'node:path'
++
++import { describe, it, expect, vi, afterEach } from 'vitest'
++
++import { makeRelativeToCWD } from '../../src/node/utils.js'
++
++const cwd = path.resolve('/', 'project', 'root')
++
++describe('makeRelativeToCWD', () => {
++    afterEach(() => {
++        vi.restoreAllMocks()
++    })
++
++    it('resolves a file with a directory from the current working directory', () => {
++        vi.spyOn(process, 'cwd').mockReturnValue(cwd)
++        expect(makeRelativeToCWD(['./specs/login.spec.js', '../other/login.spec.js'])).toEqual([
++            path.resolve(cwd, 'specs', 'login.spec.js'),
++            path.resolve(cwd, '..', 'other', 'login.spec.js')
++        ])
++    })
++
++    it('resolves a glob pattern with a directory from the current working directory (#14447)', () => {
++        vi.spyOn(process, 'cwd').mockReturnValue(cwd)
++        expect(makeRelativeToCWD(['./specs/*.spec.js', '../other/**/*.spec.js'])).toEqual([
++            path.resolve(cwd, 'specs', '*.spec.js'),
++            path.resolve(cwd, '..', 'other', '**', '*.spec.js')
++        ])
++    })
++
++    it('keeps a value without a directory, as it matches spec files by name', () => {
++        vi.spyOn(process, 'cwd').mockReturnValue(cwd)
++        expect(makeRelativeToCWD(['login', 'login.spec.js', '*.spec.js'])).toEqual(['login', 'login.spec.js', '*.spec.js'])
++    })
++
++    it('turns a file URL into a path', () => {
++        const file = path.resolve(cwd, 'specs', 'login.spec.js')
++        expect(makeRelativeToCWD([url.pathToFileURL(file).href])).toEqual([file])
++    })
++
++    it('resolves the values of a group', () => {
++        vi.spyOn(process, 'cwd').mockReturnValue(cwd)
++        expect(makeRelativeToCWD([['./specs/*.spec.js', 'login']])).toEqual([
++            [path.resolve(cwd, 'specs', '*.spec.js'), 'login']
++        ])
++    })
++})
+diff --git a/website/docs/v10Migration.md b/website/docs/v10Migration.md
+index fc18f1ac0..ed6394d76 100644
+--- a/website/docs/v10Migration.md
++++ b/website/docs/v10Migration.md
+@@ -195,6 +195,18 @@ The top-level config keys stay `specs` and `exclude`. A leftover bare list on a
+ 
+ The `tunnelIdentifier` and `parentTunnel` aliases were removed from the Sauce Labs options types. Use `tunnelName` and `tunnelOwner`.
+ 
++## `--spec` glob patterns
++
++A `--spec` value with a directory is resolved from the current working directory, also when it is a glob pattern. In v9 a glob pattern was resolved from the directory of the config file, a file path from the current working directory. This only matters when you run `wdio` from another directory than the one of the config file.
++
++```diff
++  # run from the project root, with the config in ./config/wdio.conf.js
++- npx wdio ./config/wdio.conf.js --spec "../test/specs/*.js"
+++ npx wdio ./config/wdio.conf.js --spec "./test/specs/*.js"
++```
++
++A value without a directory, like `--spec login` or `--spec "*.e2e.js"`, still matches the spec files by name.
++
+ ## TypeScript
+ 
+ The `Element`, `MultiRemoteBrowser` and `MultiRemoteElement` types exported by `webdriverio` were removed. Use the global `WebdriverIO` namespace.
+-- 
+2.43.0
+

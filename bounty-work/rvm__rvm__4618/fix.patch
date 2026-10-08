@@ -1,0 +1,216 @@
+From 703f1c5d82476589b250a1b3acec6f72799f1506 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 06:00:31 +0000
+Subject: [PATCH] Detect system again after teardown and harden PATH cleanup
+
+Follow-up to #4618. #4711 fixed the reported `sed: illegal option -- r`
+error by removing the `sed` call from `__rvm_remove_from_path`, but the root
+cause described in the issue is still present: `__rvm_teardown` unsets the
+`_system_*` variables after every command (#4584) and nothing detects them
+again before the cd hook runs. Code reached from the hook therefore sees an
+empty system, e.g. `__rvm_db_system` skips system specific entries and a
+`.ruby-version` of `1.8.7` resolves to `ruby-1.8.7-head` instead of the
+`ruby-1.8.7-p374` configured for CentOS 5.
+
+* add `__rvm_detect_system_if_needed` and call it from `__rvm_db_system`
+  and the other functions that read `_system_*` outside of loading
+  (interpreter selection for macruby/truffleruby/maglev, remote binary
+  path, travis binaries check, user shell detection)
+* `__rvm_remove_from_path` kept turning `/` entries into empty entries,
+  which adds the current directory to PATH, and did not strip a trailing
+  slash from the last entry or from the value being removed
+
+Adds tests/fast/remove_from_path_comment_test.sh (slash cleanup, root
+entries, trailing slashes, the #4759 guard) and
+tests/fast/system_detection_comment_test.sh (lookups after teardown, the cd
+hook using system specific settings via a user db override).
+---
+ CHANGELOG.md                                |  1 +
+ scripts/functions/db                        | 16 ++++++++++++++
+ scripts/functions/selector_interpreters     |  3 +++
+ scripts/functions/utility                   | 23 +++++++++++++++++++--
+ scripts/functions/utility_system            |  3 +++
+ tests/fast/remove_from_path_comment_test.sh | 15 ++++++++++++++
+ tests/fast/system_detection_comment_test.sh |  7 +++++++
+ 7 files changed, 66 insertions(+), 2 deletions(-)
+ create mode 100644 tests/fast/remove_from_path_comment_test.sh
+ create mode 100644 tests/fast/system_detection_comment_test.sh
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1bbc8f4e..dc46c664 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -50,6 +50,7 @@
+ * Fix autogen.sh call for MRI's on OpenBSD [\#5620](https://github.com/rvm/rvm/pull/5620)
+ * Update TruffleRuby dependencies for TruffleRuby 33+ [\#5632](https://github.com/rvm/rvm/pull/5632)
+ * Avoid undefined `rvm_shell_nounset` variable [\#5638](https://github.com/rvm/rvm/pull/5638)
++* Detect the system again after `__rvm_teardown` so the cd hook and other later lookups use system specific settings, keep `/` entries and strip trailing slashes of the last entry when cleaning `PATH` [\#4618](https://github.com/rvm/rvm/issues/4618)
+ 
+ #### New interpreters
+ 
+diff --git a/scripts/functions/db b/scripts/functions/db
+index 4db74f04..4a68d274 100755
+--- a/scripts/functions/db
++++ b/scripts/functions/db
+@@ -1,10 +1,26 @@
+ #!/usr/bin/env bash
+ 
++# _system_* variables are detected when RVM is loaded but __rvm_teardown unsets
++# them after every command (#4584), so code running later in the same shell -
++# like the cd hook or `rvm use` - has to detect them again
++__rvm_detect_system_if_needed()
++{
++  if
++    [[ -z "${_system_type:-}" ]] &&
++    \typeset -f __rvm_detect_system >/dev/null 2>&1
++  then
++    __rvm_detect_system
++    __rvm_detect_system_override
++  fi
++  true
++}
++
+ # Query the rvm key-value database for a specific key
+ # allow system specific overrides + warnings / errors
+ __rvm_db_system()
+ {
+   \typeset __key __message
++  __rvm_detect_system_if_needed
+   for __key in "${_system_name}_${_system_version}_$1" "${_system_name}_$1" "$1"
+   do
+     if __rvm_db "${__key}_error" __message
+diff --git a/scripts/functions/selector_interpreters b/scripts/functions/selector_interpreters
+index 2a9792ae..25072e7a 100644
+--- a/scripts/functions/selector_interpreters
++++ b/scripts/functions/selector_interpreters
+@@ -171,6 +171,7 @@ __rvm_select_macruby_nightly()
+ 
+ __rvm_select_interpreter_macruby()
+ {
++  __rvm_detect_system_if_needed
+   if
+     [[ "Darwin" == "${_system_type}" ]]
+   then
+@@ -249,6 +250,7 @@ __rvm_truffleruby_set_version()
+ 
+ __rvm_truffleruby_set_rvm_ruby_url()
+ {
++  __rvm_detect_system_if_needed
+   case "${_system_type}" in
+     Linux) platform="linux" ;;
+     Darwin) platform="macos" ;;
+@@ -296,6 +298,7 @@ __rvm_select_interpreter_truffleruby()
+ 
+ __rvm_select_interpreter_maglev()
+ {
++  __rvm_detect_system_if_needed
+   rvm_ruby_patch_level=""
+   maglev_url="$(__rvm_db "maglev_url")"
+ 
+diff --git a/scripts/functions/utility b/scripts/functions/utility
+index 81a0e9a9..a9707c1c 100755
+--- a/scripts/functions/utility
++++ b/scripts/functions/utility
+@@ -53,8 +53,14 @@ __rvm_strip()
+ __rvm_remove_from_path()
+ {
+   export PATH
+-  \typeset _value
++  \typeset _value _prefix
+   _value="${1//+(\/)//}"
++  # PATH entries are compared without trailing slashes, see below
++  if
++    [[ "$_value" == *[!/]"/" ]]
++  then
++    _value="${_value%/}"
++  fi
+ 
+   # Guard to prevent removal of the entire path
+   # https://github.com/rvm/rvm/issues/4759
+@@ -66,7 +72,20 @@ __rvm_remove_from_path()
+ 
+   # remove multiple slashes https://github.com/rvm/rvm/issues/1364
+   while [[ "$PATH" == *"//"* ]] ; do PATH="${PATH/\/\///}" ; done
+-  while [[ "$PATH" == *"/:"* ]] ; do PATH="${PATH/\/:/:}" ; done
++
++  # remove trailing slashes, but keep "/" entries - turning them into empty
++  # entries would add the current directory to PATH
++  while
++    [[ "$PATH" == *[!:]"/:"* ]]
++  do
++    _prefix="${PATH%%[!:]/:*}"
++    PATH="${PATH:0:${#_prefix}+1}${PATH:${#_prefix}+2}"
++  done
++  if
++    [[ "$PATH" == *[!:]"/" ]]
++  then
++    PATH="${PATH%/}"
++  fi
+ 
+   if
+     __rvm_string_match ":$PATH:" "*:${_value}:*"
+diff --git a/scripts/functions/utility_system b/scripts/functions/utility_system
+index 875ed44e..5aa445f8 100644
+--- a/scripts/functions/utility_system
++++ b/scripts/functions/utility_system
+@@ -3,6 +3,7 @@
+ # params: [printf_if=-] [suffix]
+ __rvm_system_path()
+ {
++  __rvm_detect_system_if_needed
+   rvm_remote_server_path="$(__rvm_db "rvm_remote_server_path${2:-}")"
+   [[ -n "${rvm_remote_server_path}" ]] ||
+   rvm_remote_server_path="${_system_name_lowercase}/${_system_version}/${_system_arch}"
+@@ -63,6 +64,7 @@ __rvm_ruby_package_file()
+ 
+ __rvm_include_travis_binaries()
+ {
++  __rvm_detect_system_if_needed
+   if [[ $rvm_remote_server_url == *"travis"* && $TRAVIS != true && $_system_name_lowercase == "osx" ]]
+   then
+       rvm_debug "Travis binaries for OSX are not movable and can't be used outside of Travis environment. \
+@@ -223,6 +225,7 @@ __list_remote_for_s3()
+ 
+ __rvm_get_user_shell()
+ {
++  __rvm_detect_system_if_needed
+   case "${_system_type}:${_system_name}" in
+     (Windows:Mingw|Linux:Termux)
+       __shell="$( echo $SHELL )" ||
+diff --git a/tests/fast/remove_from_path_comment_test.sh b/tests/fast/remove_from_path_comment_test.sh
+new file mode 100644
+index 00000000..8d27dc96
+--- /dev/null
++++ b/tests/fast/remove_from_path_comment_test.sh
+@@ -0,0 +1,15 @@
++source "$rvm_path/scripts/rvm"
++
++: duplicate and trailing slashes are removed without depending on system detection, see issues 1364 and 4618
++( unset _system_type ; PATH="/usr//bin/:/bin//:/usr/sbin/" ; __rvm_remove_from_path /nonexistent ; echo "$PATH" ) 2>&1 # status=0; match=/^/usr/bin:/bin:/usr/sbin$/; match!=/illegal option/
++
++: root entries are kept, an empty entry would add the current directory to PATH
++( PATH="/:/usr/bin:/:/bin" ; __rvm_remove_from_path /nonexistent ; echo "$PATH" ) # match=/^/:/usr/bin:/:/bin$/
++
++: entries are removed regardless of trailing slashes
++( PATH="/usr/bin:/opt/rvm-test/bin/:/bin:/opt/rvm-test/bin/" ; __rvm_remove_from_path /opt/rvm-test/bin ; echo "$PATH" ) # match=/^/usr/bin:/bin$/
++( PATH="/usr/bin:/opt/rvm-test/bin:/bin" ; __rvm_remove_from_path /opt/rvm-test/bin/ ; echo "$PATH" ) # match=/^/usr/bin:/bin$/
++
++: removing the whole PATH is refused, see issue 4759
++( PATH="/usr/bin:/bin" ; __rvm_remove_from_path "/*" ; echo "$PATH" ) # match=/^/usr/bin:/bin$/
++( PATH="/usr/bin:/bin" ; __rvm_remove_from_path "//*" ; echo "$PATH" ) # match=/^/usr/bin:/bin$/
+diff --git a/tests/fast/system_detection_comment_test.sh b/tests/fast/system_detection_comment_test.sh
+new file mode 100644
+index 00000000..8670dc4e
+--- /dev/null
++++ b/tests/fast/system_detection_comment_test.sh
+@@ -0,0 +1,7 @@
++source "$rvm_path/scripts/rvm"
++
++: system details are unset after every command, lookups detect them again, see issue 4618
++( unset _system_type _system_name _system_version ; __rvm_db_system ruby_version __rvm_test_value ; echo "${_system_type:-none}" ) # match=/^(Linux|Darwin)$/
++
++: the cd hook uses system specific settings, CentOS 5 is simulated with a user db override
++bash -c 'db="$rvm_path/user/db" ; d="$(mktemp -d)" ; touch "$db" ; cp "$db" "$d/db.bak" ; trap "mv -f \"$d/db.bak\" \"$db\" ; rm -rf \"$d\"" EXIT ; printf "system_name=CentOS\nsystem_version=5\n" >> "$db" ; mkdir "$d/proj" ; echo 1.8.7 > "$d/proj/.ruby-version" ; source "$rvm_path/scripts/rvm" ; cd "$d/proj"' 2>&1 # match=/ruby-1.8.7-p374/; match!=/ruby-1.8.7-head/
+-- 
+2.43.0
+

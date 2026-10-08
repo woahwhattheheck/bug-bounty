@@ -7,7 +7,18 @@ Status: **HANDOFF** (help_request: validation + fixes on top of the existing ori
 - Carrier PR: https://github.com/gogs/gogs/pull/8421 by @woahwhattheheck, branch `woahwhattheheck:feat-git-protocol-server-1929`, OPEN, non-draft, review requested from @unknwon (code owner)
 - Payout evidence: IssueHunt repo rewardedAmount is 0, so there is no payout history in either direction (no merged-but-unpaid issues found). Maintainer is active (Go 1.27 upgrade #8415 and #8416 merged recently).
 - Base for this patch: carrier PR head `2c3ce8c8c64f9b857ebfa6e345c2a6dfc069a1fe` (its merge-base with upstream `main` is `dbbd717e923694c36f41b0360515b4374bbe6ee0`, the current `main` tip, so the PR is up to date with main)
-- Result head after applying: `986c4c6eb0335ad72bc90fa40adbf8778d8c0cda` (2 commits, author `woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>`)
+- Result head after applying locally: `986c4c6eb0335ad72bc90fa40adbf8778d8c0cda` (2 commits, author `woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>`)
+- **Live PR head now: `5f1cd49535370197b78eb46b482f2c97ce7ed723`**. The patch content is already on #8421 (see below).
+
+## Current state (reviewer re-check, 2026-10-08)
+
+- A fleet publisher fast-forwarded the PR branch `feat-git-protocol-server-1929` from `2c3ce8c8` to `8a580253` (`fix(gitdaemon): canonicalize wiki request paths and enforce wiki access policy`) and then to `5f1cd495` (`test(gitdaemon): cover canonical wiki paths and formatter alignment`). Both commits are authored as `woahwhattheheck`, with the same email as the earlier PR commits.
+- The tree of `5f1cd495` is `f85318dc80f02106c47562ee13fc0f08b7661534`. This is byte-identical to the tree produced by `git am --3way fix.patch` on `2c3ce8c8` (blobs `gitdaemon.go` `f7a395f6`, `gitdaemon_test.go` `4e5ddf9a`). **Nothing in fix.patch remains to push.** fix.patch is kept as the record of the change.
+- The PR is 12 commits on top of `main@dbbd717e` (the current `main` tip). The full PR diff applies cleanly to `main` (7 files, +658).
+- Focused validation re-run at `5f1cd495` with Go 1.27.1 (output in the Validation section): gofmt (1.27.1 binary), go vet, go test on gitdaemon+conf, and -race -shuffle on gitdaemon all pass.
+- Wiki-gate probe at `5f1cd495`: 22 crafted request paths were sent through `parseRequest`, then through a real `git upload-pack --advertise-refs` in a root that holds `alice/repo.git` and `alice/repo.wiki.git`. Every path Git resolves to the wiki is flagged `wiki=true`. These include `/alice/repo.wiki`, `alice/repo.wiki` (no leading slash), `/ALICE/REPO.WIKI`, a Kelvin-sign `K` variant and a trailing tab. Traversal, `./`, `//` and trailing-slash forms are rejected. `*.wiki` is a reserved repository-name pattern in `internal/database/repo.go`, so the single `.wiki` suffix split cannot shadow a real repository. Owner and repository lookups match on `lower_name`, which is consistent with the lowercased canonical path.
+- The live PR body has **no `Closes #1929` line**. It still cites head `71b6bb35` and says no Go toolchain was available. Its existing "Current-head delivery and IssueHunt compensation" section asks for the $20. The ready-to-paste sections below fix the head and validation text and add `Closes #1929`.
+- PR checks page: `Go` and `Shell` `pull_request` runs are listed as "completed with no jobs". Workflow runs for an outside contributor usually need maintainer approval.
 
 ## What was done
 
@@ -67,20 +78,43 @@ $ go test -count=1 -v -run TestParseRequest ./internal/gitdaemon/ | grep -E -- '
 
 All gitdaemon tests at the fixed head: `TestReadPacketLine`, `TestParseRequest`, `TestAnonymousGitReadPolicy`, `TestSendError`, `TestGitSessionLimits`, `TestGitSessionAdmission` all PASS. The conf package (`TestInit` and the rest) passes unchanged. No full-repo suite was run. The end-to-end `handleConn` path needs a database and was not run.
 
-## How to apply (fast-forward on the existing PR branch, no force push)
+Reviewer re-run at the live PR head `5f1cd495`, in a fresh shallow clone with the same tree as `986c4c6e`:
+
+```
+$ export GOTOOLCHAIN=go1.27.1
+$ ~/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.1.linux-amd64/bin/gofmt -l internal/gitdaemon/ internal/conf/conf.go internal/conf/static.go cmd/gogs/internal/web/web.go
+(no output, exit 0)
+$ go vet ./internal/gitdaemon/ ./internal/conf/ ./cmd/gogs/internal/web/
+(no output, exit 0)
+$ go test -count=1 ./internal/gitdaemon/ ./internal/conf/
+ok  	gogs.io/gogs/internal/gitdaemon	0.085s
+ok  	gogs.io/gogs/internal/conf	0.160s
+$ go test -count=1 -race -shuffle=on ./internal/gitdaemon/
+ok  	gogs.io/gogs/internal/gitdaemon	1.057s
+$ go test -count=1 -v -run 'TestParseRequest|TestAnonymousGitReadPolicy' ./internal/gitdaemon/
+--- PASS: TestParseRequest (20/20 subtests)
+--- PASS: TestAnonymousGitReadPolicy (9/9 subtests)
+```
+
+## How to apply
+
+**Source: already applied.** PR #8421 head `5f1cd495` contains this exact change (tree `f85318dc`), so there is nothing to push. Running `git am` on the current head fails because the change is already present. Resetting the branch to `2c3ce8c8` would drop `8a580253` and `5f1cd495`.
+
+To verify that the live head matches this patch:
 
 ```
 git fetch https://github.com/gogs/gogs refs/pull/8421/head
-git checkout -B feat-git-protocol-server-1929 FETCH_HEAD   # must be 2c3ce8c8c64f9b857ebfa6e345c2a6dfc069a1fe
-git am bounty-work/gogs__gogs__1929/fix.patch
-git push <woahwhattheheck fork remote> feat-git-protocol-server-1929   # 2c3ce8c8 -> 986c4c6e (fast-forward)
+git rev-parse FETCH_HEAD            # 5f1cd49535370197b78eb46b482f2c97ce7ed723
+git checkout -q --detach 2c3ce8c8c64f9b857ebfa6e345c2a6dfc069a1fe
+git am --3way bounty-work/gogs__gogs__1929/fix.patch
+git rev-parse HEAD^{tree} FETCH_HEAD^{tree}   # both f85318dc80f02106c47562ee13fc0f08b7661534
 ```
 
-These two commits do not carry `[skip ci]`, so pushing them lets the Go workflow (lint + tests) run on the PR. A maintainer may still need to approve workflow runs for an outside contributor.
+The remaining publisher step is the PR body update below. Neither `8a580253` nor `5f1cd495` carries `[skip ci]`.
 
 ## Notes for the publisher (facts, not changes)
 
-- The PR body still names `71b6bb35` as the head and says the Go tests were not run. It can now cite the head `986c4c6e` and the validation above. The suggested replacement sections are below.
+- The PR body still names `71b6bb35` as the head, says the Go tests were not run, and has no `Closes #1929`. It can now cite the live head `5f1cd495` and the validation above. The suggested replacement sections are below. The `## Bounty` section below can replace the existing "Current-head delivery and IssueHunt compensation" section so the body does not carry two compensation sections.
 - `.github/CONTRIBUTING.md` asks for a Discussions proposal for new features and says "Communicate on the issue you are intended to pick up before starting working on it". #1929 is labelled `help wanted`.
 - Complementary PR #8360 (UI exposure of the git:// clone URL) is separate and unaffected.
 - Minor observations, left unchanged:
@@ -91,14 +125,14 @@ These two commits do not carry `[skip ci]`, so pushing them lets the Go workflow
 
 Title (unchanged): `server: add built-in Git protocol (git://) server`
 
-Replace the head/validation part of the body with:
+Replace the stale head/validation paragraphs and the existing compensation section of the body with:
 
 ```
 Closes #1929
 
 ## Test plan
 
-Head: 986c4c6eb0335ad72bc90fa40adbf8778d8c0cda, Go 1.27.1
+Head: 5f1cd49535370197b78eb46b482f2c97ce7ed723, Go 1.27.1
 
 - `gofmt -l internal/gitdaemon/ internal/conf/conf.go internal/conf/static.go cmd/gogs/internal/web/web.go` → clean
 - `go vet ./internal/gitdaemon/ ./internal/conf/ ./cmd/gogs/internal/web/` → clean

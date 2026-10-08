@@ -1,0 +1,2650 @@
+From 23d0f5f3141806558522f8d4655061ba80d14873 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:24:07 +0000
+Subject: [PATCH] [Rendering] feat: add decals
+
+Add a DecalComponent that projects any material onto the opaque geometry
+inside a box volume, along the forward axis of its entity, to add details
+such as bullet holes, signs, stains or footprints.
+
+- RenderDecal is a RenderMesh rendered by the MeshRenderFeature, so decals
+  are lit and shadowed by the existing forward and clustered lighting.
+- DecalProjection.sdsl reconstructs the receiving surface (position, normal
+  and tangent frame) from the depth buffer and replaces the surface streams
+  before the material and the lighting are evaluated. Angle and depth fades,
+  opacity, late discard to keep texture derivatives valid on the borders.
+- DecalRenderFeature selects the decal shader permutation, uploads the
+  per-decal parameters and sets up the volume pipeline state (back faces,
+  GreaterEqual depth test, no depth write, material blend state).
+- ForwardRenderer.DecalRenderStage is drawn between the opaque and the
+  transparent stages with the depth buffer bound as a shader resource.
+  DecalSortMode sorts decals by sort order, then creation order.
+- The default graphics compositor and its template get the decal stage.
+  Older graphics compositors get the DecalRenderFeature at runtime and
+  render decals in the transparent stage.
+- RenderSystem routes render objects to the render feature of their closest
+  base type when no feature supports their exact type.
+- Editor gizmo showing the projection volume and direction.
+- First-person shooter template: bullet hole decals.
+- Unit tests, shader compilation tests and GPU rendering tests.
+
+Closes #24
+---
+ .../Assets/GraphicsCompositor.sdgfxcomp       |   9 +
+ .../Assets/MainScene.sdscene                  |   8 +
+ .../BulletHoleDecals.cs                       | 234 ++++++++++++
+ .../AssetEditors/Gizmos/DecalGizmo.cs         | 135 +++++++
+ .../DecalRenderingTests.cs                    | 322 +++++++++++++++++
+ .../Stride.Engine.Tests.csproj                |   2 +
+ .../engine/Stride.Engine.Tests/TestDecals.cs  | 333 ++++++++++++++++++
+ ...DefaultGraphicsCompositorLevel10.sdgfxcomp |   9 +
+ .../Stride.Engine/Engine/DecalComponent.cs    | 111 ++++++
+ .../Rendering/Compositing/ForwardRenderer.cs  |  86 ++++-
+ .../Compositing/GraphicsCompositorHelper.cs   |   6 +
+ .../Rendering/Decals/DecalRenderProcessor.cs  | 209 +++++++++++
+ .../Compositing/CompositingProfilingKeys.cs   |   2 +
+ .../Rendering/Decals/DecalProjection.sdsl     | 160 +++++++++
+ .../Rendering/Decals/DecalRenderFeature.cs    | 147 ++++++++
+ .../Rendering/Decals/DecalSortMode.cs         |  48 +++
+ .../Rendering/Decals/RenderDecal.cs           | 132 +++++++
+ .../Rendering/MeshPipelineProcessor.cs        |  16 +-
+ .../MeshTransparentRenderStageSelector.cs     |  17 +-
+ .../Rendering/RenderSystem.cs                 |  11 +-
+ .../SimpleGroupToRenderStageSelector.cs       |   5 +
+ .../Rendering/StrideEffectBase.sdfx           |  10 +
+ .../Rendering/StrideEffectBaseKeys.cs         |   5 +
+ .../Stride.Shaders.Tests/StrideShaderTests.cs | 143 ++++++++
+ 24 files changed, 2151 insertions(+), 9 deletions(-)
+ create mode 100644 samples/Templates/FirstPersonShooter/FirstPersonShooter/FirstPersonShooter.Game/BulletHoleDecals.cs
+ create mode 100644 sources/editor/Stride.Assets.Presentation.Wpf/AssetEditors/Gizmos/DecalGizmo.cs
+ create mode 100644 sources/engine/Stride.Engine.Tests/DecalRenderingTests.cs
+ create mode 100644 sources/engine/Stride.Engine.Tests/TestDecals.cs
+ create mode 100644 sources/engine/Stride.Engine/Engine/DecalComponent.cs
+ create mode 100644 sources/engine/Stride.Engine/Rendering/Decals/DecalRenderProcessor.cs
+ create mode 100644 sources/engine/Stride.Rendering/Rendering/Decals/DecalProjection.sdsl
+ create mode 100644 sources/engine/Stride.Rendering/Rendering/Decals/DecalRenderFeature.cs
+ create mode 100644 sources/engine/Stride.Rendering/Rendering/Decals/DecalSortMode.cs
+ create mode 100644 sources/engine/Stride.Rendering/Rendering/Decals/RenderDecal.cs
+
+diff --git a/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/GraphicsCompositor.sdgfxcomp b/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/GraphicsCompositor.sdgfxcomp
+index 6d0bacd..bb444dc 100644
+--- a/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/GraphicsCompositor.sdgfxcomp
++++ b/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/GraphicsCompositor.sdgfxcomp
+@@ -18,6 +18,11 @@ RenderStages:
+         Name: Transparent
+         EffectSlotName: Main
+         SortMode: !BackToFrontSortMode {}
++    24342f8ed8c10e4597fc9ce32e422c73:
++        Id: 8e2f3424-c1d8-450e-97fc-9ce32e422c73
++        Name: Decals
++        EffectSlotName: Main
++        SortMode: !DecalSortMode {}
+     554e52c061404d4684dd7c4c70f70e0e:
+         Id: c0524e55-4061-464d-84dd-7c4c70f70e0e
+         Name: ShadowMapCaster
+@@ -45,6 +50,7 @@ RenderFeatures:
+                 OpaqueRenderStage: ref!! 50671147-a5c1-49d4-b4ad-3625f71439b3
+                 TransparentRenderStage: ref!! 0fa30591-02ee-486d-9347-2b6aee83d035
+                 EffectName: StrideForwardShadingEffect
++                DecalRenderStage: ref!! 8e2f3424-c1d8-450e-97fc-9ce32e422c73
+             6f7224048750e7260ea87c444f74b32c: !Stride.Rendering.Shadows.ShadowMapRenderStageSelector,Stride.Rendering
+                 ShadowMapRenderStage: ref!! c0524e55-4061-464d-84dd-7c4c70f70e0e
+                 EffectName: StrideForwardShadingEffect.ShadowMapCaster
+@@ -93,6 +99,7 @@ RenderFeatures:
+                         d59ef45dd99e49d3af3887763d153aa7: !Stride.Rendering.Shadows.LightPointShadowMapRendererCubeMap,Stride.Rendering
+                             ShadowCasterRenderStage: ref!! 738e433b-332b-437c-8d19-d4e99be09069
+             42be209952db58294c9f06c58809b8ca: !Stride.Rendering.InstancingRenderFeature,Stride.Rendering {}
++            21012ac94c66465892f9a014fdf21a66: !Stride.Rendering.Decals.DecalRenderFeature,Stride.Rendering {}
+     28e9bf54a5adbe063f59fb17acb2723e: !Stride.Rendering.Sprites.SpriteRenderFeature,Stride.Rendering
+         RenderStageSelectors:
+             d74665cff080638a2439c4422e542d85: !Stride.Rendering.Sprites.SpriteTransparentRenderStageSelector,Stride.Rendering
+@@ -125,6 +132,7 @@ SharedRenderers:
+         LightProbes: true
+         OpaqueRenderStage: ref!! 50671147-a5c1-49d4-b4ad-3625f71439b3
+         TransparentRenderStage: ref!! 0fa30591-02ee-486d-9347-2b6aee83d035
++        DecalRenderStage: ref!! 8e2f3424-c1d8-450e-97fc-9ce32e422c73
+         ShadowMapRenderStages:
+             fc4d1e0de5c2b0bbc27bcf96e9a848fd: ref!! c0524e55-4061-464d-84dd-7c4c70f70e0e
+             87ff1d9cdd52418daf76385176a0e316: ref!! 9c51229d-d259-46dd-bf48-77578cd01f97
+@@ -147,6 +155,7 @@ SharedRenderers:
+         LightProbes: true
+         OpaqueRenderStage: ref!! 50671147-a5c1-49d4-b4ad-3625f71439b3
+         TransparentRenderStage: ref!! 0fa30591-02ee-486d-9347-2b6aee83d035
++        DecalRenderStage: ref!! 8e2f3424-c1d8-450e-97fc-9ce32e422c73
+         ShadowMapRenderStages:
+             2323a99a8a983e182f318e55604659b0: ref!! c0524e55-4061-464d-84dd-7c4c70f70e0e
+             61b557b74893400898c007d5ece5e87f: ref!! 9c51229d-d259-46dd-bf48-77578cd01f97
+diff --git a/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/MainScene.sdscene b/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/MainScene.sdscene
+index dcd172d..2769fda 100644
+--- a/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/MainScene.sdscene
++++ b/samples/Templates/FirstPersonShooter/FirstPersonShooter/Assets/MainScene.sdscene
+@@ -2170,6 +2170,14 @@ Hierarchy:
+                                     Position: {X: 0.0, Y: 0.0, Z: 0.0}
+                                     Rotation: {X: 0.0, Y: 0.0, Z: 0.0, W: 1.0}
+                                     Scale: {X: 1.0, Y: 1.0, Z: 1.0}
++                    1bfc682d896a6c44abaf07be693a4843: !FirstPersonShooter.BulletHoleDecals,FirstPersonShooter.Game
++                        Id: 2d68fc1b-6a89-446c-abaf-07be693a4843
++                        Material: null
++                        Size: 0.15
++                        ProjectionDepth: 0.1
++                        MaxBulletHoles: 50
++                        Lifetime: 30.0
++                        FadeOutDuration: 2.0
+         -   Entity:
+                 Id: 4151d9bb-8db5-4145-8329-24eecba83e56
+                 Name: Stairs1x1x1_50
+diff --git a/samples/Templates/FirstPersonShooter/FirstPersonShooter/FirstPersonShooter.Game/BulletHoleDecals.cs b/samples/Templates/FirstPersonShooter/FirstPersonShooter/FirstPersonShooter.Game/BulletHoleDecals.cs
+new file mode 100644
+index 0000000..ab9ff5f
+--- /dev/null
++++ b/samples/Templates/FirstPersonShooter/FirstPersonShooter/FirstPersonShooter.Game/BulletHoleDecals.cs
+@@ -0,0 +1,234 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++using System;
++using System.Collections.Generic;
++using FirstPersonShooter.Player;
++using Stride.Core.Mathematics;
++using Stride.Engine;
++using Stride.Engine.Events;
++using Stride.Graphics;
++using Stride.Physics;
++using Stride.Rendering;
++using Stride.Rendering.Materials;
++using Stride.Rendering.Materials.ComputeColors;
++
++namespace FirstPersonShooter
++{
++    /// <summary>
++    /// Leaves a bullet hole decal on the surfaces hit by the gun.
++    /// </summary>
++    /// <remarks>
++    /// Each bullet hole is an entity with a <see cref="DecalComponent"/> projecting into the surface along the opposite of its normal.
++    /// Bullet holes on moving objects are attached to them, so they move along.
++    /// </remarks>
++    public class BulletHoleDecals : SyncScript
++    {
++        private readonly EventReceiver<WeaponFiredResult> weaponFiredEvent = new EventReceiver<WeaponFiredResult>(WeaponScript.WeaponFired);
++
++        private readonly List<BulletHole> bulletHoles = new List<BulletHole>();
++
++        private readonly Random random = new Random();
++
++        /// <summary>
++        /// The material projected by the bullet holes. When not set, a simple procedural bullet hole is used.
++        /// </summary>
++        public Material Material { get; set; }
++
++        /// <summary>
++        /// The width and height of a bullet hole, in meters.
++        /// </summary>
++        public float Size { get; set; } = 0.15f;
++
++        /// <summary>
++        /// The depth of the projection, in meters, centered on the impact point.
++        /// </summary>
++        public float ProjectionDepth { get; set; } = 0.1f;
++
++        /// <summary>
++        /// The maximum number of bullet holes. When it is reached, the oldest bullet hole is removed.
++        /// </summary>
++        public int MaxBulletHoles { get; set; } = 50;
++
++        /// <summary>
++        /// The time, in seconds, a bullet hole stays before fading out. Bullet holes stay forever when it is 0.
++        /// </summary>
++        public float Lifetime { get; set; } = 30.0f;
++
++        /// <summary>
++        /// The duration, in seconds, of the fade out of a bullet hole.
++        /// </summary>
++        public float FadeOutDuration { get; set; } = 2.0f;
++
++        public override void Start()
++        {
++            Material ??= CreateBulletHoleMaterial();
++        }
++
++        public override void Update()
++        {
++            while (weaponFiredEvent.TryReceive(out var weaponFired))
++            {
++                if (weaponFired.DidHit)
++                    AddBulletHole(weaponFired.HitResult);
++            }
++
++            if (Lifetime <= 0.0f)
++                return;
++
++            var elapsed = (float)Game.UpdateTime.Elapsed.TotalSeconds;
++            for (var i = bulletHoles.Count - 1; i >= 0; i--)
++            {
++                var bulletHole = bulletHoles[i];
++                bulletHole.Age += elapsed;
++
++                var remaining = Lifetime + FadeOutDuration - bulletHole.Age;
++                if (remaining <= 0.0f)
++                {
++                    RemoveBulletHole(i);
++                    continue;
++                }
++
++                // Fade the decal out at the end of its life
++                bulletHole.Decal.Opacity = FadeOutDuration > 0.0f ? Math.Min(remaining / FadeOutDuration, 1.0f) : 1.0f;
++            }
++        }
++
++        public override void Cancel()
++        {
++            for (var i = bulletHoles.Count - 1; i >= 0; i--)
++                RemoveBulletHole(i);
++        }
++
++        private void AddBulletHole(HitResult hit)
++        {
++            var hitEntity = hit.Collider?.Entity;
++            if (hitEntity == null || hit.Collider is CharacterComponent || Material == null)
++                return;
++
++            if (MaxBulletHoles <= 0)
++                return;
++
++            if (bulletHoles.Count >= MaxBulletHoles)
++                RemoveBulletHole(0);
++
++            var decal = new DecalComponent
++            {
++                Material = Material,
++                Size = new Vector3(Size, Size, ProjectionDepth),
++                // Bullet holes on the edge of an object do not stretch on the sides
++                AngleFadeStart = 70.0f,
++                AngleFadeEnd = 85.0f,
++            };
++            var entity = new Entity("Bullet hole") { decal };
++
++            // Attach the bullet hole to moving objects, so that it follows them
++            if (hit.Collider is RigidbodyComponent)
++                hitEntity.AddChild(entity);
++            else
++                Entity.Scene.Entities.Add(entity);
++
++            entity.Transform.UseTRS = false;
++            entity.Transform.WorldMatrix = CreateBulletHoleWorldMatrix(hit.Point, hit.Normal, (float)random.NextDouble() * MathUtil.TwoPi);
++            entity.Transform.UpdateLocalFromWorld();
++
++            bulletHoles.Add(new BulletHole { Entity = entity, Decal = decal });
++        }
++
++        private void RemoveBulletHole(int index)
++        {
++            // Removes the entity from its scene, and detaches it from the object it was attached to
++            bulletHoles[index].Entity.Scene = null;
++            bulletHoles.RemoveAt(index);
++        }
++
++        /// <summary>
++        /// Creates the transformation of a decal projecting into a surface: its forward axis (-Z) points into the surface.
++        /// </summary>
++        private static Matrix CreateBulletHoleWorldMatrix(Vector3 position, Vector3 surfaceNormal, float rotation)
++        {
++            var zAxis = Vector3.Normalize(surfaceNormal);
++            var reference = MathF.Abs(zAxis.Y) < 0.99f ? Vector3.UnitY : Vector3.UnitX;
++            var xAxis = Vector3.Normalize(Vector3.Cross(reference, zAxis));
++            var yAxis = Vector3.Cross(zAxis, xAxis);
++
++            // Random rotation around the normal, so that bullet holes don't all look the same
++            var (sin, cos) = MathF.SinCos(rotation);
++
++            var world = Matrix.Identity;
++            world.Right = xAxis * cos + yAxis * sin;
++            world.Up = yAxis * cos - xAxis * sin;
++            world.Backward = zAxis;
++            world.TranslationVector = position;
++            return world;
++        }
++
++        /// <summary>
++        /// Creates a bullet hole material from a procedural texture: a dark hole surrounded by a jagged, fading crater.
++        /// </summary>
++        private Material CreateBulletHoleMaterial()
++        {
++            const int TextureSize = 128;
++            const int RimSectors = 24;
++
++            var noise = new Random(1234);
++            var rim = new float[RimSectors];
++            for (var i = 0; i < RimSectors; i++)
++                rim[i] = 0.7f + 0.25f * (float)noise.NextDouble();
++
++            var pixels = new Color[TextureSize * TextureSize];
++            for (var y = 0; y < TextureSize; y++)
++            {
++                for (var x = 0; x < TextureSize; x++)
++                {
++                    // Position relative to the center, from -1 to 1
++                    var u = (x + 0.5f) / TextureSize * 2.0f - 1.0f;
++                    var v = (y + 0.5f) / TextureSize * 2.0f - 1.0f;
++                    var radius = MathF.Sqrt(u * u + v * v);
++
++                    // Radius of the crater in this direction, interpolated between random values
++                    var sector = (MathF.Atan2(v, u) / MathUtil.TwoPi + 0.5f) * RimSectors;
++                    var sectorIndex = (int)sector % RimSectors;
++                    var rimRadius = MathUtil.Lerp(rim[sectorIndex], rim[(sectorIndex + 1) % RimSectors], sector - MathF.Floor(sector));
++
++                    const float HoleRadius = 0.2f;
++                    if (radius < HoleRadius)
++                    {
++                        pixels[y * TextureSize + x] = new Color(8, 7, 6, 255);
++                    }
++                    else
++                    {
++                        var crater = Math.Clamp((radius - HoleRadius) / (rimRadius - HoleRadius), 0.0f, 1.0f);
++                        var shade = (byte)MathUtil.Lerp(30.0f, 70.0f, crater);
++                        var alpha = (byte)(230.0f * MathF.Pow(1.0f - crater, 1.5f));
++                        pixels[y * TextureSize + x] = new Color(shade, (byte)(shade * 0.95f), (byte)(shade * 0.9f), alpha);
++                    }
++                }
++            }
++
++            var texture = Texture.New2D(GraphicsDevice, TextureSize, TextureSize, PixelFormat.R8G8B8A8_UNorm_SRgb, pixels);
++
++            return Material.New(GraphicsDevice, new MaterialDescriptor
++            {
++                Attributes =
++                {
++                    Diffuse = new MaterialDiffuseMapFeature(new ComputeTextureColor(texture)),
++                    DiffuseModel = new MaterialDiffuseLambertModelFeature(),
++                    MicroSurface = new MaterialGlossinessMapFeature(new ComputeFloat(0.2f)),
++                    Specular = new MaterialMetalnessMapFeature(new ComputeFloat(0.0f)),
++                    SpecularModel = new MaterialSpecularMicrofacetModelFeature(),
++                    // The alpha of the texture shapes the bullet hole
++                    Transparency = new MaterialTransparencyBlendFeature(),
++                },
++            });
++        }
++
++        private class BulletHole
++        {
++            public Entity Entity;
++
++            public DecalComponent Decal;
++
++            public float Age;
++        }
++    }
++}
+diff --git a/sources/editor/Stride.Assets.Presentation.Wpf/AssetEditors/Gizmos/DecalGizmo.cs b/sources/editor/Stride.Assets.Presentation.Wpf/AssetEditors/Gizmos/DecalGizmo.cs
+new file mode 100644
+index 0000000..39d3896
+--- /dev/null
++++ b/sources/editor/Stride.Assets.Presentation.Wpf/AssetEditors/Gizmos/DecalGizmo.cs
+@@ -0,0 +1,135 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using Stride.Core;
++using Stride.Core.Mathematics;
++using Stride.Engine;
++using Stride.Engine.Gizmos;
++using Stride.Graphics;
++using Stride.Rendering;
++using Buffer = Stride.Graphics.Buffer;
++using Material = Stride.Rendering.Material;
++
++namespace Stride.Assets.Presentation.AssetEditors.Gizmos
++{
++    /// <summary>
++    /// The gizmo of the <see cref="DecalComponent"/>: a billboard, and the projection volume with the projection direction when selected.
++    /// </summary>
++    [GizmoComponent(typeof(DecalComponent), true)]
++    public class DecalGizmo : BillboardingGizmo<DecalComponent>
++    {
++        private static readonly Color VolumeColor = new Color(255, 170, 60);
++
++        private Entity volumeEntity;
++        private Material volumeMaterial;
++        private DecalVolumeMesh volumeMesh;
++
++        public DecalGizmo(EntityComponent component)
++            : base(component, "Decal", GizmoResources.FallbackGizmo)
++        {
++        }
++
++        protected override Entity Create()
++        {
++            var root = base.Create();
++
++            volumeMesh = new DecalVolumeMesh(GraphicsDevice);
++            volumeMaterial = GizmoEmissiveColorMaterial.Create(GraphicsDevice, VolumeColor);
++
++            volumeEntity = new Entity("Decal volume of {0}".ToFormat(root.Id))
++            {
++                new ModelComponent
++                {
++                    Model = new Model
++                    {
++                        volumeMaterial,
++                        new Mesh { Draw = volumeMesh.MeshDraw },
++                    },
++                    RenderGroup = RenderGroup,
++                },
++            };
++
++            return root;
++        }
++
++        public override void Update()
++        {
++            base.Update();
++
++            if (ContentEntity == null || GizmoRootEntity == null || volumeEntity == null)
++                return;
++
++            // The root follows the position and the rotation of the decal entity: apply its scale and the size of the decal to the volume
++            ContentEntity.Transform.WorldMatrix.Decompose(out var scale, out Quaternion _, out Vector3 _);
++            volumeEntity.Transform.Scale = Component.Size * scale;
++        }
++
++        public override bool IsSelected
++        {
++            set
++            {
++                var hasChanged = IsSelected != value;
++                base.IsSelected = value;
++
++                if (hasChanged)
++                {
++                    if (IsSelected)
++                        GizmoRootEntity.AddChild(volumeEntity);
++                    else
++                        GizmoRootEntity.RemoveChild(volumeEntity);
++                }
++            }
++        }
++
++        /// <summary>
++        /// The lines of the unit cube volume of a decal, and an arrow showing the projection direction (-Z).
++        /// </summary>
++        private class DecalVolumeMesh
++        {
++            public readonly MeshDraw MeshDraw;
++
++            public DecalVolumeMesh(GraphicsDevice graphicsDevice)
++            {
++                var vertices = new VertexPositionNormalTexture[13];
++                var normal = -Vector3.UnitZ;
++
++                // Corners of the volume: front face (z = 0.5, the projector side) then back face (z = -0.5)
++                for (var i = 0; i < 8; i++)
++                {
++                    var x = (i & 1) == 0 ? -0.5f : 0.5f;
++                    var y = (i & 2) == 0 ? -0.5f : 0.5f;
++                    var z = i < 4 ? 0.5f : -0.5f;
++                    vertices[i] = new VertexPositionNormalTexture(new Vector3(x, y, z), normal, Vector2.Zero);
++                }
++
++                // Projection arrow, from the center of the projector face to the center of the far face
++                vertices[8] = new VertexPositionNormalTexture(new Vector3(0.0f, 0.0f, 0.5f), normal, Vector2.Zero);
++                vertices[9] = new VertexPositionNormalTexture(new Vector3(0.0f, 0.0f, -0.5f), normal, Vector2.Zero);
++                vertices[10] = new VertexPositionNormalTexture(new Vector3(0.1f, 0.0f, -0.3f), normal, Vector2.Zero);
++                vertices[11] = new VertexPositionNormalTexture(new Vector3(-0.1f, 0.0f, -0.3f), normal, Vector2.Zero);
++                vertices[12] = new VertexPositionNormalTexture(new Vector3(0.0f, 0.1f, -0.3f), normal, Vector2.Zero);
++
++                var indices = new[]
++                {
++                    // Front face
++                    0, 1, 1, 3, 3, 2, 2, 0,
++                    // Back face
++                    4, 5, 5, 7, 7, 6, 6, 4,
++                    // Sides
++                    0, 4, 1, 5, 2, 6, 3, 7,
++                    // Arrow
++                    8, 9, 9, 10, 9, 11, 9, 12,
++                };
++
++                var vertexBuffer = Buffer.Vertex.New(graphicsDevice, vertices);
++                MeshDraw = new MeshDraw
++                {
++                    PrimitiveType = PrimitiveType.LineList,
++                    DrawCount = indices.Length,
++                    IndexBuffer = new IndexBufferBinding(Buffer.Index.New(graphicsDevice, indices), true, indices.Length),
++                    VertexBuffers = new[] { new VertexBufferBinding(vertexBuffer, VertexPositionNormalTexture.Layout, vertexBuffer.ElementCount) },
++                };
++            }
++        }
++    }
++}
+diff --git a/sources/engine/Stride.Engine.Tests/DecalRenderingTests.cs b/sources/engine/Stride.Engine.Tests/DecalRenderingTests.cs
+new file mode 100644
+index 0000000..9e0ea2f
+--- /dev/null
++++ b/sources/engine/Stride.Engine.Tests/DecalRenderingTests.cs
+@@ -0,0 +1,322 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Threading.Tasks;
++using Xunit;
++using Stride.Core.Mathematics;
++using Stride.Games;
++using Stride.Graphics;
++using Stride.Graphics.Regression;
++using Stride.Rendering;
++using Stride.Rendering.Compositing;
++using Stride.Rendering.Decals;
++using Stride.Rendering.Lights;
++using Stride.Rendering.Materials;
++using Stride.Rendering.Materials.ComputeColors;
++using Stride.Rendering.ProceduralModels;
++
++namespace Stride.Engine.Tests
++{
++    /// <summary>
++    /// Base of the decal rendering tests: renders decals projected on a gray wall facing the camera, then checks the
++    /// color of the wall at given positions.
++    /// </summary>
++    public abstract class DecalTestGameBase : GameTestBase
++    {
++        private const int CheckFrame = 3;
++
++        private CameraComponent camera;
++
++        protected DecalTestGameBase()
++        {
++            GraphicsDeviceManager.PreferredBackBufferWidth = 640;
++            GraphicsDeviceManager.PreferredBackBufferHeight = 360;
++        }
++
++        /// <summary>
++        /// Whether the graphics compositor has a decal render stage. Otherwise, it is set up like a graphics compositor
++        /// created before decals existed: decals are rendered in the transparent stage.
++        /// </summary>
++        protected virtual bool UseDecalRenderStage => true;
++
++        protected List<string> Failures { get; } = [];
++
++        protected bool PixelsChecked { get; private set; }
++
++        protected MeshRenderFeature MeshRenderFeature { get; private set; }
++
++        protected override async Task LoadContent()
++        {
++            await base.LoadContent();
++
++            camera = new CameraComponent { NearClipPlane = 0.1f, FarClipPlane = 100.0f };
++            var compositor = GraphicsCompositorHelper.CreateDefault(false, camera: camera, clearColor: Color.Black, graphicsProfile: GraphicsDevice.Features.CurrentProfile);
++            MeshRenderFeature = compositor.RenderFeatures.OfType<MeshRenderFeature>().Single();
++
++            if (!UseDecalRenderStage)
++            {
++                ((ForwardRenderer)compositor.SingleView).DecalRenderStage = null;
++                foreach (var selector in MeshRenderFeature.RenderStageSelectors.OfType<MeshTransparentRenderStageSelector>())
++                    selector.DecalRenderStage = null;
++                MeshRenderFeature.RenderFeatures.Remove(MeshRenderFeature.RenderFeatures.OfType<DecalRenderFeature>().Single());
++            }
++
++            SceneSystem.GraphicsCompositor = compositor;
++
++            var scene = new Scene();
++
++            var cameraEntity = new Entity("Camera") { camera };
++            cameraEntity.Transform.Position = new Vector3(0.0f, 0.0f, 8.0f);
++            scene.Entities.Add(cameraEntity);
++
++            // A gray wall facing the camera, its front face at z = 0
++            var wall = new ModelComponent(new CubeProceduralModel { Size = new Vector3(10.0f, 10.0f, 0.2f) }.Generate(Services));
++            wall.Materials[0] = CreateMaterial(new ComputeColor(new Color4(0.5f, 0.5f, 0.5f, 1.0f)));
++            var wallEntity = new Entity("Wall") { wall };
++            wallEntity.Transform.Position = new Vector3(0.0f, 0.0f, -0.1f);
++            scene.Entities.Add(wallEntity);
++
++            CreateScene(scene);
++
++            SceneSystem.SceneInstance = new SceneInstance(Services, scene);
++        }
++
++        /// <summary>
++        /// Adds the lights and the decals of the test to the scene.
++        /// </summary>
++        protected abstract void CreateScene(Scene scene);
++
++        /// <summary>
++        /// Checks the rendered image, adding the problems found to <see cref="Failures"/>.
++        /// </summary>
++        protected abstract void CheckPixels(Func<float, float, Color> sampleWall);
++
++        protected override void RegisterTests()
++        {
++            base.RegisterTests();
++
++            // Keep the game running until the pixels have been checked
++            FrameGameSystem.Draw(CheckFrame + 1, () => { });
++        }
++
++        protected override void Draw(GameTime gameTime)
++        {
++            base.Draw(gameTime);
++
++            if (PixelsChecked || FrameGameSystem.CurrentFrame < CheckFrame)
++                return;
++
++            PixelsChecked = true;
++
++            using var image = GraphicsDevice.Presenter.BackBuffer.GetDataAsImage(GraphicsContext.CommandList);
++            var pixels = image.GetPixelBuffer(0, 0);
++
++            // Color of the pixel showing the point (x, y) of the front face of the wall
++            Color SampleWall(float x, float y)
++            {
++                var ndc = Vector3.TransformCoordinate(new Vector3(x, y, 0.0f), camera.ViewProjectionMatrix);
++                return pixels.GetPixel<Color>((int)((ndc.X + 1.0f) * 0.5f * pixels.Width), (int)((1.0f - ndc.Y) * 0.5f * pixels.Height));
++            }
++
++            CheckPixels(SampleWall);
++
++            var decalRenderFeatureCount = MeshRenderFeature.RenderFeatures.OfType<DecalRenderFeature>().Count();
++            if (decalRenderFeatureCount != 1)
++                Failures.Add($"Expected one {nameof(DecalRenderFeature)}, found {decalRenderFeatureCount}");
++        }
++
++        protected void Check(string description, Color pixel, bool condition)
++        {
++            if (!condition)
++                Failures.Add($"{description}: got {pixel}");
++        }
++
++        protected static bool IsGray(Color color) => color.R > 20 && Math.Abs(color.R - color.G) < 8 && Math.Abs(color.G - color.B) < 8;
++
++        protected static bool IsNear(Color left, Color right) => Math.Abs(left.R - right.R) < 8 && Math.Abs(left.G - right.G) < 8 && Math.Abs(left.B - right.B) < 8;
++
++        protected Entity AddDecal(Scene scene, Vector3 position, Quaternion rotation, Vector3 size, IComputeColor diffuse, float opacity = 1.0f, int sortOrder = 0)
++        {
++            var entity = new Entity("Decal")
++            {
++                new DecalComponent { Material = CreateMaterial(diffuse), Size = size, Opacity = opacity, SortOrder = sortOrder },
++            };
++            entity.Transform.Position = position;
++            entity.Transform.Rotation = rotation;
++            scene.Entities.Add(entity);
++            return entity;
++        }
++
++        protected Material CreateMaterial(IComputeColor diffuse)
++        {
++            return Material.New(GraphicsDevice, new MaterialDescriptor
++            {
++                Attributes =
++                {
++                    Diffuse = new MaterialDiffuseMapFeature(diffuse),
++                    DiffuseModel = new MaterialDiffuseLambertModelFeature(),
++                },
++            });
++        }
++
++        protected void RunTest()
++        {
++            var game = (DecalTestGameBase)Activator.CreateInstance(GetType());
++            RunGameTest(game);
++
++            Assert.True(game.PixelsChecked, "The rendered image was not checked");
++            Assert.Empty(game.Failures);
++        }
++    }
++
++    /// <summary>
++    /// Renders decals on a wall lit by an ambient light, and checks the color of the wall where each decal is projected.
++    /// </summary>
++    public class DecalRenderingTests : DecalTestGameBase
++    {
++        protected override void CreateScene(Scene scene)
++        {
++            scene.Entities.Add(new Entity("Ambient light") { new LightComponent { Type = new LightAmbient(), Intensity = 1.0f } });
++
++            // Opaque decal, projected straight into the wall
++            AddDecal(scene, new Vector3(-2.0f, 1.5f, 0.0f), Quaternion.Identity, Vector3.One, new ComputeColor(new Color4(1, 0, 0, 1)));
++            // Half transparent decal
++            AddDecal(scene, new Vector3(2.0f, 1.5f, 0.0f), Quaternion.Identity, Vector3.One, new ComputeColor(new Color4(0, 1, 0, 1)), opacity: 0.5f);
++            // Decal projected almost parallel to the wall: faded out by the angle fade
++            AddDecal(scene, new Vector3(-2.0f, -1.5f, 0.0f), Quaternion.RotationY(MathUtil.DegreesToRadians(88.0f)), Vector3.One, new ComputeColor(new Color4(0, 0, 1, 1)));
++            // Decal volume in front of the wall: does not reach it
++            AddDecal(scene, new Vector3(2.0f, -1.5f, 2.0f), Quaternion.Identity, Vector3.One, new ComputeColor(new Color4(1, 1, 0, 1)));
++            // Decal volume containing the camera
++            AddDecal(scene, new Vector3(0.0f, -1.25f, 4.0f), Quaternion.Identity, new Vector3(0.8f, 3.5f, 9.0f), new ComputeColor(new Color4(1, 0, 1, 1)));
++
++            // Textured decal: top-left red, top-right green, bottom-left blue, bottom-right white
++            var quadrants = Texture.New2D(GraphicsDevice, 2, 2, PixelFormat.R8G8B8A8_UNorm, new[] { Color.Red, Color.Lime, Color.Blue, Color.White });
++            AddDecal(scene, new Vector3(4.0f, 1.5f, 0.0f), Quaternion.Identity, new Vector3(1.6f, 1.6f, 1.0f), new ComputeTextureColor(quadrants));
++
++            // Overlapping decals: the one created first has the highest sort order, so it is drawn on top
++            AddDecal(scene, new Vector3(4.0f, -1.5f, 0.0f), Quaternion.Identity, Vector3.One, new ComputeColor(new Color4(1, 0.5f, 0, 1)), sortOrder: 1);
++            AddDecal(scene, new Vector3(4.0f, -1.5f, 0.0f), Quaternion.Identity, Vector3.One, new ComputeColor(new Color4(0, 0.5f, 1, 1)), sortOrder: 0);
++        }
++
++        protected override void CheckPixels(Func<float, float, Color> sampleWall)
++        {
++            var wall = sampleWall(0.0f, 1.5f);
++            Check("Wall without decal is gray", wall, IsGray(wall));
++
++            var opaque = sampleWall(-2.0f, 1.5f);
++            Check("Opaque decal is red", opaque, opaque.R > 200 && opaque.G < 60 && opaque.B < 60);
++
++            var halfTransparent = sampleWall(2.0f, 1.5f);
++            Check("Half transparent decal blends green over the wall", halfTransparent, halfTransparent.G > halfTransparent.R + 30 && halfTransparent.R > 40 && Math.Abs(halfTransparent.R - halfTransparent.B) < 8);
++
++            var grazing = sampleWall(-2.0f, -1.5f);
++            Check("Grazing decal is faded out", grazing, IsNear(grazing, wall));
++
++            var tooFar = sampleWall(2.0f, -1.5f);
++            Check("Decal volume not reaching the wall leaves it unchanged", tooFar, IsNear(tooFar, wall));
++
++            var cameraInside = sampleWall(0.0f, -2.0f);
++            Check("Decal containing the camera is visible", cameraInside, cameraInside.R > 180 && cameraInside.B > 180 && cameraInside.G < 60);
++
++            var topLeft = sampleWall(3.6f, 1.9f);
++            Check("Textured decal: top-left is red", topLeft, topLeft.R > 200 && topLeft.G < 60 && topLeft.B < 60);
++            var topRight = sampleWall(4.4f, 1.9f);
++            Check("Textured decal: top-right is green", topRight, topRight.G > 200 && topRight.R < 60 && topRight.B < 60);
++            var bottomLeft = sampleWall(3.6f, 1.1f);
++            Check("Textured decal: bottom-left is blue", bottomLeft, bottomLeft.B > 200 && bottomLeft.R < 60 && bottomLeft.G < 60);
++            var bottomRight = sampleWall(4.4f, 1.1f);
++            Check("Textured decal: bottom-right is white", bottomRight, bottomRight.R > 200 && bottomRight.G > 200 && bottomRight.B > 200);
++
++            // The sort order is only applied by the decal render stage (the transparent stage sorts by distance)
++            if (UseDecalRenderStage)
++            {
++                var sorted = sampleWall(4.0f, -1.5f);
++                Check("Decal with the highest sort order is drawn on top", sorted, sorted.R > 200 && sorted.B < 60);
++            }
++        }
++
++        [SkippableFact]
++        public void DecalsAreProjectedOnTheOpaqueGeometry() => RunTest();
++    }
++
++    /// <summary>
++    /// Renders decals with a graphics compositor created before decals existed (no decal render stage nor
++    /// <see cref="DecalRenderFeature"/>): the decal render feature is added automatically and decals are
++    /// rendered in the transparent stage.
++    /// </summary>
++    public class DecalRenderingWithoutDecalStageTests : DecalRenderingTests
++    {
++        protected override bool UseDecalRenderStage => false;
++    }
++
++    /// <summary>
++    /// Checks that decals are lit with the normal of the surface they are projected on, whatever their projection direction.
++    /// </summary>
++    public class DecalLightingTests : DecalTestGameBase
++    {
++        protected override void CreateScene(Scene scene)
++        {
++            // A directional light hitting the wall at 60 degrees, coming from +X
++            var light = new Entity("Directional light") { new LightComponent { Type = new LightDirectional(), Intensity = 1.0f } };
++            light.Transform.Rotation = Quaternion.RotationY(MathUtil.DegreesToRadians(60.0f));
++            scene.Entities.Add(light);
++
++            // The same decal projected straight into the wall, and at 45 degrees from both sides:
++            // shaded with the normal of the projector, they would get a very different amount of light
++            var white = new ComputeColor(new Color4(0.8f, 0.8f, 0.8f, 1.0f));
++            AddDecal(scene, new Vector3(-3.0f, 0.0f, 0.0f), Quaternion.Identity, Vector3.One, white);
++            AddDecal(scene, new Vector3(0.0f, 0.0f, 0.0f), Quaternion.RotationY(MathUtil.DegreesToRadians(45.0f)), Vector3.One, white);
++            AddDecal(scene, new Vector3(3.0f, 0.0f, 0.0f), Quaternion.RotationY(MathUtil.DegreesToRadians(-45.0f)), Vector3.One, white);
++
++            // The same decals with a normal map tilting the normal toward the U direction (local X axis of the decal, +X here):
++            // they receive more light than the flat decals, and the same amount whatever the projection direction
++            var normalMap = Texture.New2D(GraphicsDevice, 1, 1, PixelFormat.R8G8B8A8_UNorm, new[] { new Color(217, 128, 217, 255) });
++            var normalMapped = new MaterialDescriptor
++            {
++                Attributes =
++                {
++                    Diffuse = new MaterialDiffuseMapFeature(white),
++                    DiffuseModel = new MaterialDiffuseLambertModelFeature(),
++                    Surface = new MaterialNormalMapFeature(new ComputeTextureColor(normalMap)),
++                },
++            };
++            foreach (var (position, angle) in new[] { (new Vector3(-3.0f, -2.0f, 0.0f), 0.0f), (new Vector3(0.0f, -2.0f, 0.0f), 45.0f), (new Vector3(3.0f, -2.0f, 0.0f), -45.0f) })
++            {
++                var entity = new Entity("Normal mapped decal") { new DecalComponent { Material = Material.New(GraphicsDevice, normalMapped) } };
++                entity.Transform.Position = position;
++                entity.Transform.Rotation = Quaternion.RotationY(MathUtil.DegreesToRadians(angle));
++                scene.Entities.Add(entity);
++            }
++        }
++
++        protected override void CheckPixels(Func<float, float, Color> sampleWall)
++        {
++            var wall = sampleWall(0.0f, 2.0f);
++            Check("Lit wall is gray", wall, IsGray(wall));
++
++            var straight = sampleWall(-3.0f, 0.0f);
++            Check("Decal is brighter than the wall", straight, IsGray(straight) && straight.R > wall.R + 10);
++
++            var fromRight = sampleWall(0.0f, 0.0f);
++            Check("Decal projected at +45 degrees is lit like the straight one", fromRight, IsNear(fromRight, straight));
++
++            var fromLeft = sampleWall(3.0f, 0.0f);
++            Check("Decal projected at -45 degrees is lit like the straight one", fromLeft, IsNear(fromLeft, straight));
++
++            var normalMapped = sampleWall(-3.0f, -2.0f);
++            Check("Normal mapped decal facing the light is brighter than the flat one", normalMapped, IsGray(normalMapped) && normalMapped.R > straight.R + 10);
++
++            var normalMappedFromRight = sampleWall(0.0f, -2.0f);
++            Check("Normal mapped decal projected at +45 degrees is lit like the straight one", normalMappedFromRight, IsNear(normalMappedFromRight, normalMapped));
++
++            var normalMappedFromLeft = sampleWall(3.0f, -2.0f);
++            Check("Normal mapped decal projected at -45 degrees is lit like the straight one", normalMappedFromLeft, IsNear(normalMappedFromLeft, normalMapped));
++        }
++
++        [SkippableFact]
++        public void DecalsAreLitWithTheReceivingSurfaceNormal() => RunTest();
++    }
++}
+diff --git a/sources/engine/Stride.Engine.Tests/Stride.Engine.Tests.csproj b/sources/engine/Stride.Engine.Tests/Stride.Engine.Tests.csproj
+index 90f58ed..37b9a05 100644
+--- a/sources/engine/Stride.Engine.Tests/Stride.Engine.Tests.csproj
++++ b/sources/engine/Stride.Engine.Tests/Stride.Engine.Tests.csproj
+@@ -37,11 +37,13 @@
+     <Compile Include="TestBowyerWatsonTetrahedralization.cs" />
+     <Compile Include="SpriteAnimationTest.cs" />
+     <Compile Include="TesselationTest.cs" />
++    <Compile Include="DecalRenderingTests.cs" />
+     <Compile Include="EffectFallbackTest.cs" />
+     <Compile Include="TestEntity.cs" />
+     <Compile Include="TestEntityManager.Benchmark.cs" />
+     <Compile Include="TestEntityManager.cs" />
+     <Compile Include="TestCameraProcessor.cs" />
++    <Compile Include="TestDecals.cs" />
+     <Compile Include="TestTransformComponent.cs" />
+     <Compile Include="TestUpdateEngine.cs" />
+     <None Include="Build\TestSerializer.cs" />
+diff --git a/sources/engine/Stride.Engine.Tests/TestDecals.cs b/sources/engine/Stride.Engine.Tests/TestDecals.cs
+new file mode 100644
+index 0000000..bdc0f57
+--- /dev/null
++++ b/sources/engine/Stride.Engine.Tests/TestDecals.cs
+@@ -0,0 +1,333 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using System;
++using System.Linq;
++using Xunit;
++using Stride.Core.Mathematics;
++using Stride.Core.Threading;
++using Stride.Graphics;
++using Stride.Rendering;
++using Stride.Rendering.Decals;
++
++namespace Stride.Engine.Tests
++{
++    /// <summary>
++    /// Tests for <see cref="DecalComponent"/>, <see cref="DecalRenderProcessor"/> and the CPU side of decal rendering.
++    /// </summary>
++    public class TestDecals
++    {
++        private const float Epsilon = 1.0e-4f;
++
++        // Same as DecalProjection.sdsl: saturate(cos(angle) * Y + Z)
++        private static float AngleFade(Vector4 parameters, float angleInDegrees)
++            => Math.Clamp(MathF.Cos(MathUtil.DegreesToRadians(angleInDegrees)) * parameters.Y + parameters.Z, 0.0f, 1.0f);
++
++        // Same as DecalProjection.sdsl: saturate((z + 0.5) * W), z being the local position in the volume along the projection axis
++        private static float DepthFade(Vector4 parameters, float localZ)
++            => Math.Clamp((localZ + 0.5f) * parameters.W, 0.0f, 1.0f);
++
++        private static void AssertNear(Vector3 expected, Vector3 actual)
++        {
++            Assert.True((expected - actual).Length() < Epsilon, $"Expected {expected} but got {actual}");
++        }
++
++        [Fact]
++        public void AngleFadeGoesFromStartToEndAngle()
++        {
++            var parameters = RenderDecal.ComputeShaderParameters(0.75f, 60.0f, 85.0f, 0.0f);
++
++            Assert.Equal(0.75f, parameters.X);
++            Assert.Equal(1.0f, AngleFade(parameters, 0.0f), Epsilon);
++            Assert.Equal(1.0f, AngleFade(parameters, 60.0f), Epsilon);
++            Assert.InRange(AngleFade(parameters, 72.5f), 0.1f, 0.9f);
++            Assert.Equal(0.0f, AngleFade(parameters, 85.0f), Epsilon);
++            Assert.Equal(0.0f, AngleFade(parameters, 120.0f), Epsilon);
++        }
++
++        [Fact]
++        public void AngleFadeWithoutRangeCutsSharply()
++        {
++            var parameters = RenderDecal.ComputeShaderParameters(1.0f, 45.0f, 45.0f, 0.0f);
++            Assert.Equal(1.0f, AngleFade(parameters, 44.0f), Epsilon);
++            Assert.Equal(0.0f, AngleFade(parameters, 46.0f), Epsilon);
++
++            // An end angle smaller than the start angle behaves as a sharp cut at the start angle
++            var reversed = RenderDecal.ComputeShaderParameters(1.0f, 45.0f, 30.0f, 0.0f);
++            Assert.Equal(1.0f, AngleFade(reversed, 44.0f), Epsilon);
++            Assert.Equal(0.0f, AngleFade(reversed, 46.0f), Epsilon);
++        }
++
++        [Fact]
++        public void AngleFadeBeyondNinetyDegreesReachesSurfacesFacingAway()
++        {
++            var parameters = RenderDecal.ComputeShaderParameters(1.0f, 150.0f, 180.0f, 0.0f);
++            Assert.Equal(1.0f, AngleFade(parameters, 120.0f), Epsilon);
++            Assert.InRange(AngleFade(parameters, 170.0f), 0.0f, 0.9f);
++        }
++
++        [Fact]
++        public void DepthFadeGoesTowardTheFarEndOfTheVolume()
++        {
++            var parameters = RenderDecal.ComputeShaderParameters(1.0f, 60.0f, 85.0f, 0.5f);
++            Assert.Equal(0.0f, DepthFade(parameters, -0.5f), Epsilon);
++            Assert.Equal(0.5f, DepthFade(parameters, -0.25f), Epsilon);
++            Assert.Equal(1.0f, DepthFade(parameters, 0.0f), Epsilon);
++            Assert.Equal(1.0f, DepthFade(parameters, 0.5f), Epsilon);
++
++            var sharp = RenderDecal.ComputeShaderParameters(1.0f, 60.0f, 85.0f, 0.0f);
++            Assert.Equal(1.0f, DepthFade(sharp, -0.499f), Epsilon);
++        }
++
++        [Fact]
++        public void ShaderParametersAreClamped()
++        {
++            Assert.Equal(1.0f, RenderDecal.ComputeShaderParameters(2.0f, 60.0f, 85.0f, 0.0f).X);
++            Assert.Equal(0.0f, RenderDecal.ComputeShaderParameters(-1.0f, 60.0f, 85.0f, 0.0f).X);
++
++            var parameters = RenderDecal.ComputeShaderParameters(1.0f, -30.0f, 400.0f, 3.0f);
++            Assert.True(float.IsFinite(parameters.Y) && float.IsFinite(parameters.Z) && float.IsFinite(parameters.W));
++            Assert.Equal(1.0f, AngleFade(parameters, 0.0f), Epsilon);
++            Assert.Equal(1.0f, DepthFade(parameters, 0.5f), Epsilon);
++        }
++
++        [Fact]
++        public void WorldMatrixMapsTheUnitCubeToTheVolume()
++        {
++            var entityWorld = Matrix.RotationY(MathUtil.PiOverTwo) * Matrix.Translation(10.0f, 2.0f, -3.0f);
++            var world = RenderDecal.ComputeWorldMatrix(new Vector3(2.0f, 1.0f, 0.5f), entityWorld);
++
++            // Center of the projector face, and a corner of the far face
++            AssertNear(Vector3.TransformCoordinate(new Vector3(0.0f, 0.0f, 0.25f), entityWorld), Vector3.TransformCoordinate(new Vector3(0.0f, 0.0f, 0.5f), world));
++            AssertNear(Vector3.TransformCoordinate(new Vector3(1.0f, 0.5f, -0.25f), entityWorld), Vector3.TransformCoordinate(new Vector3(0.5f, 0.5f, -0.5f), world));
++        }
++
++        [Fact]
++        public void BoundingBoxContainsTheRotatedVolume()
++        {
++            var world = RenderDecal.ComputeWorldMatrix(new Vector3(2.0f, 1.0f, 1.0f), Matrix.RotationZ(MathUtil.PiOverFour) * Matrix.Translation(1.0f, 2.0f, 3.0f));
++            var boundingBox = RenderDecal.ComputeBoundingBox(world);
++
++            AssertNear(new Vector3(1.0f, 2.0f, 3.0f), boundingBox.Center);
++            var halfDiagonal = 1.5f * MathF.Sqrt(0.5f);
++            AssertNear(new Vector3(halfDiagonal, halfDiagonal, 0.5f), boundingBox.Extent);
++        }
++
++        [Fact]
++        public void ProcessorCopiesTheComponentToTheRenderDecal()
++        {
++            var component = new DecalComponent
++            {
++                Size = new Vector3(2.0f, 3.0f, 4.0f),
++                Opacity = 0.5f,
++                AngleFadeStart = 10.0f,
++                AngleFadeEnd = 20.0f,
++                DepthFade = 0.3f,
++                SortOrder = -2,
++                RenderGroup = RenderGroup.Group5,
++            };
++            var entity = new Entity { component };
++            entity.Transform.Position = new Vector3(1.0f, 2.0f, 3.0f);
++            entity.Transform.UpdateWorldMatrix();
++
++            var renderDecal = new RenderDecal();
++            var materialPass = new MaterialPass();
++            DecalRenderProcessor.UpdateRenderDecal(component, renderDecal, materialPass, null);
++
++            Assert.True(renderDecal.Enabled);
++            Assert.False(renderDecal.IsShadowCaster);
++            Assert.False(renderDecal.IsScalingNegative);
++            Assert.Same(materialPass, renderDecal.MaterialPass);
++            Assert.Equal(RenderGroup.Group5, renderDecal.RenderGroup);
++            Assert.Equal(RenderDecal.ComputeWorldMatrix(component.Size, entity.Transform.WorldMatrix), renderDecal.World);
++            AssertNear(new Vector3(1.0f, 2.0f, 3.0f), renderDecal.BoundingBox.Center);
++            AssertNear(new Vector3(1.0f, 1.5f, 2.0f), renderDecal.BoundingBox.Extent);
++            Assert.Equal(0.5f, renderDecal.Opacity);
++            Assert.Equal(10.0f, renderDecal.AngleFadeStart);
++            Assert.Equal(20.0f, renderDecal.AngleFadeEnd);
++            Assert.Equal(0.3f, renderDecal.DepthFade);
++            Assert.Equal(-2, renderDecal.SortOrder);
++
++            // A mirrored decal has its volume turned inside out
++            entity.Transform.Scale = new Vector3(-1.0f, 1.0f, 1.0f);
++            entity.Transform.UpdateWorldMatrix();
++            DecalRenderProcessor.UpdateRenderDecal(component, renderDecal, materialPass, null);
++            Assert.True(renderDecal.IsScalingNegative);
++            Assert.True(renderDecal.Enabled);
++
++            // A flat volume does not project anything
++            component.Size = new Vector3(1.0f, 1.0f, 0.0f);
++            DecalRenderProcessor.UpdateRenderDecal(component, renderDecal, materialPass, null);
++            Assert.False(renderDecal.Enabled);
++
++            // Neither does a disabled component
++            component.Size = Vector3.One;
++            component.Enabled = false;
++            DecalRenderProcessor.UpdateRenderDecal(component, renderDecal, materialPass, null);
++            Assert.False(renderDecal.Enabled);
++        }
++
++        [Fact]
++        public void MeshSelectorRoutesDecalsToTheDecalStage()
++        {
++            var opaqueStage = new RenderStage("Opaque", "Main") { Index = 0 };
++            var transparentStage = new RenderStage("Transparent", "Main") { Index = 1 };
++            var decalStage = new RenderStage("Decals", "Main") { Index = 2 };
++            var selector = new MeshTransparentRenderStageSelector
++            {
++                OpaqueRenderStage = opaqueStage,
++                TransparentRenderStage = transparentStage,
++                DecalRenderStage = decalStage,
++                EffectName = "StrideForwardShadingEffect",
++            };
++            var opaqueMaterial = new MaterialPass();
++
++            var renderDecal = new RenderDecal { MaterialPass = opaqueMaterial, ActiveRenderStages = new ActiveRenderStage[3] };
++            selector.Process(renderDecal);
++            Assert.False(renderDecal.ActiveRenderStages[0].Active);
++            Assert.False(renderDecal.ActiveRenderStages[1].Active);
++            Assert.True(renderDecal.ActiveRenderStages[2].Active);
++            Assert.Equal("StrideForwardShadingEffect", renderDecal.ActiveRenderStages[2].EffectSelector.EffectName);
++
++            // Without a decal stage, decals are rendered with the transparent geometry (never with the opaque one)
++            selector.DecalRenderStage = null;
++            renderDecal.ActiveRenderStages = new ActiveRenderStage[3];
++            selector.Process(renderDecal);
++            Assert.False(renderDecal.ActiveRenderStages[0].Active);
++            Assert.True(renderDecal.ActiveRenderStages[1].Active);
++
++            // Other meshes are not affected
++            var renderMesh = new RenderMesh { MaterialPass = opaqueMaterial, ActiveRenderStages = new ActiveRenderStage[3] };
++            selector.DecalRenderStage = decalStage;
++            selector.Process(renderMesh);
++            Assert.True(renderMesh.ActiveRenderStages[0].Active);
++            Assert.False(renderMesh.ActiveRenderStages[2].Active);
++
++            // A selector without transparent nor decal stage (such as the one of the depth prepass) ignores decals
++            var depthPrepassSelector = new MeshTransparentRenderStageSelector { OpaqueRenderStage = opaqueStage, EffectName = "StrideForwardShadingEffect.ZPrepass" };
++            renderDecal.ActiveRenderStages = new ActiveRenderStage[3];
++            depthPrepassSelector.Process(renderDecal);
++            Assert.DoesNotContain(renderDecal.ActiveRenderStages, stage => stage.Active);
++        }
++
++        [Fact]
++        public void GenericSelectorIgnoresDecals()
++        {
++            var stage = new RenderStage("Picking", "Picking") { Index = 0 };
++            var selector = new SimpleGroupToRenderStageSelector { RenderStage = stage, EffectName = "Picking" };
++
++            var renderDecal = new RenderDecal { ActiveRenderStages = new ActiveRenderStage[1] };
++            selector.Process(renderDecal);
++            Assert.False(renderDecal.ActiveRenderStages[0].Active);
++
++            var renderMesh = new RenderMesh { ActiveRenderStages = new ActiveRenderStage[1] };
++            selector.Process(renderMesh);
++            Assert.True(renderMesh.ActiveRenderStages[0].Active);
++        }
++
++        [Fact]
++        public void PipelineProcessorAppliesTheDecalStates()
++        {
++            var transparentStage = new RenderStage("Transparent", "Main")
++            {
++                Index = 0,
++                Output = new RenderOutputDescription(PixelFormat.R8G8B8A8_UNorm, PixelFormat.D24_UNorm_S8_UInt),
++            };
++            var processor = new MeshPipelineProcessor { TransparentRenderStage = transparentStage };
++            var renderDecal = new RenderDecal { MaterialPass = new MaterialPass() };
++
++            var pipelineState = ProcessPipelineState(processor, transparentStage, renderDecal);
++            Assert.Equal(CullMode.Front, pipelineState.RasterizerState.CullMode);
++            Assert.True(pipelineState.DepthStencilState.DepthBufferEnable);
++            Assert.False(pipelineState.DepthStencilState.DepthBufferWriteEnable);
++            Assert.Equal(CompareFunction.GreaterEqual, pipelineState.DepthStencilState.DepthBufferFunction);
++            Assert.Equal(BlendStates.AlphaBlend, pipelineState.BlendState);
++
++            // The material blend state is kept (e.g. additive decals)
++            renderDecal.MaterialPass.BlendState = BlendStates.Additive;
++            Assert.Equal(BlendStates.Additive, ProcessPipelineState(processor, transparentStage, renderDecal).BlendState);
++
++            // Mirrored volumes have reversed faces
++            renderDecal.IsScalingNegative = true;
++            Assert.Equal(CullMode.Back, ProcessPipelineState(processor, transparentStage, renderDecal).RasterizerState.CullMode);
++        }
++
++        private static PipelineStateDescription ProcessPipelineState(PipelineProcessor processor, RenderStage renderStage, RenderObject renderObject)
++        {
++            var pipelineState = new PipelineStateDescription();
++            pipelineState.SetDefaults();
++            var renderNode = new RenderNode(renderObject, null, ViewObjectNodeReference.Invalid, renderStage);
++            processor.Process(default, ref renderNode, renderObject, pipelineState);
++            return pipelineState;
++        }
++
++        [Fact]
++        public unsafe void SortModeOrdersDecalsBySortOrderThenCreation()
++        {
++            var meshRenderFeature = new MeshRenderFeature();
++            var decals = new[]
++            {
++                new RenderDecal { SortOrder = 1 },
++                new RenderDecal { SortOrder = -1 },
++                new RenderDecal { SortOrder = 0 },
++                new RenderDecal { SortOrder = 0 },
++            };
++
++            var renderViewStage = new RenderViewStage(0) { RenderNodes = new ConcurrentCollector<RenderNodeFeatureReference>() };
++            for (var i = 0; i < decals.Length; i++)
++                renderViewStage.RenderNodes.Add(new RenderNodeFeatureReference(meshRenderFeature, new RenderNodeReference(i), decals[i]));
++            renderViewStage.RenderNodes.Close();
++
++            var sortKeys = new SortKey[decals.Length];
++            fixed (SortKey* sortKeysPointer = sortKeys)
++            {
++                new DecalSortMode().GenerateSortKey(null, renderViewStage, sortKeysPointer);
++            }
++            Array.Sort(sortKeys);
++
++            Assert.Equal(new[] { decals[1], decals[2], decals[3], decals[0] }, sortKeys.Select(sortKey => decals[sortKey.Index]));
++        }
++
++        [Fact]
++        public void RenderSystemRendersDecalsWithTheMeshRenderFeature()
++        {
++            var renderSystem = new RenderSystem();
++            var meshRenderFeature = new MeshRenderFeature();
++            renderSystem.RenderFeatures.Add(meshRenderFeature);
++
++            var renderDecal = new RenderDecal();
++            renderSystem.AddRenderObject(renderDecal);
++            Assert.Same(meshRenderFeature, renderDecal.RenderFeature);
++
++            // A render feature supporting the exact type of a render object is preferred
++            var decalOnlyRenderFeature = new DecalOnlyMeshRenderFeature();
++            renderSystem.RenderFeatures.Add(decalOnlyRenderFeature);
++            var otherRenderDecal = new RenderDecal();
++            renderSystem.AddRenderObject(otherRenderDecal);
++            Assert.Same(decalOnlyRenderFeature, otherRenderDecal.RenderFeature);
++
++            var renderMesh = new RenderMesh();
++            renderSystem.AddRenderObject(renderMesh);
++            Assert.Same(meshRenderFeature, renderMesh.RenderFeature);
++        }
++
++        [Fact]
++        public void ProcessorAddsTheDecalRenderFeatureOnlyOnce()
++        {
++            var renderSystem = new RenderSystem();
++            var meshRenderFeature = new MeshRenderFeature();
++            renderSystem.RenderFeatures.Add(meshRenderFeature);
++
++            Assert.True(DecalRenderProcessor.EnsureDecalRenderFeature(renderSystem));
++            Assert.Single(meshRenderFeature.RenderFeatures.OfType<DecalRenderFeature>());
++
++            Assert.False(DecalRenderProcessor.EnsureDecalRenderFeature(renderSystem));
++            Assert.Single(meshRenderFeature.RenderFeatures.OfType<DecalRenderFeature>());
++        }
++
++        private class DecalOnlyMeshRenderFeature : MeshRenderFeature
++        {
++            public override Type SupportedRenderObjectType => typeof(RenderDecal);
++        }
++    }
++}
+diff --git a/sources/engine/Stride.Engine/AssetPackage/Assets/Shared/DefaultGraphicsCompositorLevel10.sdgfxcomp b/sources/engine/Stride.Engine/AssetPackage/Assets/Shared/DefaultGraphicsCompositorLevel10.sdgfxcomp
+index 242b773..e2fe461 100644
+--- a/sources/engine/Stride.Engine/AssetPackage/Assets/Shared/DefaultGraphicsCompositorLevel10.sdgfxcomp
++++ b/sources/engine/Stride.Engine/AssetPackage/Assets/Shared/DefaultGraphicsCompositorLevel10.sdgfxcomp
+@@ -17,6 +17,11 @@ RenderStages:
+         Name: Transparent
+         EffectSlotName: Main
+         SortMode: !BackToFrontSortMode {}
++    24342f8ed8c10e4597fc9ce32e422c73:
++        Id: 8e2f3424-c1d8-450e-97fc-9ce32e422c73
++        Name: Decals
++        EffectSlotName: Main
++        SortMode: !DecalSortMode {}
+     554e52c061404d4684dd7c4c70f70e0e:
+         Id: c0524e55-4061-464d-84dd-7c4c70f70e0e
+         Name: ShadowMapCaster
+@@ -44,6 +49,7 @@ RenderFeatures:
+                 OpaqueRenderStage: ref!! 50671147-a5c1-49d4-b4ad-3625f71439b3
+                 TransparentRenderStage: ref!! 0fa30591-02ee-486d-9347-2b6aee83d035
+                 EffectName: StrideForwardShadingEffect
++                DecalRenderStage: ref!! 8e2f3424-c1d8-450e-97fc-9ce32e422c73
+             6f7224048750e7260ea87c444f74b32c: !Stride.Rendering.Shadows.ShadowMapRenderStageSelector,Stride.Rendering
+                 ShadowMapRenderStage: ref!! c0524e55-4061-464d-84dd-7c4c70f70e0e
+                 EffectName: StrideForwardShadingEffect.ShadowMapCaster
+@@ -92,6 +98,7 @@ RenderFeatures:
+                         d59ef45dd99e49d3af3887763d153aa7: !Stride.Rendering.Shadows.LightPointShadowMapRendererCubeMap,Stride.Rendering
+                             ShadowCasterRenderStage: ref!! b03a45c6-7a56-417c-8a80-69cc608671f1
+             42be209952db58294c9f06c58809b8ca: !Stride.Rendering.InstancingRenderFeature,Stride.Rendering {}
++            21012ac94c66465892f9a014fdf21a66: !Stride.Rendering.Decals.DecalRenderFeature,Stride.Rendering {}
+     28e9bf54a5adbe063f59fb17acb2723e: !Stride.Rendering.Sprites.SpriteRenderFeature,Stride.Rendering
+         RenderStageSelectors:
+             d74665cff080638a2439c4422e542d85: !Stride.Rendering.Sprites.SpriteTransparentRenderStageSelector,Stride.Rendering
+@@ -124,6 +131,7 @@ SharedRenderers:
+         LightProbes: true
+         OpaqueRenderStage: ref!! 50671147-a5c1-49d4-b4ad-3625f71439b3
+         TransparentRenderStage: ref!! 0fa30591-02ee-486d-9347-2b6aee83d035
++        DecalRenderStage: ref!! 8e2f3424-c1d8-450e-97fc-9ce32e422c73
+         ShadowMapRenderStages:
+             fc4d1e0de5c2b0bbc27bcf96e9a848fd: ref!! c0524e55-4061-464d-84dd-7c4c70f70e0e
+             87ff1d9cdd52418daf76385176a0e316: ref!! 555e84b4-b68a-4f38-ac3a-f0f563028ef0
+@@ -145,6 +153,7 @@ SharedRenderers:
+         LightProbes: true
+         OpaqueRenderStage: ref!! 50671147-a5c1-49d4-b4ad-3625f71439b3
+         TransparentRenderStage: ref!! 0fa30591-02ee-486d-9347-2b6aee83d035
++        DecalRenderStage: ref!! 8e2f3424-c1d8-450e-97fc-9ce32e422c73
+         ShadowMapRenderStages:
+             2323a99a8a983e182f318e55604659b0: ref!! c0524e55-4061-464d-84dd-7c4c70f70e0e
+             61b557b74893400898c007d5ece5e87f: ref!! 555e84b4-b68a-4f38-ac3a-f0f563028ef0
+diff --git a/sources/engine/Stride.Engine/Engine/DecalComponent.cs b/sources/engine/Stride.Engine/Engine/DecalComponent.cs
+new file mode 100644
+index 0000000..3443994
+--- /dev/null
++++ b/sources/engine/Stride.Engine/Engine/DecalComponent.cs
+@@ -0,0 +1,111 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using System.ComponentModel;
++using Stride.Core;
++using Stride.Core.Annotations;
++using Stride.Core.Mathematics;
++using Stride.Engine.Design;
++using Stride.Rendering;
++using Stride.Rendering.Decals;
++
++namespace Stride.Engine
++{
++    /// <summary>
++    /// Projects a material onto the opaque surfaces inside a box volume, to add details such as bullet holes, signs, stains or footprints.
++    /// </summary>
++    /// <remarks>
++    /// <para>
++    /// The volume is centered on the entity and oriented by its transform. The material is projected along the
++    /// forward axis of the entity (-Z), like the light of a spot light: the local X axis maps to the horizontal texture
++    /// coordinate (U) and the local Y axis is the up direction of the texture.
++    /// </para>
++    /// <para>
++    /// Any material can be projected. Its transparency mode (Blend, Additive or Cutoff) and its alpha control how the
++    /// decal blends over the surface; an opaque material covers the whole projected area. The decal is lit and shadowed
++    /// like the surface it is projected on.
++    /// </para>
++    /// </remarks>
++    [DataContract("DecalComponent")]
++    [Display("Decal", Expand = ExpandRule.Once)]
++    [DefaultEntityComponentRenderer(typeof(DecalRenderProcessor))]
++    [ComponentOrder(11100)]
++    [ComponentCategory("Model")]
++    public sealed class DecalComponent : ActivableEntityComponent
++    {
++        /// <summary>
++        /// Gets or sets the material projected by the decal.
++        /// </summary>
++        /// <userdoc>The material projected onto the surfaces inside the decal volume. Use a material with a transparency mode to blend it over the surfaces.</userdoc>
++        [DataMember(10)]
++        [DefaultValue(null)]
++        public Material Material { get; set; }
++
++        /// <summary>
++        /// Gets or sets the size of the decal volume: the width (X) and height (Y) of the projected area, and the depth (Z) of the projection.
++        /// </summary>
++        /// <remarks>The size is expressed in the local space of the entity, so it is also scaled by the entity transform.</remarks>
++        /// <userdoc>The width and height of the projected area, and the depth of the projection along the forward axis of the entity.</userdoc>
++        [DataMember(20)]
++        public Vector3 Size { get; set; } = Vector3.One;
++
++        /// <summary>
++        /// Gets or sets the opacity of the decal, multiplied with the output of its material.
++        /// </summary>
++        /// <userdoc>The opacity of the decal. Use it to fade decals in or out.</userdoc>
++        [DataMember(30)]
++        [DataMemberRange(0.0, 1.0, 0.01, 0.1, 2)]
++        [DefaultValue(1.0f)]
++        public float Opacity { get; set; } = 1.0f;
++
++        /// <summary>
++        /// Gets or sets the angle, in degrees, between the projection direction and the surface normal from which the decal starts to fade out.
++        /// </summary>
++        /// <userdoc>The angle between the projection direction and a surface from which the decal starts to fade out.</userdoc>
++        [DataMember(40)]
++        [DataMemberRange(0.0, 180.0, 1.0, 10.0, 1)]
++        [DefaultValue(60.0f)]
++        [Display("Angle fade start")]
++        public float AngleFadeStart { get; set; } = 60.0f;
++
++        /// <summary>
++        /// Gets or sets the angle, in degrees, between the projection direction and the surface normal from which the decal is no longer visible.
++        /// </summary>
++        /// <remarks>Use an angle larger than 90 degrees to also project on surfaces facing away from the projection, such as both sides of a thin wall.</remarks>
++        /// <userdoc>The angle between the projection direction and a surface from which the decal is no longer visible. Values larger than 90 also project on surfaces facing away.</userdoc>
++        [DataMember(50)]
++        [DataMemberRange(0.0, 180.0, 1.0, 10.0, 1)]
++        [DefaultValue(85.0f)]
++        [Display("Angle fade end")]
++        public float AngleFadeEnd { get; set; } = 85.0f;
++
++        /// <summary>
++        /// Gets or sets the fraction of the projection depth, at the far end of the volume, over which the decal fades out.
++        /// </summary>
++        /// <userdoc>The fraction of the projection depth over which the decal fades out at the far end of the volume. 0 cuts the decal sharply.</userdoc>
++        [DataMember(60)]
++        [DataMemberRange(0.0, 1.0, 0.01, 0.1, 2)]
++        [DefaultValue(0.0f)]
++        [Display("Depth fade")]
++        public float DepthFade { get; set; }
++
++        /// <summary>
++        /// Gets or sets the draw order of the decal relative to the other decals. Decals with a higher sort order are drawn on top.
++        /// </summary>
++        /// <remarks>Decals with the same sort order are drawn in creation order.</remarks>
++        /// <userdoc>The draw order of overlapping decals. Decals with a higher value are drawn on top.</userdoc>
++        [DataMember(70)]
++        [DefaultValue(0)]
++        [Display("Sort order")]
++        public int SortOrder { get; set; }
++
++        /// <summary>
++        /// Gets or sets the render group of the decal.
++        /// </summary>
++        /// <userdoc>The render group of the decal, used to choose the cameras rendering it.</userdoc>
++        [DataMember(80)]
++        [DefaultValue(RenderGroup.Group0)]
++        [Display("Render group")]
++        public RenderGroup RenderGroup { get; set; }
++    }
++}
+diff --git a/sources/engine/Stride.Engine/Rendering/Compositing/ForwardRenderer.cs b/sources/engine/Stride.Engine/Rendering/Compositing/ForwardRenderer.cs
+index e1605e3..d6e6a68 100644
+--- a/sources/engine/Stride.Engine/Rendering/Compositing/ForwardRenderer.cs
++++ b/sources/engine/Stride.Engine/Rendering/Compositing/ForwardRenderer.cs
+@@ -35,6 +35,7 @@ namespace Stride.Rendering.Compositing
+         private Texture depthStencilROCached;
+         private MultisampleCount actualMultisampleCount = MultisampleCount.None;
+         private VRDeviceSystem vrSystem;
++        private bool decalMultisampleWarningLogged;
+ 
+         private readonly Logger logger = GlobalLogger.GetLogger(nameof(ForwardRenderer));
+ 
+@@ -67,6 +68,16 @@ namespace Stride.Rendering.Compositing
+         /// </summary>
+         public RenderStage TransparentRenderStage { get; set; }
+ 
++        /// <summary>
++        /// The render stage for decals, drawn after the opaque geometry they are projected on and before the transparent geometry.
++        /// </summary>
++        /// <remarks>
++        /// The depth buffer of the opaque geometry is available as a shader resource named DepthBase.DepthStencil during this stage.
++        /// When it is not set, decals are rendered in the <see cref="TransparentRenderStage"/> (see <see cref="MeshTransparentRenderStageSelector.DecalRenderStage"/>).
++        /// Decals are not drawn when multisampling is enabled.
++        /// </remarks>
++        public RenderStage DecalRenderStage { get; set; }
++
+         /// <summary>
+         /// The shadow map render stages for shadow casters. No shadow rendering will happen if null.
+         /// </summary>
+@@ -233,6 +244,12 @@ namespace Stride.Rendering.Compositing
+                 TransparentRenderStage.OutputValidator.Validate(ref context.RenderOutput);
+             }
+ 
++            if (DecalRenderStage != null)
++            {
++                // Decals only blend over the color of the opaque geometry
++                DecalRenderStage.OutputValidator.Validate(ref context.RenderOutput);
++            }
++
+             if (GBufferRenderStage != null && LightProbes)
+             {
+                 GBufferRenderStage.Output = new RenderOutputDescription(PixelFormat.None, context.RenderOutput.DepthStencilFormat);
+@@ -279,6 +296,11 @@ namespace Stride.Rendering.Compositing
+                 context.RenderView.RenderStages.Add(OpaqueRenderStage);
+             }
+ 
++            if (DecalRenderStage != null)
++            {
++                context.RenderView.RenderStages.Add(DecalRenderStage);
++            }
++
+             if (TransparentRenderStage != null)
+             {
+                 context.RenderView.RenderStages.Add(TransparentRenderStage);
+@@ -525,6 +547,21 @@ namespace Stride.Rendering.Compositing
+ 
+                 Texture depthStencilSRV = null;
+ 
++                // Draw [main view | decal stage]
++                if (DecalRenderStage != null && CanDrawDecals())
++                {
++                    using (drawContext.QueryManager.BeginProfile(Color.Green, CompositingProfilingKeys.Decals))
++                    using (drawContext.PushRenderTargetsAndRestore())
++                    {
++                        // Decals are projected on the opaque geometry reconstructed from its depth buffer
++                        depthStencilSRV = BindDepthAsShaderResource(drawContext, depthStencilSRV);
++
++                        SetStageRenderTargets(drawContext, DecalRenderStage);
++
++                        renderSystem.Draw(drawContext, context.RenderView, DecalRenderStage);
++                    }
++                }
++
+                 // Draw [main view | subsurface scattering post process]
+                 if (SubsurfaceScatteringBlurEffect != null)
+                 {
+@@ -533,7 +570,8 @@ namespace Stride.Rendering.Compositing
+                     {
+                         using (drawContext.PushRenderTargetsAndRestore())
+                         {
+-                            depthStencilSRV = ResolveDepthAsSRV(drawContext);
++                            // Reuse the depth resolved for the decals, if any (decals do not write depth)
++                            depthStencilSRV = depthStencilSRV != null ? BindDepthAsShaderResource(drawContext, depthStencilSRV) : ResolveDepthAsSRV(drawContext);
+ 
+                             var renderTarget = drawContext.CommandList.RenderTargets[0];
+                             var materialIndexRenderTarget = drawContext.CommandList.RenderTargets[materialIndex];
+@@ -552,6 +590,8 @@ namespace Stride.Rendering.Compositing
+                     {
+                         if (depthStencilSRV == null)
+                             depthStencilSRV = ResolveDepthAsSRV(drawContext);
++                        else if (BindDepthAsResourceDuringTransparentRendering)
++                            BindDepthAsShaderResource(drawContext, depthStencilSRV); // Already resolved: bind the read-only depth view again
+ 
+                         var renderTargetSRV = ResolveRenderTargetAsSRV(drawContext);
+ 
+@@ -780,10 +820,22 @@ namespace Stride.Rendering.Compositing
+             if (!BindDepthAsResourceDuringTransparentRendering)
+                 return null;
+ 
++            return BindDepthAsShaderResource(context, depthStencilSRV: null);
++        }
++
++        /// <summary>
++        /// Binds the depth buffer as the shader resource DepthBase.DepthStencil of the current view, and binds a read-only
++        /// view of it so that it can still be used for depth testing.
++        /// </summary>
++        /// <param name="context">The draw context.</param>
++        /// <param name="depthStencilSRV">The depth buffer previously resolved as a shader resource, or <c>null</c> to resolve it now.</param>
++        /// <returns>The depth buffer as a shader resource; <c>null</c> if the device cannot read the depth buffer from shaders.</returns>
++        private Texture BindDepthAsShaderResource(RenderDrawContext context, Texture depthStencilSRV)
++        {
+             var commandList = context.CommandList;
+ 
+             var depthStencil = commandList.DepthStencilBuffer;
+-            var depthStencilSRV = context.Resolver.ResolveDepthStencil(commandList.DepthStencilBuffer);
++            depthStencilSRV ??= context.Resolver.ResolveDepthStencil(depthStencil);
+ 
+             var renderView = context.RenderContext.RenderView;
+ 
+@@ -821,15 +873,41 @@ namespace Stride.Rendering.Compositing
+         /// </summary>
+         internal void SetTransparentStageRenderTargets(RenderDrawContext drawContext)
+         {
+-            if (TransparentRenderStage == null)
++            SetStageRenderTargets(drawContext, TransparentRenderStage);
++        }
++
++        /// <summary>
++        /// Binds only the render targets a stage outputs, dropping any surplus opaque targets left bound (e.g. by
++        /// post-effects such as Local Reflections) so the framebuffer matches the render pass of the stage.
++        /// </summary>
++        internal static void SetStageRenderTargets(RenderDrawContext drawContext, RenderStage renderStage)
++        {
++            if (renderStage == null)
+                 return;
+ 
+             var commandList = drawContext.CommandList;
+-            var declaredCount = TransparentRenderStage.Output.RenderTargetCount;
++            var declaredCount = renderStage.Output.RenderTargetCount;
+             if (declaredCount >= 1 && commandList.RenderTargetCount > declaredCount)
+                 commandList.SetRenderTargets(commandList.DepthStencilBuffer, commandList.RenderTargets.Slice(0, declaredCount));
+         }
+ 
++        /// <summary>
++        /// Checks whether the <see cref="DecalRenderStage"/> can be drawn: decals sample the depth buffer, which is not supported with multisampling yet.
++        /// </summary>
++        private bool CanDrawDecals()
++        {
++            if (actualMultisampleCount == MultisampleCount.None)
++                return true;
++
++            if (!decalMultisampleWarningLogged)
++            {
++                logger.Warning("Decals are not drawn because multisampling (MSAA) is enabled on the forward renderer.");
++                decalMultisampleWarningLogged = true;
++            }
++
++            return false;
++        }
++
+         private Texture ResolveRenderTargetAsSRV(RenderDrawContext drawContext)
+         {
+             if (!BindOpaqueAsResourceDuringTransparentRendering)
+diff --git a/sources/engine/Stride.Engine/Rendering/Compositing/GraphicsCompositorHelper.cs b/sources/engine/Stride.Engine/Rendering/Compositing/GraphicsCompositorHelper.cs
+index f30afba..3877fe8 100644
+--- a/sources/engine/Stride.Engine/Rendering/Compositing/GraphicsCompositorHelper.cs
++++ b/sources/engine/Stride.Engine/Rendering/Compositing/GraphicsCompositorHelper.cs
+@@ -5,6 +5,7 @@ using Stride.Core.Mathematics;
+ using Stride.Engine;
+ using Stride.Graphics;
+ using Stride.Rendering.Background;
++using Stride.Rendering.Decals;
+ using Stride.Rendering.Images;
+ using Stride.Rendering.Lights;
+ using Stride.Rendering.Materials;
+@@ -25,6 +26,7 @@ namespace Stride.Rendering.Compositing
+         {
+             var opaqueRenderStage = new RenderStage("Opaque", "Main") { SortMode = new StateChangeSortMode() };
+             var transparentRenderStage = new RenderStage("Transparent", "Main") { SortMode = new BackToFrontSortMode() };
++            var decalRenderStage = new RenderStage("Decals", "Main") { SortMode = new DecalSortMode() };
+             var shadowCasterRenderStage = new RenderStage("ShadowMapCaster", "ShadowMapCaster") { SortMode = new FrontToBackSortMode() };
+             var shadowCasterCubeMapRenderStage = new RenderStage("ShadowMapCasterCubeMap", "ShadowMapCasterCubeMap") { SortMode = new FrontToBackSortMode() };
+             var shadowCasterParaboloidRenderStage = new RenderStage("ShadowMapCasterParaboloid", "ShadowMapCasterParaboloid") { SortMode = new FrontToBackSortMode() };
+@@ -53,6 +55,7 @@ namespace Stride.Rendering.Compositing
+                 Clear = { Color = clearColor ?? Color.CornflowerBlue },
+                 OpaqueRenderStage = opaqueRenderStage,
+                 TransparentRenderStage = transparentRenderStage,
++                DecalRenderStage = decalRenderStage,
+                 ShadowMapRenderStages = { shadowCasterRenderStage, shadowCasterParaboloidRenderStage, shadowCasterCubeMapRenderStage },
+                 PostEffects = postProcessingEffects,
+             };
+@@ -118,6 +121,7 @@ namespace Stride.Rendering.Compositing
+                 {
+                     opaqueRenderStage,
+                     transparentRenderStage,
++                    decalRenderStage,
+                     shadowCasterRenderStage,
+                     shadowCasterParaboloidRenderStage,
+                     shadowCasterCubeMapRenderStage,
+@@ -133,6 +137,7 @@ namespace Stride.Rendering.Compositing
+                             new MaterialRenderFeature(),
+                             new ShadowCasterRenderFeature(),
+                             forwardLighting,
++                            new DecalRenderFeature(),
+                         },
+                         RenderStageSelectors =
+                         {
+@@ -141,6 +146,7 @@ namespace Stride.Rendering.Compositing
+                                 EffectName = modelEffectName,
+                                 OpaqueRenderStage = opaqueRenderStage,
+                                 TransparentRenderStage = transparentRenderStage,
++                                DecalRenderStage = decalRenderStage,
+                                 RenderGroup = groupMask,
+                             },
+                             new ShadowMapRenderStageSelector
+diff --git a/sources/engine/Stride.Engine/Rendering/Decals/DecalRenderProcessor.cs b/sources/engine/Stride.Engine/Rendering/Decals/DecalRenderProcessor.cs
+new file mode 100644
+index 0000000..5b8085f
+--- /dev/null
++++ b/sources/engine/Stride.Engine/Rendering/Decals/DecalRenderProcessor.cs
+@@ -0,0 +1,209 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using Stride.Core;
++using Stride.Core.Diagnostics;
++using Stride.Engine;
++using Stride.Extensions;
++using Stride.Graphics;
++using Stride.Graphics.GeometricPrimitives;
++
++namespace Stride.Rendering.Decals
++{
++    /// <summary>
++    /// Creates the <see cref="RenderDecal"/> of the <see cref="DecalComponent"/>s and keeps them up to date.
++    /// </summary>
++    /// <remarks>
++    /// Decals are rendered by the <see cref="MeshRenderFeature"/>, which needs a <see cref="DecalRenderFeature"/> to project them.
++    /// If the graphics compositor does not have one, it is added the first time decals are drawn, so that decals also work
++    /// with graphics compositors created before decals were supported (they are then rendered in the transparent stage).
++    /// </remarks>
++    public class DecalRenderProcessor : EntityProcessor<DecalComponent, RenderDecal>, IEntityComponentRenderProcessor
++    {
++        private static readonly Logger Log = GlobalLogger.GetLogger(nameof(DecalRenderProcessor));
++
++        private GeometricPrimitive volumePrimitive;
++        private Mesh volumeMesh;
++        private bool isDepthAsShaderResourceSupported = true;
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="DecalRenderProcessor"/> class.
++        /// </summary>
++        public DecalRenderProcessor()
++            : base(typeof(TransformComponent))
++        {
++        }
++
++        /// <inheritdoc/>
++        public VisibilityGroup VisibilityGroup { get; set; }
++
++        /// <inheritdoc/>
++        protected internal override void OnSystemAdd()
++        {
++            base.OnSystemAdd();
++
++            var graphicsDevice = Services.GetSafeServiceAs<IGraphicsDeviceService>().GraphicsDevice;
++
++            // The volume of every decal is the unit cube (from -0.5 to 0.5 on each axis), transformed by RenderDecal.World
++            volumePrimitive = GeometricPrimitive.Cube.New(graphicsDevice, 1.0f);
++            volumeMesh = new Mesh { Draw = volumePrimitive.ToMeshDraw(), Name = "DecalVolume" };
++
++            isDepthAsShaderResourceSupported = graphicsDevice.Features.HasDepthAsSRV;
++            if (!isDepthAsShaderResourceSupported)
++                Log.Warning("Decals are not rendered: this graphics device cannot read the depth buffer from shaders.");
++        }
++
++        /// <inheritdoc/>
++        protected internal override void OnSystemRemove()
++        {
++            foreach (var renderDecal in ComponentDatas.Values)
++                Unregister(renderDecal);
++
++            volumeMesh = null;
++            volumePrimitive?.Dispose();
++            volumePrimitive = null;
++
++            base.OnSystemRemove();
++        }
++
++        /// <inheritdoc/>
++        protected override RenderDecal GenerateComponentData(Entity entity, DecalComponent component)
++        {
++            return new RenderDecal { Source = component };
++        }
++
++        /// <inheritdoc/>
++        protected override bool IsAssociatedDataValid(Entity entity, DecalComponent component, RenderDecal associatedData)
++        {
++            return associatedData.Source == component;
++        }
++
++        /// <inheritdoc/>
++        protected override void OnEntityComponentRemoved(Entity entity, DecalComponent component, RenderDecal data)
++        {
++            Unregister(data);
++        }
++
++        /// <inheritdoc/>
++        public override void Draw(RenderContext context)
++        {
++            if (ComponentDatas.Count == 0 || VisibilityGroup == null)
++                return;
++
++            EnsureDecalRenderFeature(VisibilityGroup.RenderSystem);
++
++            foreach (var (component, renderDecal) in ComponentDatas)
++            {
++                var materialPass = GetMaterialPass(component);
++                var canRender = materialPass != null && isDepthAsShaderResourceSupported;
++
++                // A new material or render group can change the effect, the pipeline state and the render stages of the decal:
++                // register it again so that everything is evaluated from scratch
++                if (IsRegistered(renderDecal) && (!canRender || renderDecal.MaterialPass != materialPass || renderDecal.RenderGroup != component.RenderGroup))
++                    Unregister(renderDecal);
++
++                if (!canRender)
++                    continue;
++
++                UpdateRenderDecal(component, renderDecal, materialPass, volumeMesh);
++
++                if (!IsRegistered(renderDecal))
++                    Register(renderDecal);
++            }
++        }
++
++        /// <summary>
++        /// Copies the state of a decal component to its render decal.
++        /// </summary>
++        /// <param name="component">The decal component.</param>
++        /// <param name="renderDecal">The render decal to update.</param>
++        /// <param name="materialPass">The material pass projected by the decal.</param>
++        /// <param name="volumeMesh">The mesh of the decal volume (the unit cube).</param>
++        internal static void UpdateRenderDecal(DecalComponent component, RenderDecal renderDecal, MaterialPass materialPass, Mesh volumeMesh)
++        {
++            var volumeWorld = RenderDecal.ComputeWorldMatrix(component.Size, component.Entity.Transform.WorldMatrix);
++            var determinant = volumeWorld.Determinant();
++
++            // A flat volume does not project anything (and cannot be inverted by the shader)
++            renderDecal.Enabled = component.Enabled && determinant != 0.0f && float.IsFinite(determinant);
++            renderDecal.RenderGroup = component.RenderGroup;
++            renderDecal.MaterialPass = materialPass;
++            renderDecal.Mesh = volumeMesh;
++            renderDecal.World = volumeWorld;
++            renderDecal.IsScalingNegative = determinant < 0.0f;
++            renderDecal.BoundingBox = RenderDecal.ComputeBoundingBox(volumeWorld);
++
++            renderDecal.Opacity = component.Opacity;
++            renderDecal.AngleFadeStart = component.AngleFadeStart;
++            renderDecal.AngleFadeEnd = component.AngleFadeEnd;
++            renderDecal.DepthFade = component.DepthFade;
++            renderDecal.SortOrder = component.SortOrder;
++        }
++
++        /// <summary>
++        /// Adds a <see cref="DecalRenderFeature"/> to the mesh render features that do not have one.
++        /// </summary>
++        /// <param name="renderSystem">The render system.</param>
++        /// <returns><c>true</c> if a decal render feature was added; otherwise, <c>false</c>.</returns>
++        internal static bool EnsureDecalRenderFeature(RenderSystem renderSystem)
++        {
++            if (renderSystem == null)
++                return false;
++
++            var added = false;
++            foreach (var renderFeature in renderSystem.RenderFeatures)
++            {
++                if (renderFeature is not MeshRenderFeature meshRenderFeature || HasDecalRenderFeature(meshRenderFeature))
++                    continue;
++
++                meshRenderFeature.RenderFeatures.Add(new DecalRenderFeature());
++                Log.Info($"Added a {nameof(DecalRenderFeature)} to the {nameof(MeshRenderFeature)} of the graphics compositor to render decals.");
++                added = true;
++            }
++
++            return added;
++        }
++
++        private static bool HasDecalRenderFeature(MeshRenderFeature meshRenderFeature)
++        {
++            foreach (var subRenderFeature in meshRenderFeature.RenderFeatures)
++            {
++                if (subRenderFeature is DecalRenderFeature)
++                    return true;
++            }
++
++            return false;
++        }
++
++        private static MaterialPass GetMaterialPass(DecalComponent component)
++        {
++            // Only the first pass of the material is projected
++            var passes = component.Material?.Passes;
++            return passes is { Count: > 0 } ? passes[0] : null;
++        }
++
++        private static bool IsRegistered(RenderDecal renderDecal)
++        {
++            return renderDecal.VisibilityObjectNode != StaticObjectNodeReference.Invalid;
++        }
++
++        private void Register(RenderDecal renderDecal)
++        {
++            lock (VisibilityGroup.RenderObjects)
++            {
++                VisibilityGroup.RenderObjects.Add(renderDecal);
++            }
++        }
++
++        private void Unregister(RenderDecal renderDecal)
++        {
++            if (VisibilityGroup == null || !IsRegistered(renderDecal))
++                return;
++
++            lock (VisibilityGroup.RenderObjects)
++            {
++                VisibilityGroup.RenderObjects.Remove(renderDecal);
++            }
++        }
++    }
++}
+diff --git a/sources/engine/Stride.Rendering/Rendering/Compositing/CompositingProfilingKeys.cs b/sources/engine/Stride.Rendering/Rendering/Compositing/CompositingProfilingKeys.cs
+index 0b372b4..1742dcc 100644
+--- a/sources/engine/Stride.Rendering/Rendering/Compositing/CompositingProfilingKeys.cs
++++ b/sources/engine/Stride.Rendering/Rendering/Compositing/CompositingProfilingKeys.cs
+@@ -11,6 +11,8 @@ namespace Stride.Rendering.Compositing
+ 
+         public static readonly ProfilingKey Opaque = new ProfilingKey(Compositing, "Opaque");
+ 
++        public static readonly ProfilingKey Decals = new ProfilingKey(Compositing, "Decals");
++
+         public static readonly ProfilingKey Transparent = new ProfilingKey(Compositing, "Transparent");
+ 
+         public static readonly ProfilingKey MsaaResolve = new ProfilingKey(Compositing, "MSAA Resolve");
+diff --git a/sources/engine/Stride.Rendering/Rendering/Decals/DecalProjection.sdsl b/sources/engine/Stride.Rendering/Rendering/Decals/DecalProjection.sdsl
+new file mode 100644
+index 0000000..3571612
+--- /dev/null
++++ b/sources/engine/Stride.Rendering/Rendering/Decals/DecalProjection.sdsl
+@@ -0,0 +1,160 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++namespace Stride.Rendering.Decals
++{
++    /// <summary>
++    /// Projects the material of a decal onto the opaque geometry already present in the depth buffer.
++    /// </summary>
++    /// <remarks>
++    /// The decal volume (a unit cube transformed by the World matrix) is only rasterized to find the pixels that can
++    /// receive the decal. For each of them, the receiving surface is reconstructed from the depth buffer: its position,
++    /// normal and tangent frame, and the decal texture coordinates replace the streams of the volume before the
++    /// material and the lighting are evaluated, so the decal is shaded exactly like the surface it is projected on.
++    /// The material is projected along the local -Z axis; local X maps to U and local Y maps to V (upward).
++    /// </remarks>
++    shader DecalProjection : ShaderBase, NormalBase, Transformation, PositionStream4, PositionHStream4, DepthBase
++    {
++        cbuffer PerDraw.Decal
++        {
++            // x: opacity, y: angle fade scale, z: angle fade bias, w: depth fade scale (see RenderDecal.ComputeShaderParameters)
++            stage float4 DecalParameters;
++        };
++
++        // The normal of the receiving surface, in world space
++        stage stream float3 DecalSurfaceNormalWS;
++
++        // The tangent frame of the decal on the receiving surface, in world space
++        stage stream float3x3 DecalTangentToWorld;
++
++        // The opacity of the decal at the current pixel (0 outside of the volume)
++        stage stream float DecalFade;
++
++        override stage void PSMain()
++        {
++            ProjectDecal();
++
++            // Evaluate the material and the lighting on the receiving surface
++            base.PSMain();
++
++            streams.ColorTarget *= streams.DecalFade;
++
++            // Discard only now, so that the texture coordinate derivatives used by the material stay valid on the decal borders
++            clip(streams.DecalFade - 1.0 / 1024.0);
++        }
++
++        override stage void GenerateNormal_PS()
++        {
++            // The normals of the volume are meaningless: shade the decal with the normal of the receiving surface
++            streams.normalWS = streams.DecalSurfaceNormalWS;
++            streams.meshNormalWS = streams.DecalSurfaceNormalWS;
++            streams.tangentToWorld = streams.DecalTangentToWorld;
++        }
++
++        float LoadDecalDepth(int2 pixel, int2 maxPixel)
++        {
++            return GetZProjDepthFromScreenPosition(clamp(pixel, int2(0, 0), maxPixel));
++        }
++
++        float3 ComputeDecalPositionVS(float2 positionNDC, float depth)
++        {
++            float4 positionVS = mul(float4(positionNDC, depth, 1.0), ProjectionInverse);
++            return positionVS.xyz / positionVS.w;
++        }
++
++        stage void ProjectDecal()
++        {
++            uint depthWidth;
++            uint depthHeight;
++            DepthStencil.GetDimensions(depthWidth, depthHeight);
++            int2 maxPixel = int2(depthWidth, depthHeight) - 1;
++
++            int2 pixel = int2(streams.ShadingPosition.xy);
++            float2 positionNDC = streams.PositionH.xy / streams.PositionH.w;
++
++            // Size of a pixel in normalized device coordinates (the sign follows the direction of the pixel rows and columns)
++            float2 pixelSizeNDC = float2(ddx(positionNDC.x), ddy(positionNDC.y));
++
++            // Reconstruct the receiving surface from the depth buffer
++            float depth = LoadDecalDepth(pixel, maxPixel);
++            float depthRight = LoadDecalDepth(pixel + int2(1, 0), maxPixel);
++            float depthLeft = LoadDecalDepth(pixel - int2(1, 0), maxPixel);
++            float depthDown = LoadDecalDepth(pixel + int2(0, 1), maxPixel);
++            float depthUp = LoadDecalDepth(pixel - int2(0, 1), maxPixel);
++
++            float3 positionVS = ComputeDecalPositionVS(positionNDC, depth);
++
++            // Use the neighbor closest in depth on each axis, to avoid wrong normals on depth discontinuities
++            float3 tangentXVS;
++            if (abs(depthRight - depth) < abs(depth - depthLeft))
++                tangentXVS = ComputeDecalPositionVS(positionNDC + float2(pixelSizeNDC.x, 0.0), depthRight) - positionVS;
++            else
++                tangentXVS = positionVS - ComputeDecalPositionVS(positionNDC - float2(pixelSizeNDC.x, 0.0), depthLeft);
++
++            float3 tangentYVS;
++            if (abs(depthDown - depth) < abs(depth - depthUp))
++                tangentYVS = ComputeDecalPositionVS(positionNDC + float2(0.0, pixelSizeNDC.y), depthDown) - positionVS;
++            else
++                tangentYVS = positionVS - ComputeDecalPositionVS(positionNDC - float2(0.0, pixelSizeNDC.y), depthUp);
++
++            float3 normalVS = cross(tangentYVS, tangentXVS);
++            float normalLength = length(normalVS);
++            if (normalLength > 0.0)
++                normalVS /= normalLength;
++            else
++                normalVS = float3(0.0, 0.0, 1.0);
++
++            // The receiving surface is visible, so its normal faces the camera
++            float3 toCameraVS = -positionVS;
++            if (Projection[3][3] > 0.5)
++                toCameraVS = float3(0.0, 0.0, 1.0); // Orthographic projection: the view direction is constant
++            if (dot(normalVS, toCameraVS) < 0.0)
++                normalVS = -normalVS;
++
++            float3 positionWS = mul(float4(positionVS, 1.0), ViewInverse).xyz;
++            float3 normalWS = normalize(mul(normalVS, (float3x3)ViewInverse));
++
++            // Position of the receiving surface inside the decal volume (the volume is the unit cube centered on the origin)
++            float3 positionDecal = mul(float4(positionWS, 1.0), WorldInverse).xyz;
++
++            float3 axisXWS = normalize(World[0].xyz);
++            float3 axisYWS = normalize(World[1].xyz);
++            float3 axisZWS = normalize(World[2].xyz);
++
++            float fade = 0.0;
++            if (abs(positionDecal.x) <= 0.5 && abs(positionDecal.y) <= 0.5 && abs(positionDecal.z) <= 0.5)
++            {
++                // Fade out on surfaces that are not facing the projector, and toward the far end of the volume
++                float angleFade = saturate(dot(normalWS, axisZWS) * DecalParameters.y + DecalParameters.z);
++                float depthFade = saturate((positionDecal.z + 0.5) * DecalParameters.w);
++                fade = saturate(DecalParameters.x) * angleFade * depthFade;
++            }
++            streams.DecalFade = fade;
++
++            // Tangent frame: tangent along increasing U (local X), bitangent along increasing V (local -Y), like mesh tangents
++            float3 tangentWS = axisXWS - normalWS * dot(axisXWS, normalWS);
++            if (dot(tangentWS, tangentWS) < 1.0e-8)
++            {
++                // The X axis of the decal is aligned with the surface normal: derive the tangent from the Y axis instead
++                float3 decreasingVWS = axisYWS - normalWS * dot(axisYWS, normalWS);
++                tangentWS = cross(decreasingVWS, normalWS);
++            }
++            tangentWS = normalize(tangentWS);
++            float3 bitangentWS = cross(tangentWS, normalWS);
++
++            streams.DecalSurfaceNormalWS = normalWS;
++            streams.DecalTangentToWorld = float3x3(tangentWS, bitangentWS, normalWS);
++
++            // Replace the streams of the volume with the ones of the receiving surface
++#if !(STRIDE_GRAPHICS_API_DIRECT3D && STRIDE_GRAPHICS_PROFILE < GRAPHICS_PROFILE_LEVEL_10_0)
++            // The back faces of the volume are rasterized, but the receiving surface faces the camera:
++            // without this, the lighting would flip the normal as for the back faces of two-sided materials
++            streams.IsFrontFace = true;
++#endif
++            streams.PositionWS = float4(positionWS, 1.0);
++            streams.DepthVS = mul(float4(positionWS, 1.0), ViewProjection).w;
++            streams.ShadingPosition.z = depth;
++            streams.TexCoord = float2(positionDecal.x + 0.5, 0.5 - positionDecal.y);
++        }
++    };
++}
+diff --git a/sources/engine/Stride.Rendering/Rendering/Decals/DecalRenderFeature.cs b/sources/engine/Stride.Rendering/Rendering/Decals/DecalRenderFeature.cs
+new file mode 100644
+index 0000000..a383552
+--- /dev/null
++++ b/sources/engine/Stride.Rendering/Rendering/Decals/DecalRenderFeature.cs
+@@ -0,0 +1,147 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using Stride.Core.Diagnostics;
++using Stride.Core.Mathematics;
++using Stride.Core.Threading;
++using Stride.Graphics;
++using Stride.Shaders;
++
++namespace Stride.Rendering.Decals
++{
++    /// <summary>
++    /// Projects the <see cref="RenderDecal"/> rendered by a <see cref="MeshRenderFeature"/> onto the receiving geometry.
++    /// </summary>
++    /// <remarks>
++    /// <para>
++    /// This feature must be added to <see cref="MeshRenderFeature.RenderFeatures"/>. For each decal, it mixes the
++    /// <c>DecalProjection</c> shader in the effect (through <see cref="StrideEffectBaseKeys.DecalShader"/>), uploads the
++    /// fade parameters, and sets up the pipeline state of the decal volume.
++    /// </para>
++    /// <para>
++    /// Decals sample the depth of the opaque geometry: they must be rendered in a stage drawn after the opaque stage,
++    /// while the depth buffer is bound as a shader resource (<c>DepthBase.DepthStencil</c>), such as the decal stage
++    /// or the transparent stage of the forward renderer.
++    /// </para>
++    /// </remarks>
++    public class DecalRenderFeature : SubRenderFeature
++    {
++        private static readonly ProfilingKey PrepareEffectPermutationsKey = new("DecalRenderFeature.PrepareEffectPermutations");
++        private static readonly ProfilingKey PrepareKey = new("DecalRenderFeature.Prepare");
++
++        private static readonly ShaderSource DecalProjectionShader = new ShaderClassSource("DecalProjection");
++
++        private StaticObjectPropertyKey<RenderEffect> renderEffectKey;
++        private ObjectPropertyKey<Vector4> decalParametersKey;
++        private ConstantBufferOffsetReference decalParameters;
++
++        /// <inheritdoc/>
++        protected override void InitializeCore()
++        {
++            base.InitializeCore();
++
++            var rootEffectRenderFeature = (RootEffectRenderFeature)RootRenderFeature;
++            renderEffectKey = rootEffectRenderFeature.RenderEffectKey;
++            decalParametersKey = RootRenderFeature.RenderData.CreateObjectKey<Vector4>();
++            decalParameters = rootEffectRenderFeature.CreateDrawCBufferOffsetSlot(DecalProjectionKeys.DecalParameters.Name);
++        }
++
++        /// <inheritdoc/>
++        public override void Extract()
++        {
++            var decalParametersData = RootRenderFeature.RenderData.GetData(decalParametersKey);
++
++            Dispatcher.ForEach(RootRenderFeature.ObjectNodeReferences, objectNodeReference =>
++            {
++                var objectNode = RootRenderFeature.GetObjectNode(objectNodeReference);
++                if (objectNode.RenderObject is RenderDecal renderDecal)
++                    decalParametersData[objectNodeReference] = renderDecal.GetShaderParameters();
++            });
++        }
++
++        /// <inheritdoc/>
++        public override void PrepareEffectPermutations(RenderDrawContext context)
++        {
++            using var _ = Profiler.Begin(PrepareEffectPermutationsKey);
++
++            var renderEffects = RootRenderFeature.RenderData.GetData(renderEffectKey);
++            var effectSlotCount = ((RootEffectRenderFeature)RootRenderFeature).EffectPermutationSlotCount;
++
++            Dispatcher.ForEach(RootRenderFeature.ObjectNodeReferences, objectNodeReference =>
++            {
++                var objectNode = RootRenderFeature.GetObjectNode(objectNodeReference);
++                if (objectNode.RenderObject is not RenderDecal renderDecal)
++                    return;
++
++                var staticObjectNode = renderDecal.StaticObjectNode;
++                for (var i = 0; i < effectSlotCount; ++i)
++                {
++                    var renderEffect = renderEffects[staticObjectNode * effectSlotCount + i];
++
++                    // Skip effects not used during this frame
++                    if (renderEffect == null || !renderEffect.IsUsedDuringThisFrame(RenderSystem))
++                        continue;
++
++                    renderEffect.EffectValidator.ValidateParameter(StrideEffectBaseKeys.DecalShader, DecalProjectionShader);
++                }
++            });
++        }
++
++        /// <inheritdoc/>
++        public override unsafe void Prepare(RenderDrawContext context)
++        {
++            using var _ = Profiler.Begin(PrepareKey);
++
++            var decalParametersData = RootRenderFeature.RenderData.GetData(decalParametersKey);
++
++            Dispatcher.ForBatched(RootRenderFeature.RenderNodes.Count, (from, toExclusive) =>
++            {
++                for (var i = from; i < toExclusive; i++)
++                {
++                    var renderNode = RootRenderFeature.RenderNodes[i];
++                    if (renderNode.RenderObject is not RenderDecal)
++                        continue;
++
++                    var perDrawLayout = renderNode.RenderEffect.Reflection?.PerDrawLayout;
++                    if (perDrawLayout == null)
++                        continue;
++
++                    var decalParametersOffset = perDrawLayout.GetConstantBufferOffset(decalParameters);
++                    if (decalParametersOffset == -1)
++                        continue;
++
++                    var mappedCB = (byte*)renderNode.Resources.ConstantBuffer.Data + decalParametersOffset;
++                    *(Vector4*)mappedCB = decalParametersData[renderNode.RenderObject.ObjectNode];
++                }
++            });
++        }
++
++        /// <inheritdoc/>
++        public override void ProcessPipelineState(RenderContext context, RenderNodeReference renderNodeReference, ref RenderNode renderNode, RenderObject renderObject, PipelineStateDescription pipelineState)
++        {
++            if (renderObject is RenderDecal renderDecal)
++                SetupPipelineState(renderDecal, pipelineState);
++        }
++
++        /// <summary>
++        /// Sets up the pipeline state used to draw the volume of a decal.
++        /// </summary>
++        /// <param name="renderDecal">The decal.</param>
++        /// <param name="pipelineState">The pipeline state to set up.</param>
++        internal static void SetupPipelineState(RenderDecal renderDecal, PipelineStateDescription pipelineState)
++        {
++            // Blend over the receiving surface: premultiplied alpha, unless the material has its own transparency mode
++            pipelineState.BlendState = renderDecal.MaterialPass?.BlendState ?? BlendStates.AlphaBlend;
++
++            // Draw the back faces of the volume, so that the decal is still visible when the camera is inside of it,
++            // and keep only the pixels where the opaque geometry is in front of them. A decal never writes depth.
++            pipelineState.DepthStencilState = new DepthStencilStateDescription(depthEnable: true, depthWriteEnable: false)
++            {
++                DepthBufferFunction = CompareFunction.GreaterEqual,
++            };
++
++            // The winding of the volume is reversed when its transformation is mirrored
++            pipelineState.RasterizerState.CullMode = renderDecal.IsScalingNegative ? CullMode.Back : CullMode.Front;
++        }
++    }
++}
+diff --git a/sources/engine/Stride.Rendering/Rendering/Decals/DecalSortMode.cs b/sources/engine/Stride.Rendering/Rendering/Decals/DecalSortMode.cs
+new file mode 100644
+index 0000000..6edfe3c
+--- /dev/null
++++ b/sources/engine/Stride.Rendering/Rendering/Decals/DecalSortMode.cs
+@@ -0,0 +1,48 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using Stride.Core;
++
++namespace Stride.Rendering.Decals
++{
++    /// <summary>
++    /// Sorts decals by <see cref="RenderDecal.SortOrder"/>, then by creation order, so that overlapping decals are
++    /// blended in a stable order and the most recent ones are drawn on top.
++    /// </summary>
++    /// <remarks>
++    /// Sort key pattern: [RenderFeature Sort Key 8 bits] [Decal sort order 32 bits] [unused 24 bits], ties broken by creation order.
++    /// </remarks>
++    [DataContract("DecalSortMode")]
++    public class DecalSortMode : SortMode
++    {
++        /// <inheritdoc/>
++        public override unsafe void GenerateSortKey(RenderView renderView, RenderViewStage renderViewStage, SortKey* sortKeys)
++        {
++            var renderNodes = renderViewStage.RenderNodes;
++
++            for (var i = 0; i < renderNodes.Count; ++i)
++            {
++                var renderNode = renderNodes[i];
++                var renderObject = renderNode.RenderObject;
++
++                sortKeys[i] = new SortKey { Value = ComputeSortKeyValue(renderNode.RootRenderFeature.SortKey, renderObject), Index = i, StableIndex = renderObject.Index };
++            }
++        }
++
++        /// <summary>
++        /// Computes the value of the sort key of a render object.
++        /// </summary>
++        /// <param name="renderFeatureSortKey">The sort key of the render feature of the object.</param>
++        /// <param name="renderObject">The render object.</param>
++        /// <returns>The value of the sort key.</returns>
++        internal static ulong ComputeSortKeyValue(byte renderFeatureSortKey, RenderObject renderObject)
++        {
++            var sortOrder = renderObject is RenderDecal renderDecal ? renderDecal.SortOrder : 0;
++
++            // Flip the sign bit so that negative sort orders come first when compared as unsigned values
++            var orderedSortOrder = unchecked((uint)sortOrder ^ 0x80000000u);
++
++            return ((ulong)renderFeatureSortKey << 56) | ((ulong)orderedSortOrder << 24);
++        }
++    }
++}
+diff --git a/sources/engine/Stride.Rendering/Rendering/Decals/RenderDecal.cs b/sources/engine/Stride.Rendering/Rendering/Decals/RenderDecal.cs
+new file mode 100644
+index 0000000..564e1f9
+--- /dev/null
++++ b/sources/engine/Stride.Rendering/Rendering/Decals/RenderDecal.cs
+@@ -0,0 +1,132 @@
++// Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net)
++// Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
++
++using System;
++using Stride.Core.Mathematics;
++
++namespace Stride.Rendering.Decals
++{
++    /// <summary>
++    /// A decal: a material projected onto the opaque geometry that is inside a box volume.
++    /// </summary>
++    /// <remarks>
++    /// <para>
++    /// The volume is the unit cube (from -0.5 to 0.5 on each axis) transformed by <see cref="RenderMesh.World"/>.
++    /// The material is projected along the local forward axis (-Z), with the local X axis mapped to the U texture
++    /// coordinate and the local Y axis mapped to the V texture coordinate (flipped so that the texture is upright).
++    /// </para>
++    /// <para>
++    /// A decal is drawn by the <see cref="MeshRenderFeature"/> like any <see cref="RenderMesh"/>, so it is lit and
++    /// shadowed by the same lights as the rest of the scene. The <see cref="DecalRenderFeature"/> sub render feature
++    /// must be part of the mesh render feature: it reconstructs the receiving surface from the depth buffer and
++    /// projects the material onto it.
++    /// </para>
++    /// </remarks>
++    public class RenderDecal : RenderMesh
++    {
++        /// <summary>
++        /// The largest value used for a fade scale, so that a zero-width fade range becomes a hard cut.
++        /// </summary>
++        internal const float MaxFadeScale = 1.0e4f;
++
++        /// <summary>
++        /// The global opacity of the decal, multiplied with the output of its material.
++        /// </summary>
++        public float Opacity = 1.0f;
++
++        /// <summary>
++        /// The angle, in degrees, between the projection axis and the surface normal from which the decal starts to fade out.
++        /// </summary>
++        public float AngleFadeStart = 60.0f;
++
++        /// <summary>
++        /// The angle, in degrees, between the projection axis and the surface normal from which the decal is no longer visible.
++        /// </summary>
++        public float AngleFadeEnd = 85.0f;
++
++        /// <summary>
++        /// The fraction of the projection depth, at the far end of the volume, over which the decal fades out.
++        /// </summary>
++        public float DepthFade;
++
++        /// <summary>
++        /// The draw order of the decal relative to the other decals. Decals with a higher sort order are drawn on top.
++        /// </summary>
++        public int SortOrder;
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="RenderDecal"/> class.
++        /// </summary>
++        public RenderDecal()
++        {
++            // A decal only receives light and never occludes anything.
++            IsShadowCaster = false;
++        }
++
++        /// <summary>
++        /// Gets the parameters uploaded to the decal shader: opacity, angle fade scale, angle fade bias and depth fade scale.
++        /// </summary>
++        /// <returns>The packed decal shader parameters.</returns>
++        public Vector4 GetShaderParameters() => ComputeShaderParameters(Opacity, AngleFadeStart, AngleFadeEnd, DepthFade);
++
++        /// <summary>
++        /// Computes the parameters uploaded to the decal shader.
++        /// </summary>
++        /// <param name="opacity">The global opacity of the decal.</param>
++        /// <param name="angleFadeStart">The angle, in degrees, from which the decal starts to fade out.</param>
++        /// <param name="angleFadeEnd">The angle, in degrees, from which the decal is no longer visible.</param>
++        /// <param name="depthFade">The fraction of the projection depth over which the decal fades out.</param>
++        /// <returns>
++        /// The opacity in X; in Y and Z the scale and bias that map the cosine between the surface normal and the projection axis
++        /// to an angle fade factor; in W the scale that maps the normalized distance from the far end of the volume to a depth fade factor.
++        /// </returns>
++        /// <remarks>
++        /// The shader computes <c>saturate(cos(angle) * Y + Z)</c> for the angle fade and <c>saturate((z + 0.5) * W)</c>
++        /// for the depth fade, where <c>z</c> is the position of the receiving surface along the local Z axis of the volume.
++        /// </remarks>
++        public static Vector4 ComputeShaderParameters(float opacity, float angleFadeStart, float angleFadeEnd, float depthFade)
++        {
++            var start = Math.Clamp(angleFadeStart, 0.0f, 180.0f);
++            var end = Math.Clamp(angleFadeEnd, 0.0f, 180.0f);
++            if (end < start)
++                end = start;
++
++            var cosStart = MathF.Cos(MathUtil.DegreesToRadians(start));
++            var cosEnd = MathF.Cos(MathUtil.DegreesToRadians(end));
++
++            // fade = saturate((cos - cosEnd) / (cosStart - cosEnd))
++            var angleRange = cosStart - cosEnd;
++            var angleScale = angleRange > 1.0f / MaxFadeScale ? 1.0f / angleRange : MaxFadeScale;
++            var angleBias = -cosEnd * angleScale;
++
++            // fade = saturate(normalizedDistanceFromFarEnd / depthFade)
++            var clampedDepthFade = Math.Clamp(depthFade, 0.0f, 1.0f);
++            var depthScale = clampedDepthFade > 1.0f / MaxFadeScale ? 1.0f / clampedDepthFade : MaxFadeScale;
++
++            return new Vector4(Math.Clamp(opacity, 0.0f, 1.0f), angleScale, angleBias, depthScale);
++        }
++
++        /// <summary>
++        /// Computes the world matrix of the projection volume of a decal.
++        /// </summary>
++        /// <param name="size">The size of the volume: width and height of the projected area, and depth of the projection.</param>
++        /// <param name="world">The world matrix of the decal entity.</param>
++        /// <returns>The world matrix transforming the unit cube into the projection volume.</returns>
++        public static Matrix ComputeWorldMatrix(Vector3 size, Matrix world)
++        {
++            return Matrix.Scaling(size) * world;
++        }
++
++        /// <summary>
++        /// Computes the world space bounding box of the projection volume of a decal.
++        /// </summary>
++        /// <param name="volumeWorld">The world matrix of the projection volume, see <see cref="ComputeWorldMatrix"/>.</param>
++        /// <returns>The bounding box of the volume in world space.</returns>
++        public static BoundingBoxExt ComputeBoundingBox(Matrix volumeWorld)
++        {
++            var boundingBox = new BoundingBoxExt(new Vector3(-0.5f), new Vector3(0.5f));
++            boundingBox.Transform(volumeWorld);
++            return boundingBox;
++        }
++    }
++}
+diff --git a/sources/engine/Stride.Rendering/Rendering/MeshPipelineProcessor.cs b/sources/engine/Stride.Rendering/Rendering/MeshPipelineProcessor.cs
+index fdde06b..2efb679 100644
+--- a/sources/engine/Stride.Rendering/Rendering/MeshPipelineProcessor.cs
++++ b/sources/engine/Stride.Rendering/Rendering/MeshPipelineProcessor.cs
+@@ -1,6 +1,7 @@
+ // Copyright (c) .NET Foundation and Contributors (https://dotnetfoundation.org/ & https://stride3d.net) and Silicon Studio Corp. (https://www.siliconstudio.co.jp)
+ // Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
+ using Stride.Graphics;
++using Stride.Rendering.Decals;
+ 
+ namespace Stride.Rendering
+ {
+@@ -17,6 +18,14 @@ namespace Stride.Rendering
+             var isMultisample = output.MultisampleCount != MultisampleCount.None;
+             var renderMesh = (RenderMesh)renderObject;
+ 
++            if (renderMesh is RenderDecal renderDecal)
++            {
++                // Decals have their own blend, depth and culling states, whatever their stage and their material
++                DecalRenderFeature.SetupPipelineState(renderDecal, pipelineState);
++                ApplyOutputStates(pipelineState, output);
++                return;
++            }
++
+             // Make object in transparent stage use AlphaBlend and DepthRead
+             if (renderNode.RenderStage == TransparentRenderStage)
+             {
+@@ -68,7 +77,12 @@ namespace Stride.Rendering
+             if (renderMesh.MaterialInfo.DepthFunction is {} newDepthFunction)
+                 pipelineState.DepthStencilState.DepthBufferFunction = newDepthFunction;
+ 
+-            if (isMultisample)
++            ApplyOutputStates(pipelineState, output);
++        }
++
++        private static void ApplyOutputStates(PipelineStateDescription pipelineState, in RenderOutputDescription output)
++        {
++            if (output.MultisampleCount != MultisampleCount.None)
+             {
+                 pipelineState.RasterizerState.MultisampleCount = output.MultisampleCount;
+                 pipelineState.RasterizerState.MultisampleAntiAliasLine = true;
+diff --git a/sources/engine/Stride.Rendering/Rendering/MeshTransparentRenderStageSelector.cs b/sources/engine/Stride.Rendering/Rendering/MeshTransparentRenderStageSelector.cs
+index 0dccc85..2fdd248 100644
+--- a/sources/engine/Stride.Rendering/Rendering/MeshTransparentRenderStageSelector.cs
++++ b/sources/engine/Stride.Rendering/Rendering/MeshTransparentRenderStageSelector.cs
+@@ -2,18 +2,33 @@
+ // Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
+ using System.ComponentModel;
+ using Stride.Engine;
++using Stride.Rendering.Decals;
+ 
+ namespace Stride.Rendering
+ {
+     public class MeshTransparentRenderStageSelector : TransparentRenderStageSelector
+     {
++        /// <summary>
++        /// The render stage of the decals (<see cref="RenderDecal"/>). When not set, decals are rendered in the <see cref="TransparentRenderStageSelector.TransparentRenderStage"/>.
++        /// </summary>
++        /// <remarks>
++        /// Decals are projected on the opaque geometry, so this stage must be drawn after the opaque stage, while its depth buffer is available as a shader resource.
++        /// </remarks>
++        [DefaultValue(null)]
++        public RenderStage DecalRenderStage { get; set; }
++
+         public override void Process(RenderObject renderObject)
+         {
+             if (((RenderGroupMask)(1U << (int)renderObject.RenderGroup) & RenderGroup) != 0)
+             {
+                 var renderMesh = (RenderMesh)renderObject;
+ 
+-                var renderStage = renderMesh.MaterialPass.HasTransparency ? TransparentRenderStage : OpaqueRenderStage;
++                RenderStage renderStage;
++                if (renderMesh is RenderDecal)
++                    renderStage = DecalRenderStage ?? TransparentRenderStage;
++                else
++                    renderStage = renderMesh.MaterialPass.HasTransparency ? TransparentRenderStage : OpaqueRenderStage;
++
+                 if (renderStage != null)
+                     renderObject.ActiveRenderStages[renderStage.Index] = new ActiveRenderStage(EffectName);
+             }
+diff --git a/sources/engine/Stride.Rendering/Rendering/RenderSystem.cs b/sources/engine/Stride.Rendering/Rendering/RenderSystem.cs
+index bb2acf7..3b06d34 100644
+--- a/sources/engine/Stride.Rendering/Rendering/RenderSystem.cs
++++ b/sources/engine/Stride.Rendering/Rendering/RenderSystem.cs
+@@ -606,20 +606,25 @@ namespace Stride.Rendering
+         /// Adds a <see cref="RenderObject"/> to the rendering.
+         /// </summary>
+         /// An appropriate <see cref="RootRenderFeature"/> will be found and the object will be initialized with it.
++        /// Render features supporting the exact type of the object are used first; otherwise the ones supporting its closest base type
++        /// (for instance, a <see cref="Decals.RenderDecal"/> is rendered by the <see cref="MeshRenderFeature"/>).
+         /// If nothing could be found, <see cref="RenderObject.RenderFeature"/> will be null.
+         /// <param name="renderObject"></param>
+         public void AddRenderObject(RenderObject renderObject)
+         {
+-            List<RootRenderFeature> renderFeatures;
+-
+-            if (renderFeaturesByType.TryGetValue(renderObject.GetType(), out renderFeatures))
++            for (var type = renderObject.GetType(); type != null && type != typeof(RenderObject); type = type.BaseType)
+             {
++                if (!renderFeaturesByType.TryGetValue(type, out var renderFeatures))
++                    continue;
++
+                 // Try each available compatible render feature
+                 foreach (var renderFeature in renderFeatures)
+                 {
+                     if (renderFeature.TryAddRenderObject(renderObject))
+                         break;
+                 }
++
++                return;
+             }
+         }
+ 
+diff --git a/sources/engine/Stride.Rendering/Rendering/SimpleGroupToRenderStageSelector.cs b/sources/engine/Stride.Rendering/Rendering/SimpleGroupToRenderStageSelector.cs
+index 09f016b..471dce8 100644
+--- a/sources/engine/Stride.Rendering/Rendering/SimpleGroupToRenderStageSelector.cs
++++ b/sources/engine/Stride.Rendering/Rendering/SimpleGroupToRenderStageSelector.cs
+@@ -2,6 +2,7 @@
+ // Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
+ using System.ComponentModel;
+ using Stride.Engine;
++using Stride.Rendering.Decals;
+ 
+ namespace Stride.Rendering
+ {
+@@ -16,6 +17,10 @@ namespace Stride.Rendering
+ 
+         public override void Process(RenderObject renderObject)
+         {
++            // The volume of a decal is not a visible surface: decals are only rendered by projection (see MeshTransparentRenderStageSelector.DecalRenderStage)
++            if (renderObject is RenderDecal)
++                return;
++
+             if (RenderStage != null && ((RenderGroupMask)(1U << (int)renderObject.RenderGroup) & RenderGroup) != 0)
+             {
+                 renderObject.ActiveRenderStages[RenderStage.Index] = new ActiveRenderStage(EffectName);
+diff --git a/sources/engine/Stride.Rendering/Rendering/StrideEffectBase.sdfx b/sources/engine/Stride.Rendering/Rendering/StrideEffectBase.sdfx
+index e706737..a52ac39 100644
+--- a/sources/engine/Stride.Rendering/Rendering/StrideEffectBase.sdfx
++++ b/sources/engine/Stride.Rendering/Rendering/StrideEffectBase.sdfx
+@@ -169,6 +169,16 @@ namespace Stride.Rendering
+             mixin (extensionPostVertexStage);
+         }
+ 
++        // -----------------------------------------------
++        // Decal projection: replaces the surface streams with the ones
++        // of the opaque geometry reconstructed from the depth buffer
++        // -----------------------------------------------
++        var decalShader = StrideEffectBaseKeys.DecalShader;
++        if (decalShader != null)
++        {
++            mixin (decalShader);
++        }
++
+         // -----------------------------------------------
+         // MRT output definitions (color0 excluded)
+         // -----------------------------------------------
+diff --git a/sources/engine/Stride.Rendering/Rendering/StrideEffectBaseKeys.cs b/sources/engine/Stride.Rendering/Rendering/StrideEffectBaseKeys.cs
+index 54a4f8f..4b76d1d 100644
+--- a/sources/engine/Stride.Rendering/Rendering/StrideEffectBaseKeys.cs
++++ b/sources/engine/Stride.Rendering/Rendering/StrideEffectBaseKeys.cs
+@@ -10,6 +10,11 @@ namespace Stride.Rendering
+     {
+         public static readonly PermutationParameterKey<ShaderSource> ExtensionPostVertexStageShader = ParameterKeys.NewPermutation<ShaderSource>();
+ 
++        /// <summary>
++        /// The shader projecting a decal onto the receiving surface reconstructed from the depth buffer (see <see cref="Decals.DecalRenderFeature"/>).
++        /// </summary>
++        public static readonly PermutationParameterKey<ShaderSource> DecalShader = ParameterKeys.NewPermutation<ShaderSource>();
++
+         public static readonly PermutationParameterKey<ShaderSource> ComputeVelocityShader = ParameterKeys.NewPermutation<ShaderSource>();
+ 
+         public static readonly PermutationParameterKey<ShaderSource> RenderTargetExtensions = ParameterKeys.NewPermutation<ShaderSource>();
+diff --git a/sources/shaders/Stride.Shaders.Tests/StrideShaderTests.cs b/sources/shaders/Stride.Shaders.Tests/StrideShaderTests.cs
+index 0cad1b8..366ce7c 100644
+--- a/sources/shaders/Stride.Shaders.Tests/StrideShaderTests.cs
++++ b/sources/shaders/Stride.Shaders.Tests/StrideShaderTests.cs
+@@ -1126,6 +1126,149 @@ new ShaderMacro("class", "shader"),
+         TestCore($"LightProbeShader{samples}", shaderSource, "./assets/Stride/SDSL");
+     }
+ 
++    // Decals (#24): DecalRenderFeature mixes DecalProjection after the normal shaders of the forward
++    // shading effect. It reconstructs the receiving surface from the depth buffer and replaces the
++    // position, normal, tangent frame and texture coordinate streams before the material and the
++    // (clustered) lighting are evaluated, then fades and discards the result.
++    [Theory]
++    [InlineData(false, false)]
++    [InlineData(true, false)]
++    [InlineData(false, true)]
++    [InlineData(true, true)]
++    public void DecalProjectionForwardShadingCompiles(bool normalMap, bool vulkan)
++    {
++        var shaderSource = DecalForwardShadingMixin(normalMap);
++        var options = vulkan
++            ? new ShaderMixer.Options(ResourcesRegisterSeparate: false, StripGoogleUserType: true)
++            : new ShaderMixer.Options(ResourcesRegisterSeparate: true);
++
++        var shaderMixer = new ShaderMixer(new ShaderLoader("./assets/Stride/SDSL"));
++        var log = new Stride.Core.Diagnostics.LoggerResult();
++        shaderMixer.MergeSDSL(shaderSource, options, log, out var bytecode, out var effectReflection, out _, out _);
++
++        if (log.HasErrors)
++            Assert.Fail(string.Join(Environment.NewLine, log.Messages.Where(m => m.Type == Stride.Core.Diagnostics.LogMessageType.Error).Select(m => m.Text)));
++
++        var shaderName = $"DecalProjection{(normalMap ? "NormalMap" : "")}{(vulkan ? ".Vulkan" : "")}";
++        File.WriteAllBytes($"{shaderName}.spv", bytecode);
++        var validationResult = Spv.ValidateFile($"{shaderName}.spv", targetVulkan: vulkan);
++        Assert.True(validationResult.IsValid, validationResult.Output);
++
++        // The decal parameters are uploaded per draw by DecalRenderFeature, and the depth is bound per view by the forward renderer
++        var decalParameters = Assert.Single(effectReflection.ConstantBuffers.SelectMany(cb => cb.Members), m => m.KeyInfo.KeyName == "DecalProjection.DecalParameters");
++        Assert.Equal("Decal", decalParameters.LogicalGroup);
++        var depthStencil = Assert.Single(effectReflection.ResourceBindings, r => r.KeyInfo.KeyName == "DepthBase.DepthStencil");
++        Assert.Equal("PerView", depthStencil.ResourceGroup);
++
++        if (!vulkan && SpirvCrossSupport.Available && OperatingSystem.IsWindows())
++        {
++            // What the Direct3D effect compiler runs: legalize, translate to HLSL and compile with fxc
++            var legalized = SpirvTools.LegalizeForHlsl(System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytecode));
++            var translator = new SpirvTranslator(legalized.AsMemory());
++            foreach (var entryPoint in translator.GetEntryPoints())
++            {
++                var hlsl = translator.Translate(Backend.Hlsl, entryPoint);
++                var profile = entryPoint.ExecutionModel == ExecutionModel.Fragment ? "ps_5_0" : "vs_5_0";
++                var errors = FxcSupport.Compile(hlsl, profile);
++                Assert.True(errors is null, errors + Environment.NewLine + hlsl);
++            }
++        }
++    }
++
++    /// <summary>
++    /// Builds the forward shading effect of a decal the way StrideForwardShadingEffect composes it when
++    /// <c>StrideEffectBaseKeys.DecalShader</c> is set: a textured material, optionally normal mapped, blended
++    /// with the alpha blend transparency mode, lit by the clustered point and spot lights and the ambient light.
++    /// </summary>
++    private static ShaderMixinSource DecalForwardShadingMixin(bool normalMap)
++    {
++        ShaderMixinSource Compose(params ShaderClassCode[] mixins)
++        {
++            var source = new ShaderMixinSource();
++            source.Mixins.AddRange(mixins);
++            source.Macros.AddRange(
++            [
++                new ShaderMacro("STRIDE_RENDER_TARGET_COUNT", "1"),
++                new ShaderMacro("STRIDE_MULTISAMPLE_COUNT", "1"),
++                new ShaderMacro("STRIDE_GRAPHICS_API_DIRECT3D", "1"),
++                new ShaderMacro("STRIDE_GRAPHICS_API_DIRECT3D11", "1"),
++                new ShaderMacro("STRIDE_GRAPHICS_PROFILE", "45056"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_9_1", "37120"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_9_2", "37376"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_9_3", "37632"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_10_0", "40960"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_10_1", "41216"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_11_0", "45056"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_11_1", "45312"),
++                new ShaderMacro("GRAPHICS_PROFILE_LEVEL_11_2", "45568"),
++                new ShaderMacro("class", "shader"),
++            ]);
++            return source;
++        }
++
++        // StrideEffectBase: the decal shader comes after the transformation and normal shaders
++        var root = Compose(
++            new ShaderClassSource("ShaderBase"),
++            new ShaderClassSource("ShadingBase"),
++            new ShaderClassSource("TransformationBase"),
++            new ShaderClassSource("NormalStream"),
++            new ShaderClassSource("TransformationWAndVP"),
++            new ShaderClassSource(normalMap ? "NormalFromNormalMapping" : "NormalFromMesh"),
++            new ShaderClassSource("DecalProjection"),
++            new ShaderClassSource("MaterialSurfacePixelStageCompositor"));
++
++        var directLightGroups = new ShaderArraySource();
++        directLightGroups.Add(Compose(new ShaderClassSource("LightClusteredPointGroup")));
++        directLightGroups.Add(Compose(new ShaderClassSource("LightClusteredSpotGroup")));
++        root.Compositions.Add("directLightGroups", directLightGroups);
++
++        var environmentLights = new ShaderArraySource();
++        environmentLights.Add(Compose(new ShaderClassSource("LightSimpleAmbient")));
++        root.Compositions.Add("environmentLights", environmentLights);
++
++        var materialLayers = new ShaderArraySource();
++
++        var diffuse = Compose(new ShaderClassSource("MaterialSurfaceDiffuse"));
++        diffuse.Compositions.Add("diffuseMap", new ShaderClassSource("ComputeColorTextureScaledOffsetDynamicSampler", "Material.DiffuseMap", "TEXCOORD0", "Material.Sampler.i0", "rgba", "Material.TextureScale", "Material.TextureOffset"));
++        materialLayers.Add(diffuse);
++
++        if (normalMap)
++        {
++            var normal = Compose(new ShaderClassSource("MaterialSurfaceNormalMap", "true", "true"));
++            normal.Compositions.Add("normalMap", new ShaderClassSource("ComputeColorTextureScaledOffsetDynamicSampler", "Material.NormalMap", "TEXCOORD0", "Material.Sampler.i0", "rgba", "Material.TextureScale.i1", "Material.TextureOffset.i1"));
++            materialLayers.Add(normal);
++        }
++
++        var alphaBlend = Compose(new ShaderClassSource("MaterialSurfaceSetStreamFromComputeColor", "matDiffuseSpecularAlphaBlend", "r"));
++        alphaBlend.Compositions.Add("computeColorSource", new ShaderClassSource("ComputeColorConstantFloatLink", "Material.DiffuseSpecularAlphaBlendValue"));
++        materialLayers.Add(alphaBlend);
++
++        var specular = Compose(new ShaderClassSource("MaterialSurfaceShadingSpecularMicrofacet"));
++        specular.Compositions.Add("environmentFunction", new ShaderClassSource("MaterialSpecularMicrofacetEnvironmentGGXLUT"));
++        specular.Compositions.Add("fresnelFunction", new ShaderClassSource("MaterialSpecularMicrofacetFresnelSchlick"));
++        specular.Compositions.Add("geometricShadowingFunction", new ShaderClassSource("MaterialSpecularMicrofacetVisibilitySmithSchlickGGX"));
++        specular.Compositions.Add("normalDistributionFunction", new ShaderClassSource("MaterialSpecularMicrofacetNormalDistributionGGX"));
++
++        var shadingSurfaces = new ShaderArraySource();
++        shadingSurfaces.Add(new ShaderClassSource("MaterialSurfaceShadingDiffuseLambert", "false"));
++        shadingSurfaces.Add(specular);
++        var lightingAndShading = Compose(new ShaderClassSource("MaterialSurfaceLightingAndShading"));
++        lightingAndShading.Compositions.Add("surfaces", shadingSurfaces);
++        materialLayers.Add(lightingAndShading);
++
++        materialLayers.Add(Compose(new ShaderClassSource("MaterialSurfaceDiffuseSpecularAlphaBlendColor")));
++
++        var materialPixelStage = Compose(new ShaderClassSource("MaterialSurfaceArray"));
++        materialPixelStage.Compositions.Add("layers", materialLayers);
++        root.Compositions.Add("materialPixelStage", materialPixelStage);
++
++        root.Compositions.Add("streamInitializerPixelStage", Compose(
++            new ShaderClassSource("MaterialStream"),
++            new ShaderClassSource("MaterialPixelShadingStream")));
++
++        return root;
++    }
++
+     /// <summary>
+     /// Builds the pixel side of a forward shading effect around a single environment light, the
+     /// way ForwardLightingRenderFeature composes one. Only what an environment light needs is
+-- 
+2.43.0
+

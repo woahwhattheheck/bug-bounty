@@ -1,0 +1,33 @@
+From 6b39dd2e901813f24c8931d17977d6d82b944abb Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:20:40 +0000
+Subject: [PATCH] fix(ui): register camera selector QML in the resource list
+
+Non-deploy builds (just run / cargo build --release) load the UI from the
+explicit qrc! list in src/resources_qml.rs. CameraLensSelector.qml and
+CameraCatalog.js were not listed, so LensProfile.qml failed with
+"CameraLensSelector is not a type" and the main window did not load.
+Deploy builds were unaffected because build.rs compiles every file under
+src/ui.
+
+Refs #742
+---
+ src/resources_qml.rs | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/resources_qml.rs b/src/resources_qml.rs
+index a7fda49..9086f82 100644
+--- a/src/resources_qml.rs
++++ b/src/resources_qml.rs
+@@ -28,6 +28,8 @@ qrc!(pub rsrc_qml,
+         "src/ui/components/AdvancedSection.qml",
+         "src/ui/components/BasicText.qml",
+         "src/ui/components/Button.qml",
++        "src/ui/components/CameraCatalog.js",
++        "src/ui/components/CameraLensSelector.qml",
+         "src/ui/components/CheckBox.qml",
+         "src/ui/components/CheckBoxWithContent.qml",
+         "src/ui/components/ComboBox.qml",
+-- 
+2.43.0
+

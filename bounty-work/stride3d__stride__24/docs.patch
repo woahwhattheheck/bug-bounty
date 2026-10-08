@@ -1,0 +1,185 @@
+From 964e9d706ddf08ee9be8cd748ec949039fa58e74 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:28:02 +0000
+Subject: [PATCH] feat: Add decals manual page
+
+Document the decal component added for stride3d/stride#24: how decals are
+rendered, how to create a decal material, how to add decals in Game Studio
+and from code, the graphics compositor setup for existing projects and the
+current limitations.
+---
+ en/manual/graphics/decals.md | 135 +++++++++++++++++++++++++++++++++++
+ en/manual/graphics/index.md  |   1 +
+ en/manual/toc.yml            |   2 +
+ 3 files changed, 138 insertions(+)
+ create mode 100644 en/manual/graphics/decals.md
+
+diff --git a/en/manual/graphics/decals.md b/en/manual/graphics/decals.md
+new file mode 100644
+index 0000000..234aa14
+--- /dev/null
++++ b/en/manual/graphics/decals.md
+@@ -0,0 +1,135 @@
++# Decals
++
++<span class="badge text-bg-primary">Beginner</span>
++<span class="badge text-bg-success">Designer</span>
++<span class="badge text-bg-success">Artist</span>
++<span class="badge text-bg-success">Programmer</span>
++
++**Decals** project a material onto the surfaces of a scene. Use them to add details such as bullet holes, signs, stains, footprints, graffiti, road markings or dirt, without changing the models they are projected on.
++
++A decal is an entity with a **decal component**. The component defines a box volume, centered on the entity and oriented by its transform. Every opaque surface inside the volume receives the material, projected along the **forward axis** of the entity (-Z), like the light of a [spot light](lights-and-shadows/spot-lights.md):
++
++* the local X axis of the entity is the horizontal axis of the texture (U)
++* the local Y axis is the up direction of the texture (V)
++* the local Z axis is the depth of the projection
++
++Decals can project **any material**: a diffuse map with an alpha channel, normal maps, glossiness, metalness, emissive and so on. A decal is lit and shadowed exactly like the surface it is projected on, by all the lights of the scene.
++
++## How decals are rendered
++
++Stride renders decals with the depth buffer of the opaque geometry, in a dedicated render stage drawn after the opaque geometry and before the transparent geometry:
++
++1. The box volume of the decal is drawn.
++2. For each pixel covered by the volume, the position and the normal of the surface already rendered at that pixel are reconstructed from the depth buffer.
++3. If that position is inside the volume, the material of the decal is evaluated at that position, with texture coordinates given by the position in the volume, and lit with the normal of the surface.
++4. The result is blended over the surface.
++
++This means decals have a cost proportional to the area of the screen covered by their volume, and nothing to pay for the complexity of the surfaces they are projected on. Keep the volume of a decal as thin as the surfaces it decorates allow.
++
++## Create a decal material
++
++1. In the **Asset View**, click **Add asset** and select **Material**.
++2. In the **Diffuse** properties, set a **Diffuse map** to the texture of the decal. Its alpha channel shapes the decal.
++3. Under **Misc** > **Transparency**, select **Blend** to blend the decal over the surfaces with the alpha of the texture. Select **Additive** for emissive decals such as glowing marks.
++4. Optionally, add a **Normal map**, **Glossiness** or **Metalness** maps: they are projected with the diffuse map.
++
++An opaque material (without transparency) covers the whole rectangle of the projection.
++
++> [!Tip]
++> Give the texture of the decal a transparent border, so that the edges of the projection are not visible.
++
++For more information about materials, see [Materials](materials/index.md).
++
++## Add a decal in Game Studio
++
++1. In the **Scene Editor**, create an empty entity, or select an existing one.
++2. In the **Property Grid**, click **Add component** and select **Model** > **Decal**.
++3. Set the **Material** of the decal component.
++4. Move and rotate the entity so that its forward axis points into the surfaces to decorate. When the entity is selected, Game Studio shows the volume of the decal, and an arrow showing the direction of the projection.
++5. Set the **Size** of the volume: the width (X) and height (Y) of the projected area, and the depth (Z) of the projection.
++
++### Decal component properties
++
++| Property         | Description |
++|------------------|-------------|
++| Material         | The material projected by the decal. |
++| Size             | The width (X) and height (Y) of the projected area, and the depth (Z) of the projection, in the local space of the entity (so it is also scaled by the scale of the entity). |
++| Opacity          | The opacity of the decal, multiplied with the output of its material. Use it to fade decals in and out. |
++| Angle fade start | The angle, in degrees, between the projection direction and a surface from which the decal starts to fade out. |
++| Angle fade end   | The angle, in degrees, between the projection direction and a surface from which the decal is no longer visible. Use an angle larger than 90 degrees to also project on surfaces facing away from the projection, such as both sides of a thin wall. |
++| Depth fade       | The fraction of the projection depth, at the far end of the volume, over which the decal fades out. 0 cuts the decal sharply. |
++| Sort order       | The draw order of overlapping decals. Decals with a higher sort order are drawn on top of the others. Decals with the same sort order are drawn in creation order. |
++| Render group     | The render group of the decal, used to select the cameras that render it. |
++
++The angle fades prevent a decal from stretching on the surfaces parallel to the projection direction, such as the sides of a box.
++
++## Graphics compositor
++
++The graphics compositor of new projects has a **Decals** render stage. Projects created with an older version of Stride render decals in the **Transparent** render stage instead: decals are then sorted with the transparent objects, and the **Sort order** property is ignored.
++
++To add the decal stage to an existing graphics compositor:
++
++1. In the **Asset View**, double-click the **Graphics Compositor** asset.
++2. In the **Render stages** list, add a render stage named **Decals**, with the **Main** effect slot and the **DecalSortMode** sort mode.
++3. Select the **Mesh render feature**. In its **Render stage selectors**, select the **MeshTransparentRenderStageSelector** of the opaque and transparent stages, and set its **Decal render stage** to **Decals**.
++4. In the **Render features** of the mesh render feature, add a **DecalRenderFeature**.
++5. Select the **forward renderer** nodes (game and editor), and set their **Decal render stage** to **Decals**.
++
++> [!Note]
++> If the mesh render feature has no **DecalRenderFeature**, Stride adds one when the first decal is rendered.
++
++For more information about the graphics compositor, see [Graphics compositor](graphics-compositor/index.md).
++
++## Create decals from code
++
++Add a [DecalComponent](xref:Stride.Engine.DecalComponent) to an entity. For example, to leave a bullet hole where a raycast hits a surface:
++
++```cs
++using Stride.Core.Mathematics;
++using Stride.Engine;
++using Stride.Rendering;
++
++public class BulletHoles : SyncScript
++{
++    public Material BulletHoleMaterial { get; set; }
++
++    public void AddBulletHole(Vector3 position, Vector3 surfaceNormal)
++    {
++        var decal = new DecalComponent
++        {
++            Material = BulletHoleMaterial,
++            // 15 cm wide, projected 5 cm in front of and behind the impact point
++            Size = new Vector3(0.15f, 0.15f, 0.1f),
++        };
++
++        var bulletHole = new Entity("Bullet hole") { decal };
++
++        // The decal projects along its forward axis (-Z): turn its Z axis toward the surface normal
++        bulletHole.Transform.Position = position;
++        bulletHole.Transform.Rotation = Quaternion.BetweenDirections(Vector3.UnitZ, surfaceNormal);
++
++        Entity.Scene.Entities.Add(bulletHole);
++    }
++}
++```
++
++To make a decal follow a moving object, add the decal entity as a child of the object (`movingObject.AddChild(bulletHole)`).
++
++To fade a decal out, decrease its `Opacity` over time, and remove its entity from the scene when it reaches 0.
++
++The **First-person shooter** template uses decals for the bullet holes of the gun: see the `BulletHoleDecals` script.
++
++## Limitations
++
++* Decals are only projected on the **opaque** geometry. Transparent objects are drawn after the decals and do not receive them.
++* Decals are blended over the shaded color of the surfaces. They don't modify the normal and roughness buffers read by post effects such as [local reflections](post-effects/local-reflections.md) and [ambient occlusion](post-effects/ambient-occlusion.md).
++* Decals are not drawn when **MSAA** is enabled on the forward renderer.
++* Only the first pass of a multi-pass material is projected. Materials using tessellation, displacement or texture coordinates other than the first set are not supported.
++* Decals project on every opaque surface inside their volume, including dynamic objects such as characters: keep the volume tight around the surfaces to decorate.
++* Decals require a graphics device that can read the depth buffer from shaders (graphics profile 10.0 or higher).
++
++## See also
++
++* [Materials](materials/index.md)
++* [Graphics compositor](graphics-compositor/index.md)
++* [Spot lights](lights-and-shadows/spot-lights.md)
+diff --git a/en/manual/graphics/index.md b/en/manual/graphics/index.md
+index 4c5056b..a763c50 100644
+--- a/en/manual/graphics/index.md
++++ b/en/manual/graphics/index.md
+@@ -24,6 +24,7 @@ The graphics module provides a set of methods to display the game. Although Stri
+ * [Materials](materials/index.md)
+ * [Textures](textures/index.md)
+ * [Lights and shadows](lights-and-shadows/index.md)
++* [Decals](decals.md)
+ * [Post effects](post-effects/index.md)
+ * [Window Configuration](window-configuration.md)
+ * [Graphics compositor](graphics-compositor/index.md)
+diff --git a/en/manual/toc.yml b/en/manual/toc.yml
+index 799d079..5321c5b 100644
+--- a/en/manual/toc.yml
++++ b/en/manual/toc.yml
+@@ -239,6 +239,8 @@ items:
+             href: graphics/lights-and-shadows/shadows.md
+           - name: Voxel Cone Tracing GI
+             href: graphics/lights-and-shadows/voxel-cone-tracing-gi.md
++      - name: Decals
++        href: graphics/decals.md
+       - name: Post effects
+         href: graphics/post-effects/index.md
+         items:
+-- 
+2.43.0
+

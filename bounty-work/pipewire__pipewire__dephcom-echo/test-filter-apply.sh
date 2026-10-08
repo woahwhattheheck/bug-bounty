@@ -13,6 +13,10 @@
 #   5. the module is unloaded again once the streams are gone.
 #
 # usage: test-filter-apply.sh <pipewire-source-dir> [<builddir>]
+#
+# WIREPLUMBER=<path to wireplumber> selects the session manager (default:
+# wireplumber from PATH). WIREPLUMBER_LIBDIR=<dir> is added to the library
+# path for a wireplumber that is not installed system wide.
 set -u
 
 # wireplumber wants a session bus
@@ -63,7 +67,21 @@ wait_for() { # wait_for <timeout-s> <command...>
 
 PIPEWIRE_DEBUG=${PIPEWIRE_DEBUG:-2} pipewire > "$WORK/pipewire.log" 2>&1 & PIDS+=($!)
 wait_for 10 test -S "$XDG_RUNTIME_DIR/pipewire-0" || { echo "pipewire did not start"; cat "$WORK/pipewire.log"; exit 1; }
-wireplumber > "$WORK/wireplumber.log" 2>&1 & PIDS+=($!)
+WIREPLUMBER=${WIREPLUMBER:-wireplumber}
+WP_VERSION=$(LD_LIBRARY_PATH=${WIREPLUMBER_LIBDIR:+$WIREPLUMBER_LIBDIR:}$LD_LIBRARY_PATH "$WIREPLUMBER" --version 2>/dev/null | grep -o "libwireplumber [0-9.]*" | awk '{print $2}')
+echo "session manager: $WIREPLUMBER $WP_VERSION"
+case "$WP_VERSION" in
+0.4.*)
+	# WirePlumber 0.4 only honours a boolean state.restore-target from its
+	# own rules, not the stream property. Don't let it remember where the
+	# streams are moved so that the checks don't depend on earlier ones.
+	mkdir -p "$XDG_CONFIG_HOME/wireplumber/main.lua.d"
+	echo 'stream_defaults.properties["restore-target"] = false' \
+		> "$XDG_CONFIG_HOME/wireplumber/main.lua.d/90-test.lua"
+	;;
+esac
+LD_LIBRARY_PATH=${WIREPLUMBER_LIBDIR:+$WIREPLUMBER_LIBDIR:}$LD_LIBRARY_PATH \
+	"$WIREPLUMBER" > "$WORK/wireplumber.log" 2>&1 & PIDS+=($!)
 PIPEWIRE_DEBUG=${PULSE_DEBUG:-3} pipewire-pulse > "$WORK/pipewire-pulse.log" 2>&1 & PIDS+=($!)
 wait_for 10 pactl info > /dev/null 2>&1 || { echo "pipewire-pulse did not start"; cat "$WORK/pipewire-pulse.log"; exit 1; }
 
@@ -129,8 +147,12 @@ kill $REC2; wait $REC2 2>/dev/null
 echo "== moving a filtered stream to another device moves the filter along"
 pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=mic2 media.class=Audio/Source/Virtual object.linger=true audio.position=[MONO] }' > /dev/null
 wait_for 10 sh -c 'pactl list short sources | grep -qw mic2'
-REC_IDX=$(pactl -f json list source-outputs | python3 -c "import json,sys; print(next(s['index'] for s in json.load(sys.stdin) if s['properties'].get('application.name')=='voip-rec'))")
-pactl move-source-output "$REC_IDX" mic2
+# move the stream like a mixer does. pactl move-source-output exits right
+# after the reply and its metadata update is sometimes lost when pipewire-pulse
+# tears down the client, use pw-metadata which waits for the server.
+REC_ID=$(pactl -f json list source-outputs | python3 -c "import json,sys; print(next(s['properties']['object.id'] for s in json.load(sys.stdin) if s['properties'].get('application.name')=='voip-rec'))")
+MIC2_SERIAL=$(pactl -f json list sources | python3 -c "import json,sys; print(next(s['properties']['object.serial'] for s in json.load(sys.stdin) if s['name']=='mic2'))")
+pw-metadata "$REC_ID" target.object "$MIC2_SERIAL" Spa:Id > /dev/null
 check "record stream re-filtered on mic2.echo-cancel" wait_for 10 dev_is source-outputs voip-rec mic2.echo-cancel
 check "new echo-canceller uses mic2 as source master" sh -c 'pactl list short modules | grep module-echo-cancel | grep -q "source_master=\"mic2\""'
 check "playback follows to the new echo-canceller" wait_for 10 sh -c 'pactl -f json list sink-inputs | python3 -c "
@@ -178,6 +200,7 @@ check "explicit filter.apply loads the echo-canceller" wait_for 10 dev_is sink-i
 kill $HSP $HSR; wait $HSP $HSR 2>/dev/null
 
 if [ $FAIL != 0 ]; then
+	[ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$KEEP_LOGS"/
 	echo "---- wireplumber log"; tail -30 "$WORK/wireplumber.log"
 	echo "---- pipewire-pulse log (filter lines)"
 	grep "filter-apply.c\|module.c" "$WORK/pipewire-pulse.log" | tail -${LOG_LINES:-60}

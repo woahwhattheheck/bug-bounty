@@ -1,0 +1,178 @@
+From 51aa6431898c615218dd27f31094c0a1155f1473 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:49:18 +0000
+Subject: [PATCH 1/2] test(error-boundary): cover awaited diagnostics in Share
+ Diagnostics action
+
+Add regressions for the ErrorBoundaryFallback "Share Diagnostics"
+recovery action:
+
+- Share.share receives the resolved redacted diagnostics string, not
+  the Promise returned by the async getDiagnostics()
+- repeat taps are ignored while the export is being prepared
+- a failed export shows a generic, retryable alert without exposing the
+  underlying error message
+
+Refs #397
+---
+ __tests__/ErrorBoundary.test.tsx | 107 ++++++++++++++++++++++++++++++-
+ 1 file changed, 105 insertions(+), 2 deletions(-)
+
+diff --git a/__tests__/ErrorBoundary.test.tsx b/__tests__/ErrorBoundary.test.tsx
+index a2dfe48..b671437 100644
+--- a/__tests__/ErrorBoundary.test.tsx
++++ b/__tests__/ErrorBoundary.test.tsx
+@@ -1,6 +1,6 @@
+ import React, { useState } from 'react';
+-import { View, Text, Button as RNButton } from 'react-native';
+-import { render, fireEvent } from '@testing-library/react-native';
++import { View, Text, Button as RNButton, Share } from 'react-native';
++import { render, fireEvent, act, waitFor } from '@testing-library/react-native';
+ 
+ jest.mock('@react-native-async-storage/async-storage', () =>
+   require('@react-native-async-storage/async-storage/jest/async-storage-mock')
+@@ -16,6 +16,7 @@ jest.mock('lucide-react-native', () => ({
+ 
+ import { ErrorBoundary } from '../src/components/ErrorBoundary';
+ import * as errorReporting from '../src/utils/errorReporting';
++import * as diagnostics from '../src/utils/diagnostics';
+ 
+ // Suppress expected console.error logs during error boundary test executions
+ const originalConsoleError = console.error;
+@@ -194,3 +195,105 @@ describe('ErrorBoundary', () => {
+     }
+   });
+ });
++
++describe('ErrorBoundaryFallback — Share Diagnostics recovery action', () => {
++  const SHARE_LABEL = 'Share redacted diagnostics log';
++  const SHARE_FAILED_MESSAGE = 'Diagnostics could not be shared. Please try again.';
++  const REDACTED_DIAGNOSTICS = JSON.stringify({
++    walletState: { hasPublicKey: true, lastError: 'Signing failed for [REDACTED_SECRET]' },
++  });
++
++  let shareSpy: jest.SpyInstance;
++  let getDiagnosticsSpy: jest.SpyInstance;
++
++  beforeEach(() => {
++    shareSpy = jest.spyOn(Share, 'share').mockResolvedValue({ action: Share.sharedAction });
++    getDiagnosticsSpy = jest.spyOn(diagnostics, 'getDiagnostics');
++  });
++
++  afterEach(() => {
++    shareSpy.mockRestore();
++    getDiagnosticsSpy.mockRestore();
++  });
++
++  const renderFallback = () =>
++    render(
++      <ErrorBoundary>
++        <ProblemChild shouldThrow={true} />
++      </ErrorBoundary>
++    );
++
++  it('passes the resolved redacted diagnostics text to Share.share (#397)', async () => {
++    getDiagnosticsSpy.mockResolvedValue(REDACTED_DIAGNOSTICS);
++
++    const { getByLabelText, getByText, queryByText } = renderFallback();
++
++    fireEvent.press(getByLabelText(SHARE_LABEL));
++
++    await waitFor(() => expect(shareSpy).toHaveBeenCalledTimes(1));
++    const [content] = shareSpy.mock.calls[0];
++    // getDiagnostics() is async. Native Share needs the string itself; a
++    // pending Promise gives an empty or failed share sheet.
++    expect(typeof content.message).toBe('string');
++    expect(content).toEqual({
++      message: REDACTED_DIAGNOSTICS,
++      title: 'App Diagnostics Log',
++    });
++
++    await waitFor(() => expect(getByText('Share Diagnostics')).toBeTruthy());
++    expect(queryByText(SHARE_FAILED_MESSAGE)).toBeNull();
++  });
++
++  it('ignores repeat taps while diagnostics are being prepared', async () => {
++    let resolveDiagnostics: (value: string) => void = () => {};
++    getDiagnosticsSpy.mockImplementation(
++      () =>
++        new Promise<string>((resolve) => {
++          resolveDiagnostics = resolve;
++        })
++    );
++
++    const { getByLabelText, getByText } = renderFallback();
++
++    fireEvent.press(getByLabelText(SHARE_LABEL));
++
++    expect(getByText('Preparing diagnostics…')).toBeTruthy();
++    expect(getByLabelText(SHARE_LABEL)).toBeDisabled();
++    fireEvent.press(getByLabelText(SHARE_LABEL));
++    expect(getDiagnosticsSpy).toHaveBeenCalledTimes(1);
++    expect(shareSpy).not.toHaveBeenCalled();
++
++    await act(async () => {
++      resolveDiagnostics(REDACTED_DIAGNOSTICS);
++    });
++
++    await waitFor(() => expect(getByText('Share Diagnostics')).toBeTruthy());
++    expect(shareSpy).toHaveBeenCalledTimes(1);
++  });
++
++  it('shows a generic, retryable error when diagnostics cannot be prepared', async () => {
++    getDiagnosticsSpy
++      .mockRejectedValueOnce(new Error('SecureStore read failed for wallet-backup-entry'))
++      .mockResolvedValueOnce(REDACTED_DIAGNOSTICS);
++
++    const { getByLabelText, findByText, queryByText } = renderFallback();
++
++    fireEvent.press(getByLabelText(SHARE_LABEL));
++
++    expect(await findByText(SHARE_FAILED_MESSAGE)).toBeTruthy();
++    expect(shareSpy).not.toHaveBeenCalled();
++    expect(queryByText(/SecureStore read failed/)).toBeNull();
++    expect(getByLabelText(SHARE_LABEL)).not.toBeDisabled();
++
++    fireEvent.press(getByLabelText(SHARE_LABEL));
++
++    await waitFor(() => expect(queryByText(SHARE_FAILED_MESSAGE)).toBeNull());
++    await waitFor(() =>
++      expect(shareSpy).toHaveBeenCalledWith({
++        message: REDACTED_DIAGNOSTICS,
++        title: 'App Diagnostics Log',
++      })
++    );
++    expect(getDiagnosticsSpy).toHaveBeenCalledTimes(2);
++  });
++});
+-- 
+2.43.0
+
+
+From de1cb58dc05a4e346c6c9844df1c0311cac8fa57 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:49:26 +0000
+Subject: [PATCH 2/2] docs(error-handling): describe awaited Share Diagnostics
+ behavior
+
+Refs #397
+---
+ docs/error-handling.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/error-handling.md b/docs/error-handling.md
+index 9528230..b90f4ee 100644
+--- a/docs/error-handling.md
++++ b/docs/error-handling.md
+@@ -45,7 +45,7 @@ React error boundaries **do not** catch event-handler or async errors. That is w
+ | **Try Again** | Clears boundary state and re-renders children |
+ | **Go to Home** | Clears boundary state, then `router.replace('/(tabs)')` |
+ | **Restart App** | Clears boundary state, then best-effort `DevSettings.reload()` |
+-| **Share Diagnostics** | Opens the OS share sheet with `getDiagnostics()` JSON (already redacted) |
++| **Share Diagnostics** | Awaits the redacted `getDiagnostics()` JSON, then opens the OS share sheet with that text. The button is busy and ignores repeat taps while the export is prepared; if the export or share sheet fails, a generic "could not be shared" alert is shown (no error details) and the action can be retried |
+ 
+ Custom fallbacks remain supported via the `fallback` prop on `ErrorBoundary` (node or render function).
+ 
+-- 
+2.43.0
+

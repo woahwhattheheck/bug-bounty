@@ -9,13 +9,13 @@
   - `PROPOSAL.md`: ready to share, as the issue requires
   - this file
 
-## Before submitting: required process steps
+## Upstream process (facts from the issue) and status
 
-1. **Proposal and call come first.** The issue says: *"Formal notice: Don't proceed unless we have a Zoom video call first"*. It also asks for a proposal agreed in advance and kept in a shared Google Drive folder, followed by a 2-week mentored window.
-   - Share `PROPOSAL.md` with Kendraio and ask for the call. Use an issue comment or Kendraio Slack (http://slack.kendra.io).
-   - Open the PR only after that. The working implementation is presented in the proposal as "ready for review and changes".
-2. **Read the 13 issue comments first.** GitHub's issue page lazy-loads the timeline, so our tooling could not read them (the REST API is blocked here). The visible metadata shows no assignee and no linked PR. Check that no candidate was selected or announced there.
-3. **Confirm the bounty is still on offer.** The bounty dates from 2021 (Grant for the Web budget). Ask in the same message that requests the call. Competing PR #614 asked the same question on 2026-08-20 and has had no maintainer reply.
+- **The issue sets a process.** It says: *"Formal notice: Don't proceed unless we have a Zoom video call first"*. It also asks for a proposal agreed in advance (kept in a shared Google Drive folder), followed by a 2-week mentored window.
+  - `PROPOSAL.md` in this directory is the ready-to-share proposal for that step. It presents the working implementation as available for review and changes.
+  - The PR body below has a placeholder for the proposal link and the call date.
+- **13 issue comments could not be read.** GitHub's issue page lazy-loads the timeline, and the REST API is blocked here. The visible metadata shows no assignee and no linked PR.
+- **The bounty dates from 2021** (Grant for the Web budget). The collective still holds the funds (see below). Competing PR #614 asked maintainers on 2026-08-20 whether the bounty is still active; there is no maintainer reply yet.
 
 ## Funding and payout evidence
 
@@ -200,7 +200,7 @@ Fleet: no Slack TAKE or other fleet work found for kendraio or MusicBrainz.
 Closes #184
 
 This adds the MusicBrainz integration described in #184.
-Proposal: <link to the shared Drive copy of PROPOSAL.md> (agreed on the call of <date>; fill in only after the call has happened).
+Proposal: <link to the shared Drive copy of PROPOSAL.md> (agreed on the call of <date>).
 
 ## What's included
 

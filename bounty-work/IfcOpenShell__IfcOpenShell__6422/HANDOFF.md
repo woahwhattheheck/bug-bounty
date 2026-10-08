@@ -53,14 +53,14 @@ The viewport only showed the 3D model plus Bonsai's own GPU decorations. The pri
 - `src/bonsai/bonsai/bim/module/drawing/ui.py`: adds the toggle and opacity controls to the Active Drawing panel.
 - `src/bonsai/bonsai/bim/module/drawing/__init__.py`: registers the new operator.
 - `src/bonsai/bonsai/bim/ui.py`: adds the `svg2png_command` preference.
-- `src/bonsai/test/tool/test_drawing_print_preview.py`: new file with 21 Blender-backed tests. It carries the AI-generated header that AGENTS.md requires.
+- `src/bonsai/test/tool/test_drawing_print_preview.py`: new file with 20 Blender-backed tests. It carries the AI-generated header that AGENTS.md requires.
 - Total: 7 files, +425/-0.
 
 ## Validation (focused; Blender 5.2.2 LTS headless + ifcopenshell 0.9.0 + Bonsai from this branch)
 ```
 cd src/bonsai
 BONSAI_TEST_ARGS='-o addopts= -p no:pytest-blender test/tool/test_drawing_print_preview.py test/tool/test_drawing.py -q' blender -b -P runpytest.py
-→ 107 passed  (21 new print preview tests + 86 existing drawing tool tests)
+→ 107 passed  (new print preview tests + the existing drawing tool tests)
 BONSAI_TEST_ARGS='-o addopts= -p no:pytest-blender -p pytest_bdd test/bim/test_feature.py -q -m drawing' blender -b -P runpytest.py
 → 24 passed, 656 deselected
 python -m pytest -p no:pytest-blender test/core/test_drawing.py -q → 41 passed
@@ -104,7 +104,7 @@ End-to-end check with the real `rsvg-convert` 2.58 auto-detected:
   - It shows the complete printed drawing by rendering the real SVG with a full renderer.
   - It is about 120 lines of tool code, with no custom SVG parser.
   - It refreshes when drawings are created and survives camera data recreation.
-  - It has 21 tests and uses `Closes #6422`.
+  - It has 20 tests and uses `Closes #6422`.
 
 ## Upstream contribution rules (from repo `AGENTS.md`)
 - **Required disclosure.** The repo requires AI-generated contributions to be marked in three places: the commit body, a header in new files, and the PR description. The commit body line, the new test-file header and the PR text below are all included. Omitting them is a stated reason for rejection.

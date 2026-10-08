@@ -1,0 +1,564 @@
+From c19411530dfe6d7b93c5d1dfbb13d9fe526411c7 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:54:00 +0000
+Subject: [PATCH] Arrange sheet layouts in the 3D viewport
+
+Positioning drawings, schedules and references on a sheet required
+opening the layout SVG in Inkscape. Edit Sheet Layout in the Sheets
+panel now creates temporary real-size outlines of the sheet and of
+every item placed on it, with their view titles, and isolates them in
+the viewport seen from the top. Items are moved with the usual Blender
+tools, such as snapping, alignment and typed values. Saving writes the
+new positions to the layout SVG, keeping each view title's offset to
+its item. Cancelling leaves the layout unchanged.
+
+Closes #6428.
+
+Generated with the assistance of an AI coding tool.
+---
+ .../bonsai/bim/module/drawing/__init__.py     |   3 +
+ .../bonsai/bim/module/drawing/operator.py     |  81 +++++++++
+ src/bonsai/bonsai/bim/module/drawing/prop.py  |   2 +
+ .../bonsai/bim/module/drawing/sheeter.py      |  61 +++++++
+ src/bonsai/bonsai/bim/module/drawing/ui.py    |   9 +
+ src/bonsai/bonsai/tool/drawing.py             | 103 +++++++++++
+ .../test/tool/test_drawing_sheet_layout.py    | 169 ++++++++++++++++++
+ 7 files changed, 428 insertions(+)
+ create mode 100644 src/bonsai/test/tool/test_drawing_sheet_layout.py
+
+diff --git a/src/bonsai/bonsai/bim/module/drawing/__init__.py b/src/bonsai/bonsai/bim/module/drawing/__init__.py
+index 1bca9ea..635f4d6 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/__init__.py
++++ b/src/bonsai/bonsai/bim/module/drawing/__init__.py
+@@ -56,6 +56,7 @@ classes = (
+     operator.DisableEditingDrawings,
+     operator.DisableEditingReferences,
+     operator.DisableEditingSchedules,
++    operator.DisableEditingSheetLayout,
+     operator.DisableEditingSheets,
+     operator.DisableEditingText,
+     operator.DuplicateDrawing,
+@@ -63,11 +64,13 @@ classes = (
+     operator.EditAssignedProduct,
+     operator.EditElementFilter,
+     operator.EditSheet,
++    operator.EditSheetLayout,
+     operator.EditText,
+     operator.EditTextPopup,
+     operator.EnableAddAnnotationType,
+     operator.EnableEditingAssignedProduct,
+     operator.EnableEditingElementFilter,
++    operator.EnableEditingSheetLayout,
+     operator.EnableEditingText,
+     operator.ExcludeAnnotation,
+     operator.ExpandSheet,
+diff --git a/src/bonsai/bonsai/bim/module/drawing/operator.py b/src/bonsai/bonsai/bim/module/drawing/operator.py
+index ee95603..50d0a63 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/operator.py
++++ b/src/bonsai/bonsai/bim/module/drawing/operator.py
+@@ -1968,6 +1968,87 @@ class OpenLayout(bpy.types.Operator, tool.Ifc.Operator):
+         core.open_layout(tool.Drawing, sheet=sheet)
+ 
+ 
++class EnableEditingSheetLayout(bpy.types.Operator):
++    bl_idname = "bim.enable_editing_sheet_layout"
++    bl_label = "Edit Sheet Layout"
++    bl_description = (
++        "Arrange the drawings, schedules and references of the selected sheet in the 3D viewport.\n\n"
++        "Move them with the usual Blender tools (snapping, alignment, typed values), then save the layout"
++    )
++    bl_options = {"REGISTER", "UNDO"}
++
++    @classmethod
++    def poll(cls, context):
++        props = tool.Drawing.get_document_props()
++        if props.editing_sheet_layout_id:
++            cls.poll_message_set("Already editing a sheet layout.")
++            return False
++        if not tool.Drawing.get_active_sheet_item():
++            cls.poll_message_set("No sheet selected.")
++            return False
++        if not tool.Blender.get_view3d_area():
++            cls.poll_message_set("No 3D viewport found.")
++            return False
++        return True
++
++    def execute(self, context):
++        props = tool.Drawing.get_document_props()
++        sheet = tool.Ifc.get().by_id(tool.Drawing.get_active_sheet().ifc_definition_id)
++        layout_path = tool.Drawing.get_document_uri(sheet, "LAYOUT")
++        if not layout_path or not os.path.isfile(layout_path):
++            self.report({"ERROR"}, "Sheet layout file not found.")
++            return {"CANCELLED"}
++
++        sheet_builder = sheeter.SheetBuilder()
++        sheet_builder.update_sheet_drawing_sizes(sheet)
++        layout = sheet_builder.get_sheet_layout(sheet)
++
++        names = {}
++        for item in layout["items"]:
++            reference = tool.Ifc.get().by_id(item["reference_id"])
++            name = os.path.splitext(os.path.basename(reference.Location or ""))[0] or "Unnamed"
++            if identification := tool.Document.get_external_reference_id(reference):
++                name = f"{identification} - {name}"
++            names[item["reference_id"]] = name
++
++        objs = tool.Drawing.create_sheet_layout_objects(layout, names)
++        tool.Drawing.isolate_sheet_layout_objects(objs)
++        props.editing_sheet_layout_id = sheet.id()
++        return {"FINISHED"}
++
++
++class EditSheetLayout(bpy.types.Operator):
++    bl_idname = "bim.edit_sheet_layout"
++    bl_label = "Save Sheet Layout"
++    bl_description = "Save positions of the sheet items arranged in the 3D viewport to the sheet layout"
++    bl_options = {"REGISTER", "UNDO"}
++
++    @classmethod
++    def poll(cls, context):
++        return bool(tool.Drawing.get_document_props().editing_sheet_layout_id)
++
++    def execute(self, context):
++        props = tool.Drawing.get_document_props()
++        sheet = tool.Ifc.get().by_id(props.editing_sheet_layout_id)
++        sheeter.SheetBuilder().set_sheet_item_positions(sheet, tool.Drawing.get_sheet_layout_positions())
++        bpy.ops.bim.disable_editing_sheet_layout()
++        self.report({"INFO"}, "Sheet layout saved. Create the sheet to see the result.")
++        return {"FINISHED"}
++
++
++class DisableEditingSheetLayout(bpy.types.Operator):
++    bl_idname = "bim.disable_editing_sheet_layout"
++    bl_label = "Disable Editing Sheet Layout"
++    bl_description = "Stop arranging sheet items, without saving their positions"
++    bl_options = {"REGISTER", "UNDO"}
++
++    def execute(self, context):
++        tool.Drawing.exit_sheet_layout_view()
++        tool.Drawing.remove_sheet_layout_objects()
++        tool.Drawing.get_document_props().editing_sheet_layout_id = 0
++        return {"FINISHED"}
++
++
+ class SelectAllSheets(bpy.types.Operator):
+     bl_idname = "bim.select_all_sheets"
+     bl_label = "Select All Sheets"
+diff --git a/src/bonsai/bonsai/bim/module/drawing/prop.py b/src/bonsai/bonsai/bim/module/drawing/prop.py
+index c80f6e8..df611f7 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/prop.py
++++ b/src/bonsai/bonsai/bim/module/drawing/prop.py
+@@ -434,6 +434,7 @@ class DocProperties(PropertyGroup):
+     active_reference_index: IntProperty(name="Active Reference Index")
+     titleblock: EnumProperty(items=get_titleblocks, name="Titleblock", update=update_titleblocks)
+     is_editing_sheets: BoolProperty(name="Is Editing Sheets", default=False)
++    editing_sheet_layout_id: IntProperty(name="Editing Sheet Layout Id")
+     sheets: CollectionProperty(name="Sheets", type=Sheet)
+     active_sheet_index: IntProperty(name="Active Sheet Index")
+     drawing_styles: CollectionProperty(name="Drawing Styles", type=DrawingStyle)
+@@ -460,6 +461,7 @@ class DocProperties(PropertyGroup):
+         active_reference_index: int
+         titleblock: str
+         is_editing_sheets: bool
++        editing_sheet_layout_id: int
+         sheets: bpy.types.bpy_prop_collection_idprop[Sheet]
+         active_sheet_index: int
+         drawing_styles: bpy.types.bpy_prop_collection_idprop[DrawingStyle]
+diff --git a/src/bonsai/bonsai/bim/module/drawing/sheeter.py b/src/bonsai/bonsai/bim/module/drawing/sheeter.py
+index df57b6e..78179a8 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/sheeter.py
++++ b/src/bonsai/bonsai/bim/module/drawing/sheeter.py
+@@ -24,6 +24,7 @@ import urllib.parse
+ import uuid
+ import xml.etree.ElementTree as ET
+ from pathlib import Path
++from typing import Any
+ from xml.dom import minidom
+ 
+ import ifcopenshell.util.geolocation
+@@ -211,6 +212,66 @@ class SheetBuilder:
+ 
+         layout_tree.write(layout_path)
+ 
++    def get_sheet_layout(self, sheet: ifcopenshell.entity_instance) -> dict[str, Any]:
++        """Get sheet size and the placement of drawings, schedules and references on it, in mm."""
++        layout_path = tool.Drawing.get_document_uri(sheet, "LAYOUT")
++        assert layout_path
++        layout_root = ET.parse(layout_path).getroot()
++        items = []
++        for view in layout_root.findall(f"{SVG}g"):
++            if view.attrib.get("data-type") not in ("drawing", "schedule", "reference"):
++                continue
++            content = title = None
++            for image in view.findall(f"{SVG}image"):
++                if image.attrib.get("data-type") in ("foreground", "content"):
++                    content = image
++                elif image.attrib.get("data-type") == "view-title":
++                    title = image
++            if content is None:
++                continue
++            items.append(
++                {
++                    "reference_id": int(view.attrib["data-id"]),
++                    "content": self.get_image_rectangle(content),
++                    "title": None if title is None else self.get_image_rectangle(title),
++                }
++            )
++        return {
++            "width": self.convert_to_mm(layout_root.attrib["width"]),
++            "height": self.convert_to_mm(layout_root.attrib["height"]),
++            "items": items,
++        }
++
++    def get_image_rectangle(self, image: ET.Element) -> tuple[float, float, float, float]:
++        return tuple(self.convert_to_mm(image.attrib[a]) for a in ("x", "y", "width", "height"))
++
++    def set_sheet_item_positions(
++        self, sheet: ifcopenshell.entity_instance, positions: dict[int, tuple[float, float]]
++    ) -> None:
++        """Move sheet items, together with their view titles.
++
++        :param positions: Map of sheet item reference ids to their new top left corner, in mm.
++        """
++        ET.register_namespace("", "http://www.w3.org/2000/svg")
++        ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
++
++        layout_path = tool.Drawing.get_document_uri(sheet, "LAYOUT")
++        assert layout_path
++        layout_tree = ET.parse(layout_path)
++        for view in layout_tree.getroot().findall(f"{SVG}g"):
++            if (position := positions.get(int(view.attrib.get("data-id", 0)))) is None:
++                continue
++            images = view.findall(f"{SVG}image")
++            content = next((i for i in images if i.attrib.get("data-type") in ("foreground", "content")), None)
++            if content is None:
++                continue
++            offset_x = position[0] - self.convert_to_mm(content.attrib["x"])
++            offset_y = position[1] - self.convert_to_mm(content.attrib["y"])
++            for image in images:
++                image.attrib["x"] = str(round(self.convert_to_mm(image.attrib["x"]) + offset_x, 4))
++                image.attrib["y"] = str(round(self.convert_to_mm(image.attrib["y"]) + offset_y, 4))
++        layout_tree.write(layout_path)
++
+     def remove_drawing(self, reference: ifcopenshell.entity_instance, sheet: ifcopenshell.entity_instance) -> None:
+         ET.register_namespace("", "http://www.w3.org/2000/svg")
+ 
+diff --git a/src/bonsai/bonsai/bim/module/drawing/ui.py b/src/bonsai/bonsai/bim/module/drawing/ui.py
+index 42cb737..80e9af6 100644
+--- a/src/bonsai/bonsai/bim/module/drawing/ui.py
++++ b/src/bonsai/bonsai/bim/module/drawing/ui.py
+@@ -472,6 +472,14 @@ class BIM_PT_sheets(Panel):
+             row.operator("bim.load_sheets", text="", icon="IMPORT")
+             return
+ 
++        if self.props.editing_sheet_layout_id:
++            box = self.layout.box()
++            box.label(text="Editing Sheet Layout", icon="VIEW_ORTHO")
++            box.label(text="Move sheet items in the 3D viewport.", icon="INFO")
++            row = box.row(align=True)
++            row.operator("bim.edit_sheet_layout", icon="CHECKMARK")
++            row.operator("bim.disable_editing_sheet_layout", text="", icon="CANCEL")
++
+         row = self.layout.row(align=True)
+         row.prop(self.props, "titleblock", text="")
+         row.operator("bim.add_sheet", text="", icon="ADD")
+@@ -520,6 +528,7 @@ class BIM_PT_sheets(Panel):
+             row3.operator("bim.add_drawing_to_sheet", icon="IMAGE_PLANE", text="")
+             row3.operator("bim.add_schedule_to_sheet", icon="PRESET_NEW", text="")
+             row3.operator("bim.add_reference_to_sheet", icon="IMAGE_REFERENCE", text="")
++            row3.operator("bim.enable_editing_sheet_layout", icon="VIEW_ORTHO", text="")
+             row3.operator("bim.open_layout", icon="CURRENT_FILE", text="")
+ 
+             row3.separator(factor=0.5, type="SPACE")
+diff --git a/src/bonsai/bonsai/tool/drawing.py b/src/bonsai/bonsai/tool/drawing.py
+index 3c54e53..3959acc 100644
+--- a/src/bonsai/bonsai/tool/drawing.py
++++ b/src/bonsai/bonsai/tool/drawing.py
+@@ -1242,6 +1242,109 @@ class Drawing(bonsai.core.tool.Drawing):
+                 new.name = os.path.basename(reference.Location)
+                 new.reference_type = reference_description
+ 
++    SHEET_LAYOUT_PROP = "BIMSheetLayout"
++    SHEET_LAYOUT_ITEM_PROP = "BIMSheetLayoutReference"
++
++    @classmethod
++    def get_sheet_layout_collection(cls) -> Union[bpy.types.Collection, None]:
++        return next((c for c in bpy.data.collections if c.get(cls.SHEET_LAYOUT_PROP)), None)
++
++    @classmethod
++    def create_sheet_layout_objects(cls, layout: dict[str, Any], names: dict[int, str]) -> list[bpy.types.Object]:
++        """Create temporary objects to arrange sheet items in the viewport.
++
++        The sheet lies in the XY plane with its top left corner at the origin, at real size (1 mm is 1 mm).
++
++        :param layout: Sheet layout, see ``SheetBuilder.get_sheet_layout``.
++        :param names: Map of sheet item reference ids to their names.
++        :return: Sheet object, followed by the objects of the sheet items.
++        """
++        assert bpy.context.scene
++        collection = bpy.data.collections.new("Sheet Layout")
++        collection[cls.SHEET_LAYOUT_PROP] = True
++        bpy.context.scene.collection.children.link(collection)
++
++        def create_rectangle(name: str, x: float, y: float, width: float, height: float) -> bpy.types.Object:
++            mesh = bpy.data.meshes.new(name)
++            mesh.from_pydata([(0, 0, 0), (width, 0, 0), (width, -height, 0), (0, -height, 0)], [], [(0, 1, 2, 3)])
++            obj = bpy.data.objects.new(name, mesh)
++            obj.location = (x, -y, 0)
++            obj.lock_location[2] = True
++            obj.lock_rotation = (True, True, True)
++            obj.lock_scale = (True, True, True)
++            collection.objects.link(obj)
++            return obj
++
++        mm = 0.001
++        sheet = create_rectangle("Sheet", 0, 0, layout["width"] * mm, layout["height"] * mm)
++        sheet.display_type = "WIRE"
++        sheet.lock_location = (True, True, True)
++        objs = [sheet]
++        for item in layout["items"]:
++            x, y, width, height = (v * mm for v in item["content"])
++            obj = create_rectangle(names.get(item["reference_id"], "Unnamed"), x, y, width, height)
++            obj[cls.SHEET_LAYOUT_ITEM_PROP] = item["reference_id"]
++            obj.show_name = True
++            obj.show_wire = True
++            if item["title"]:
++                title_x, title_y, title_width, title_height = (v * mm for v in item["title"])
++                title = create_rectangle(f"{obj.name} Title", title_x - x, title_y - y, title_width, title_height)
++                title.parent = obj
++                title.display_type = "WIRE"
++                title.hide_select = True
++            objs.append(obj)
++        return objs
++
++    @classmethod
++    def get_sheet_layout_positions(cls) -> dict[int, tuple[float, float]]:
++        """Get positions of sheet items arranged in the viewport, in mm."""
++        positions = {}
++        if not (collection := cls.get_sheet_layout_collection()):
++            return positions
++        for obj in collection.objects:
++            if (reference_id := obj.get(cls.SHEET_LAYOUT_ITEM_PROP)) is not None:
++                positions[reference_id] = (round(obj.location.x * 1000, 2), round(-obj.location.y * 1000, 2))
++        return positions
++
++    @classmethod
++    def remove_sheet_layout_objects(cls) -> None:
++        if not (collection := cls.get_sheet_layout_collection()):
++            return
++        for obj in list(collection.objects):
++            mesh = obj.data
++            bpy.data.objects.remove(obj)
++            if isinstance(mesh, bpy.types.Mesh) and not mesh.users:
++                bpy.data.meshes.remove(mesh)
++        bpy.data.collections.remove(collection)
++
++    @classmethod
++    def isolate_sheet_layout_objects(cls, objs: list[bpy.types.Object]) -> None:
++        """Show only the sheet layout in the viewport, looking at it from the top."""
++        context_override = tool.Blender.get_viewport_context()
++        space = context_override["space_data"]
++        assert isinstance(space, bpy.types.SpaceView3D) and space.region_3d
++        if space.local_view:
++            with bpy.context.temp_override(**context_override):
++                bpy.ops.view3d.localview(frame_selected=False)
++        bpy.ops.object.select_all(action="DESELECT")
++        for obj in objs:
++            obj.select_set(True)
++        with bpy.context.temp_override(**context_override):
++            bpy.ops.view3d.localview(frame_selected=False)
++            bpy.ops.view3d.view_axis(type="TOP")
++            bpy.ops.view3d.view_selected()
++        bpy.ops.object.select_all(action="DESELECT")
++        objs[0].hide_select = True
++
++    @classmethod
++    def exit_sheet_layout_view(cls) -> None:
++        context_override = tool.Blender.get_viewport_context()
++        space = context_override["space_data"]
++        assert isinstance(space, bpy.types.SpaceView3D)
++        if space.local_view:
++            with bpy.context.temp_override(**context_override):
++                bpy.ops.view3d.localview(frame_selected=False)
++
+     @classmethod
+     def get_active_sheet(cls) -> Sheet:
+         props = cls.get_document_props()
+diff --git a/src/bonsai/test/tool/test_drawing_sheet_layout.py b/src/bonsai/test/tool/test_drawing_sheet_layout.py
+new file mode 100644
+index 0000000..3e231f1
+--- /dev/null
++++ b/src/bonsai/test/tool/test_drawing_sheet_layout.py
+@@ -0,0 +1,169 @@
++# This file was generated with the assistance of an AI coding tool.
++# Bonsai - OpenBIM Blender Add-on
++# Copyright (C) 2026 Bonsai contributors
++#
++# This file is part of Bonsai.
++#
++# Bonsai is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Bonsai is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
++
++import xml.etree.ElementTree as ET
++from pathlib import Path
++
++import bpy
++import pytest
++
++import bonsai.tool as tool
++from bonsai.bim.module.drawing.sheeter import SVG, SheetBuilder
++from test.bim.bootstrap import NewFile
++
++
++class SheetWithDrawingFile(NewFile):
++    @pytest.fixture(autouse=True)
++    def setup_sheet(self, setup):
++        bpy.ops.bim.create_project()
++        tool.Project.save_test_project()
++        bpy.ops.mesh.primitive_cube_add(size=10, location=(0, 0, 4))
++        bpy.ops.bim.assign_class(ifc_class="IfcActuator", predefined_type="ELECTRICACTUATOR", userdefined_type="")
++
++        bpy.ops.bim.load_sheets()
++        bpy.ops.bim.add_sheet()
++        bpy.ops.bim.load_drawings()
++        props = tool.Drawing.get_document_props()
++        for d in props.drawings:
++            d.is_expanded = True
++        bpy.ops.bim.add_drawing()
++        drawing = next(e for e in tool.Ifc.get().by_type("IfcAnnotation") if e.ObjectType == "DRAWING")
++        for i, d in enumerate(props.drawings):
++            if d.ifc_definition_id == drawing.id():
++                props.active_drawing_index = i
++        bpy.ops.bim.activate_drawing(drawing=drawing.id())
++        bpy.ops.bim.create_drawing()
++        bpy.ops.bim.add_drawing_to_sheet()
++
++        self.sheet = next(e for e in tool.Ifc.get().by_type("IfcDocumentInformation") if e.Scope == "SHEET")
++        self.reference = next(
++            r
++            for r in tool.Drawing.get_document_references(self.sheet)
++            if tool.Drawing.get_reference_description(r) == "DRAWING"
++        )
++        self.layout_path = Path(tool.Ifc.get_path()).parent / "layouts" / "A01 - UNTITLED.svg"
++
++    def get_layout_images(self) -> dict[str, tuple[float, ...]]:
++        root = ET.parse(self.layout_path).getroot()
++        view = next(g for g in root.findall(f"{SVG}g") if g.attrib.get("data-id") == str(self.reference.id()))
++        return {
++            image.attrib["data-type"]: tuple(round(float(image.attrib[a]), 2) for a in ("x", "y", "width", "height"))
++            for image in view.findall(f"{SVG}image")
++        }
++
++    def get_item_object(self) -> bpy.types.Object:
++        collection = tool.Drawing.get_sheet_layout_collection()
++        assert collection
++        return next(o for o in collection.objects if o.get(tool.Drawing.SHEET_LAYOUT_ITEM_PROP))
++
++
++class TestGetSheetLayout(SheetWithDrawingFile):
++    def test_run(self):
++        layout = SheetBuilder().get_sheet_layout(self.sheet)
++        assert (layout["width"], layout["height"]) == (841.0, 594.0)
++        assert len(layout["items"]) == 1
++        item = layout["items"][0]
++        assert item["reference_id"] == self.reference.id()
++        assert item["content"] == (30.0, 30.0, 500.0, 500.0)
++        assert tuple(round(v, 2) for v in item["title"]) == (30.0, 535.0, 50.22, 10.0)
++
++
++class TestSetSheetItemPositions(SheetWithDrawingFile):
++    def test_run(self):
++        SheetBuilder().set_sheet_item_positions(self.sheet, {self.reference.id(): (100.0, 20.5)})
++        images = self.get_layout_images()
++        assert images["foreground"] == (100.0, 20.5, 500.0, 500.0)
++        # View title keeps its offset to the drawing.
++        assert images["view-title"] == (100.0, 525.5, 50.22, 10.0)
++
++    def test_ignoring_unknown_items(self):
++        SheetBuilder().set_sheet_item_positions(self.sheet, {123456: (100.0, 20.5)})
++        assert self.get_layout_images()["foreground"] == (30.0, 30.0, 500.0, 500.0)
++
++
++class TestEnableEditingSheetLayout(SheetWithDrawingFile):
++    def test_run(self):
++        bpy.ops.bim.enable_editing_sheet_layout()
++
++        assert tool.Drawing.get_document_props().editing_sheet_layout_id == self.sheet.id()
++        collection = tool.Drawing.get_sheet_layout_collection()
++        assert collection
++
++        sheet_obj = collection.objects["Sheet"]
++        assert sheet_obj.hide_select
++        assert tuple(round(v, 4) for v in sheet_obj.dimensions[:2]) == (0.841, 0.594)
++
++        obj = self.get_item_object()
++        assert obj[tool.Drawing.SHEET_LAYOUT_ITEM_PROP] == self.reference.id()
++        assert obj.name == "1 - PLAN_VIEW"
++        # 1 mm on the sheet is 1 mm in Blender, sheet's Y axis points down.
++        assert tuple(round(v, 4) for v in obj.location) == (0.03, -0.03, 0.0)
++        assert tuple(round(v, 4) for v in obj.dimensions[:2]) == (0.5, 0.5)
++        assert obj.lock_location[2] and all(obj.lock_rotation) and all(obj.lock_scale)
++        title = obj.children[0]
++        assert tuple(round(v, 4) for v in title.location) == (0.0, -0.505, 0.0)
++
++        space = tool.Blender.get_view3d_space()
++        assert space.local_view
++        bpy.context.view_layer.update()
++        assert all(o.local_view_get(space) for o in (sheet_obj, obj))
++        cube = bpy.data.objects["IfcActuator/Cube"]
++        assert not cube.local_view_get(space)
++
++
++class TestEditSheetLayout(SheetWithDrawingFile):
++    def test_run(self):
++        bpy.ops.bim.enable_editing_sheet_layout()
++        obj = self.get_item_object()
++        obj.location = (0.1, -0.0205, 0)
++
++        bpy.ops.bim.edit_sheet_layout()
++
++        images = self.get_layout_images()
++        assert images["foreground"] == (100.0, 20.5, 500.0, 500.0)
++        assert images["view-title"] == (100.0, 525.5, 50.22, 10.0)
++        assert tool.Drawing.get_sheet_layout_collection() is None
++        assert tool.Drawing.get_document_props().editing_sheet_layout_id == 0
++        assert tool.Blender.get_view3d_space().local_view is None
++
++    def test_creating_sheet_after_editing_layout(self):
++        bpy.ops.bim.enable_editing_sheet_layout()
++        self.get_item_object().location = (0.1, -0.0205, 0)
++        bpy.ops.bim.edit_sheet_layout()
++
++        bpy.ops.bim.create_sheets()
++
++        sheet_path = Path(tool.Ifc.get_path()).parent / "sheets" / "A01 - UNTITLED.svg"
++        root = ET.parse(sheet_path).getroot()
++        view = next(g for g in root.findall(f"{SVG}g") if g.attrib.get("data-type") == "drawing")
++        assert view.findall(f"{SVG}g")[0].attrib["transform"] == "translate(100.0,20.5)"
++
++
++class TestDisableEditingSheetLayout(SheetWithDrawingFile):
++    def test_run(self):
++        bpy.ops.bim.enable_editing_sheet_layout()
++        self.get_item_object().location = (0.1, -0.0205, 0)
++
++        bpy.ops.bim.disable_editing_sheet_layout()
++
++        assert self.get_layout_images()["foreground"] == (30.0, 30.0, 500.0, 500.0)
++        assert tool.Drawing.get_sheet_layout_collection() is None
++        assert not [o for o in bpy.data.objects if o.name.startswith("Sheet")]
++        assert tool.Drawing.get_document_props().editing_sheet_layout_id == 0
++        assert tool.Blender.get_view3d_space().local_view is None
+-- 
+2.43.0
+

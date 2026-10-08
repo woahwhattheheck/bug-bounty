@@ -1,0 +1,172 @@
+From 97b59abbc8ed64991b9b089694a9d37094c969e6 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:56:25 +0000
+Subject: [PATCH] Fix unbound variable errors when RVM runs with nounset
+
+Scripts that enable `set -u` (for example `set -euo pipefail` in Packer,
+Docker or CI provisioning) could not load or use RVM:
+
+* `scripts/functions/support` read `_system_name` while setting up the
+  utility functions, which runs before system detection, so
+  `rvm --default use` failed with `_system_name: unbound variable`
+* `scripts/rvm` read `rvm_prefix` before checking whether it was set
+* the duplicated `rvm_user_install_flag` detection expanded `USER`, which is
+  not set in Docker `RUN` steps, cron jobs or systemd units; an empty value
+  is now never treated as a user-install prefix
+* `scripts/cd` expanded `chpwd_functions`, which bash < 4.4 reports as
+  unbound when the array is unset or empty; existing hooks are preserved
+
+`binscripts/rvm-installer` carries the same `rvm_user_install_flag` block but
+is GPG-signed and verified in CI, so it is left for a signed release update.
+
+Adds tests/fast/nounset_comment_test.sh covering loading under nounset,
+the reported load-then-`set -u` flow, environments without USER and
+cd hook registration.
+
+Fixes #4694
+---
+ CHANGELOG.md                       |  1 +
+ scripts/cd                         |  6 ++++--
+ scripts/functions/installer        |  9 +++++++--
+ scripts/functions/support          |  4 ++--
+ scripts/initialize                 |  9 +++++++--
+ scripts/rvm                        | 11 ++++++++---
+ tests/fast/nounset_comment_test.sh | 13 +++++++++++++
+ 7 files changed, 42 insertions(+), 11 deletions(-)
+ create mode 100644 tests/fast/nounset_comment_test.sh
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1bbc8f4e..152fea6e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -50,6 +50,7 @@
+ * Fix autogen.sh call for MRI's on OpenBSD [\#5620](https://github.com/rvm/rvm/pull/5620)
+ * Update TruffleRuby dependencies for TruffleRuby 33+ [\#5632](https://github.com/rvm/rvm/pull/5632)
+ * Avoid undefined `rvm_shell_nounset` variable [\#5638](https://github.com/rvm/rvm/pull/5638)
++* Fix `unbound variable` errors when RVM is loaded or used with `set -u` (nounset), including environments without `USER` [\#4694](https://github.com/rvm/rvm/issues/4694)
+ 
+ #### New interpreters
+ 
+diff --git a/scripts/cd b/scripts/cd
+index 19ec8d55..b9aad145 100755
+--- a/scripts/cd
++++ b/scripts/cd
+@@ -35,8 +35,10 @@ case "${rvm_project_rvmrc:-1}" in
+     __rvm_do_with_env_after
+     return 0
+   }
+-  [[ " ${chpwd_functions[*]} " == *" __rvm_cd_functions_set "* ]] ||
+-  chpwd_functions=( "${chpwd_functions[@]}" __rvm_cd_functions_set )
++  # guarded expansions keep this working under `set -u` when chpwd_functions
++  # is unset or empty (bash < 4.4 treats both as unbound)
++  [[ " ${chpwd_functions[*]:-} " == *" __rvm_cd_functions_set "* ]] ||
++  chpwd_functions=( ${chpwd_functions[@]+"${chpwd_functions[@]}"} __rvm_cd_functions_set )
+ 
+   # This functionality is opt-in by setting rvm_cd_complete_flag=1 in ~/.rvmrc
+   # Generic bash cd completion seems to work great for most, so this is only
+diff --git a/scripts/functions/installer b/scripts/functions/installer
+index 54462a09..51a7e44c 100644
+--- a/scripts/functions/installer
++++ b/scripts/functions/installer
+@@ -301,8 +301,13 @@ setup_installer()
+   [[ -n "${rvm_user_install_flag:-}" ]] ||
+   case "$rvm_path" in
+     (/usr/local/rvm)         rvm_user_install_flag=0 ;;
+-    ($HOME/*|/${USER// /_}*) rvm_user_install_flag=1 ;;
+-    (*)                      rvm_user_install_flag=0 ;;
++    ($HOME/*)                rvm_user_install_flag=1 ;;
++    (*)
++      if [[ -n "${USER:-}" && "$rvm_path" == "/${USER// /_}"* ]]
++      then rvm_user_install_flag=1
++      else rvm_user_install_flag=0
++      fi
++      ;;
+   esac
+ 
+   if [[ -d "$rvm_path" && -s "${rvm_path}/scripts/rvm" ]]
+diff --git a/scripts/functions/support b/scripts/functions/support
+index 113b4a2e..a24a1e72 100644
+--- a/scripts/functions/support
++++ b/scripts/functions/support
+@@ -179,8 +179,8 @@ __rvm_setup_utils_functions()
+   gnu_utils=( awk cp date find sed tail tar xargs )
+   gnu_missing=()
+ 
+-  if is_a_function __rvm_setup_utils_functions_${_system_name}
+-  then __rvm_setup_utils_functions_${_system_name} "$@" || return $?
++  if is_a_function __rvm_setup_utils_functions_${_system_name:-}
++  then __rvm_setup_utils_functions_${_system_name:-} "$@" || return $?
+   else __rvm_setup_utils_functions_Other "$@" || return $?
+   fi
+ }
+diff --git a/scripts/initialize b/scripts/initialize
+index 6b864cd2..768355a6 100755
+--- a/scripts/initialize
++++ b/scripts/initialize
+@@ -109,8 +109,13 @@ Error:
+   [[ -n "${rvm_user_install_flag:-}" ]] ||
+   case "$rvm_path" in
+     (/usr/local/rvm)         rvm_user_install_flag=0 ;;
+-    ($HOME/*|/${USER// /_}*) rvm_user_install_flag=1 ;;
+-    (*)                      rvm_user_install_flag=0 ;;
++    ($HOME/*)                rvm_user_install_flag=1 ;;
++    (*)
++      if [[ -n "${USER:-}" && "$rvm_path" == "/${USER// /_}"* ]]
++      then rvm_user_install_flag=1
++      else rvm_user_install_flag=0
++      fi
++      ;;
+   esac
+   export rvm_user_install_flag
+ 
+diff --git a/scripts/rvm b/scripts/rvm
+index fdf4d26d..8661be4b 100755
+--- a/scripts/rvm
++++ b/scripts/rvm
+@@ -137,7 +137,7 @@ else
+ fi
+ 
+ # guess rvm_prefix if not set
+-if [[ -z "${rvm_prefix}" ]]
++if [[ -z "${rvm_prefix:-}" ]]
+ then
+   rvm_prefix=$( dirname $rvm_path )
+ fi
+@@ -146,8 +146,13 @@ fi
+ [[ -n "${rvm_user_install_flag:-}" ]] ||
+ case "$rvm_path" in
+   (/usr/local/rvm)         rvm_user_install_flag=0 ;;
+-  ($HOME/*|/${USER// /_}*) rvm_user_install_flag=1 ;;
+-  (*)                      rvm_user_install_flag=0 ;;
++  ($HOME/*)                rvm_user_install_flag=1 ;;
++  (*)
++    if [[ -n "${USER:-}" && "$rvm_path" == "/${USER// /_}"* ]]
++    then rvm_user_install_flag=1
++    else rvm_user_install_flag=0
++    fi
++    ;;
+ esac
+ 
+ export rvm_loaded_flag
+diff --git a/tests/fast/nounset_comment_test.sh b/tests/fast/nounset_comment_test.sh
+new file mode 100644
+index 00000000..d7126eb3
+--- /dev/null
++++ b/tests/fast/nounset_comment_test.sh
+@@ -0,0 +1,13 @@
++source "$rvm_path/scripts/rvm"
++
++: loading and using RVM in a shell with nounset enabled, see issue 4694
++bash -u -c 'source "$rvm_path/scripts/rvm" && rvm current' 2>&1 # status=0; match!=/unbound variable/
++env -u USER bash -u -c 'source "$rvm_path/scripts/rvm" && rvm current' 2>&1 # status=0; match!=/unbound variable/
++
++: reported flow, RVM loaded first and nounset enabled afterwards
++bash -c 'source "$rvm_path/scripts/rvm"; set -eu -o pipefail; rvm use system && rvm current' 2>&1 # status=0; match=/system/; match!=/unbound variable/
++env -u USER bash -c 'source "$rvm_path/scripts/rvm"; set -eu -o pipefail; rvm use system && rvm current' 2>&1 # status=0; match=/system/; match!=/unbound variable/
++
++: cd hook is registered under nounset and existing hooks are kept
++bash -u -c 'unset chpwd_functions; source "$rvm_path/scripts/rvm"; echo "${chpwd_functions[*]}"' 2>&1 # status=0; match=/^__rvm_cd_functions_set$/
++bash -u -c 'chpwd_functions=(my_hook); source "$rvm_path/scripts/rvm"; echo "${chpwd_functions[*]}"' 2>&1 # status=0; match=/^my_hook __rvm_cd_functions_set$/
+-- 
+2.43.0
+

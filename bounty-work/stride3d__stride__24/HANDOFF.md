@@ -100,7 +100,7 @@ no full test suites.
 
 | Check | Command (from the stride clone) | Result |
 |---|---|---|
-| Stride.Rendering build | `dotnet build sources/engine/Stride.Rendering/Stride.Rendering.csproj -c Debug -p:StrideSkipAutoPack=true -p:StrideSkipUnitTests=true` | 0 errors, no new warnings in decal files |
+| Stride.Rendering build | `dotnet build sources/engine/Stride.Rendering/Stride.Rendering.csproj -c Debug -p:StrideSkipAutoPack=true -p:StrideSkipUnitTests=true` | 0 errors |
 | Stride.Engine build | `dotnet build sources/engine/Stride.Engine/Stride.Engine.csproj -c Debug -p:StrideSkipAutoPack=true -p:StrideSkipUnitTests=true` | 0 errors |
 | Shader test build + run | `dotnet build sources/shaders/Stride.Shaders.Tests/Stride.Shaders.Tests.csproj -c Debug -p:StrideSkipAutoPack=true` then in `bin/Tests/Stride.Shaders.Tests/Linux-Vulkan/Debug`: `dotnet test Stride.Shaders.Tests.dll --filter "FullyQualifiedName~DecalProjectionForwardShadingCompiles"` | **4/4 passed** (normal map on/off x SPIR-V on/off; SPIR-V validated by spirv-tools; reflection asserts `DecalParameters` in the per-draw `Decal` group and `DepthStencil` in `PerView`) |
 | Engine unit + GPU tests | harness in `validation/linux-harness/` (compiles the unmodified `TestDecals.cs` and `DecalRenderingTests.cs`; the 3 `Linux*` subclasses only point the effect compiler at the shader sources because there is no compiled asset database on Linux): `DECAL_SHADER_ROOT=<dir with shaders/*.sdsl> dotnet test --filter "FullyQualifiedName~Stride.Engine.Tests.LinuxDecal\|FullyQualifiedName~Stride.Engine.Tests.TestDecals"` | **17/17 passed** (14 unit + 3 GPU rendering tests), output in `validation/engine_tests_output.txt` |
@@ -108,7 +108,7 @@ no full test suites.
 | Editor gizmo | `DecalGizmo.cs` compiled against stubs with the exact signatures of the WPF gizmo base classes (WPF does not build on Linux) | type-checks |
 | FPS template | `BulletHoleDecals.cs` + the template game scripts compiled against the branch engine | builds, 0 errors |
 | Compositor YAML | default and FPS `sdgfxcomp` loaded with the Stride YAML serializer | `Decals` stage with `DecalSortMode`, `DecalRenderFeature`, `DecalRenderStage` on selector and both forward renderers resolve |
-| Visual | headless render of the test scene, `validation/screenshots/decals_stage.png` (decal stage) and `decals_fallback.png` (old compositor, transparent-stage path) | identical decals in both modes |
+| Visual | headless render of the test scene, `validation/screenshots/decals_stage.png` (decal stage) and `decals_fallback.png` (old compositor, transparent-stage path) | same image in both modes except the overlapping pair at the bottom right: the decal stage draws the higher `SortOrder` decal on top (orange), the transparent-stage fallback ignores `SortOrder` (blue on top), as documented |
 
 ## 6. Steps for the submitter on Windows (not possible in this container)
 

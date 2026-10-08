@@ -1,0 +1,91 @@
+From 0e29c03c9e473becbf957eadd2ca2a55518b8519 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 06:08:47 +0000
+Subject: [PATCH] fix: drop listbox role and active descendant when there are
+ no options
+
+An open Select with no options rendered the not-found content inside
+role="listbox" without any option children, and pointed
+aria-activedescendant at a non-existent "<id>_list_-1" element. axe
+reports both (aria-required-children, aria-valid-attr-value).
+
+ref ant-design/ant-design#11600
+---
+ src/OptionList.tsx                       |  8 ++------
+ src/Select.tsx                           |  4 +++-
+ tests/Accessibility.test.tsx             | 13 +++++++++++++
+ tests/__snapshots__/Select.test.tsx.snap |  1 -
+ 4 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/src/OptionList.tsx b/src/OptionList.tsx
+index 87b9094..0de9027 100644
+--- a/src/OptionList.tsx
++++ b/src/OptionList.tsx
+@@ -282,13 +282,9 @@ const OptionList: React.ForwardRefRenderFunction<RefOptionListProps, {}> = (_, r
+ 
+   // ========================== Render ==========================
+   if (memoFlattenOptions.length === 0) {
++    // No `role="listbox"` here: a listbox must own at least one option
+     return (
+-      <div
+-        role="listbox"
+-        id={`${id}_list`}
+-        className={`${itemPrefixCls}-empty`}
+-        onMouseDown={onListMouseDown}
+-      >
++      <div id={`${id}_list`} className={`${itemPrefixCls}-empty`} onMouseDown={onListMouseDown}>
+         {notFoundContent}
+       </div>
+     );
+diff --git a/src/Select.tsx b/src/Select.tsx
+index 9735154..c408a11 100644
+--- a/src/Select.tsx
++++ b/src/Select.tsx
+@@ -764,7 +764,9 @@ const Select = React.forwardRef<BaseSelectRef, SelectProps<any, DefaultOptionTyp
+           emptyOptions={!displayOptions.length}
+           // >>> Accessibility
+           activeValue={activeValue}
+-          activeDescendantId={`${mergedId}_list_${accessibilityIndex}`}
++          activeDescendantId={
++            accessibilityIndex >= 0 ? `${mergedId}_list_${accessibilityIndex}` : undefined
++          }
+         />
+       </SelectContext.Provider>
+     );
+diff --git a/tests/Accessibility.test.tsx b/tests/Accessibility.test.tsx
+index 8e7ff6a..4496611 100644
+--- a/tests/Accessibility.test.tsx
++++ b/tests/Accessibility.test.tsx
+@@ -504,5 +504,18 @@ describe('Select.Accessibility', () => {
+       expect(optionA).not.toHaveAttribute('aria-disabled', 'true');
+       expect(optionB).toHaveAttribute('aria-disabled', 'true');
+     });
++
++    // https://github.com/ant-design/ant-design/issues/11600
++    it('should not expose an empty listbox or a missing active descendant', () => {
++      const { container } = render(<Select id="empty-select" open options={[]} />);
++
++      const input = container.querySelector('input');
++      expect(input).toHaveAttribute('aria-controls', 'empty-select_list');
++      expect(input).not.toHaveAttribute('aria-activedescendant');
++
++      const emptyList = document.querySelector('#empty-select_list');
++      expect(emptyList).toHaveClass('rc-select-item-empty');
++      expect(emptyList).not.toHaveAttribute('role');
++    });
+   });
+ });
+diff --git a/tests/__snapshots__/Select.test.tsx.snap b/tests/__snapshots__/Select.test.tsx.snap
+index 461638c..d235dcf 100644
+--- a/tests/__snapshots__/Select.test.tsx.snap
++++ b/tests/__snapshots__/Select.test.tsx.snap
+@@ -104,7 +104,6 @@ exports[`Select.Basic filterOption could be true as described in default value 1
+     <div
+       class="rc-select-item-empty"
+       id="test-id_list"
+-      role="listbox"
+     >
+       Not Found
+     </div>
+-- 
+2.43.0

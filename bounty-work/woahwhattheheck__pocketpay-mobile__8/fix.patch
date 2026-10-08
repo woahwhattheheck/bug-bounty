@@ -1,0 +1,153 @@
+From 6d150e5955373b47dfd19fea9b1e8f0e0bf3e927 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:47:26 +0000
+Subject: [PATCH 1/2] test(confirm): stub lucide icons so the #400 regression
+ suite loads
+
+The new async-confirmation-failure suite imports ConfirmModal, which pulls
+in lucide-react-native. That package ships untransformed ESM, so Jest
+failed with "Unexpected token 'export'" before any case ran. Mock the two
+icons ConfirmModal uses, as the existing useConfirm/ConfirmModal suites do.
+
+Refs #400
+---
+ tests/async-confirmation-failure.test.tsx | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/tests/async-confirmation-failure.test.tsx b/tests/async-confirmation-failure.test.tsx
+index 69f4f15..79a197a 100644
+--- a/tests/async-confirmation-failure.test.tsx
++++ b/tests/async-confirmation-failure.test.tsx
+@@ -1,5 +1,13 @@
+ import React from 'react';
+ import { act, renderHook } from '@testing-library/react-native';
++
++// lucide-react-native ships untransformed ESM; stub the icons ConfirmModal uses,
++// as the other ConfirmModal/useConfirm suites do.
++jest.mock('lucide-react-native', () => ({
++  X: () => null,
++  AlertTriangle: () => null,
++}));
++
+ import { ConfirmModal, ConfirmModalProps } from '../src/components/ConfirmModal';
+ import { useConfirm } from '../src/hooks/useConfirm';
+ 
+-- 
+2.43.0
+
+
+From e47c4bb7939205131fe2aa64b1049c0246d70cdd Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:48:21 +0000
+Subject: [PATCH 2/2] test(confirm): cover the rendered redacted retry error
+ for #400
+
+Exercise the ConfirmModal error path end to end through useConfirm: a
+rejected destructive action keeps the dialog open, shows the generic
+alert-role message without the thrown error text, and a successful retry
+resolves true and closes the dialog. Also cover the declarative reopen
+path that clears a stale failure message.
+
+Refs #400
+---
+ tests/async-confirmation-failure.test.tsx | 81 ++++++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/tests/async-confirmation-failure.test.tsx b/tests/async-confirmation-failure.test.tsx
+index 79a197a..da3f412 100644
+--- a/tests/async-confirmation-failure.test.tsx
++++ b/tests/async-confirmation-failure.test.tsx
+@@ -1,5 +1,6 @@
+ import React from 'react';
+-import { act, renderHook } from '@testing-library/react-native';
++import { Text } from 'react-native';
++import { act, fireEvent, render, renderHook } from '@testing-library/react-native';
+ 
+ // lucide-react-native ships untransformed ESM; stub the icons ConfirmModal uses,
+ // as the other ConfirmModal/useConfirm suites do.
+@@ -125,4 +126,82 @@ describe('async confirmation failure and lifecycle', () => {
+     expect(await first).toBe(true);
+     expect(result.current.isVisible).toBe(false);
+   });
++
++  it('shows a redacted, accessible retry error in the rendered dialog and clears it on success', async () => {
++    let attempts = 0;
++    const onResolved = jest.fn();
++    const Harness = () => {
++      const { confirm, confirmationDialog, isVisible } = useConfirm();
++      return (
++        <>
++          <Text
++            accessibilityRole="button"
++            accessibilityLabel="raise"
++            onPress={() => {
++              void confirm({
++                title: 'Delete Contact',
++                message: 'Are you sure?',
++                confirmLabel: 'Delete',
++                destructive: true,
++                onConfirm: async () => {
++                  attempts += 1;
++                  if (attempts === 1) throw new Error('secret seed in provider error');
++                },
++              }).then(onResolved);
++            }}
++          >
++            raise
++          </Text>
++          <Text>{isVisible ? 'dialog-open' : 'dialog-closed'}</Text>
++          {confirmationDialog}
++        </>
++      );
++    };
++
++    const { getByLabelText, getByTestId, getByText, queryByTestId, queryByText } = render(<Harness />);
++    await act(async () => {
++      fireEvent.press(getByLabelText('raise'));
++    });
++    await act(async () => {
++      fireEvent.press(getByLabelText('Delete'));
++    });
++
++    const alert = getByTestId('confirm-action-error');
++    expect(alert.props.accessibilityRole).toBe('alert');
++    expect(getByText('Unable to complete this action. Please try again.')).toBeTruthy();
++    expect(queryByText(/secret seed/)).toBeNull();
++    expect(getByText('dialog-open')).toBeTruthy();
++    expect(onResolved).not.toHaveBeenCalled();
++
++    await act(async () => {
++      fireEvent.press(getByLabelText('Delete'));
++    });
++    expect(attempts).toBe(2);
++    expect(onResolved).toHaveBeenCalledWith(true);
++    expect(getByText('dialog-closed')).toBeTruthy();
++    expect(queryByTestId('confirm-action-error')).toBeNull();
++  });
++
++  it('clears a previous failure when a declarative modal is hidden and reopened', async () => {
++    const onConfirm = jest.fn(async () => {
++      throw new Error('private storage detail');
++    });
++    const props = {
++      title: 'Reset Wallet',
++      message: 'Remove this wallet from the device?',
++      confirmLabel: 'Reset',
++      onConfirm,
++      onCancel: jest.fn(),
++    };
++
++    const { getByLabelText, queryByTestId, rerender } = render(<ConfirmModal visible {...props} />);
++    await act(async () => {
++      fireEvent.press(getByLabelText('Reset'));
++    });
++    expect(queryByTestId('confirm-action-error')).not.toBeNull();
++
++    rerender(<ConfirmModal visible={false} {...props} />);
++    rerender(<ConfirmModal visible {...props} />);
++    expect(queryByTestId('confirm-action-error')).toBeNull();
++  });
+ });
+-- 
+2.43.0
+

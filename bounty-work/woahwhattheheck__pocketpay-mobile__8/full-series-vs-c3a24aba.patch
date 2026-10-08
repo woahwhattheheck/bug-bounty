@@ -1,0 +1,563 @@
+From 64bc7728d11367baffd904be1ca8037de3eee0d0 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <brycembusiness2@gmail.com>
+Date: Wed, 7 Oct 2026 23:53:44 -0400
+Subject: [PATCH 1/7] fix(confirm): fail closed on rejected async actions and
+ stale dialogs
+
+---
+ src/hooks/useConfirm.tsx | 63 +++++++++++++++++++++++++---------------
+ 1 file changed, 39 insertions(+), 24 deletions(-)
+
+diff --git a/src/hooks/useConfirm.tsx b/src/hooks/useConfirm.tsx
+index e257856..96275fc 100644
+--- a/src/hooks/useConfirm.tsx
++++ b/src/hooks/useConfirm.tsx
+@@ -52,50 +52,65 @@ export interface UseConfirmResult {
+  * ```
+  */
+ export function useConfirm(): UseConfirmResult {
+-  const [request, setRequest] = useState<ConfirmRequest | null>(null);
++  // Each request has its own identity: a late callback from an older dialog
++  // must never acknowledge or dismiss a different confirmation.
++  const [request, setRequest] = useState<(ConfirmRequest & { id: number }) | null>(null);
++  const requestRef = useRef<(ConfirmRequest & { id: number }) | null>(null);
++  const requestIdRef = useRef(0);
+   const resolverRef = useRef<((confirmed: boolean) => void) | null>(null);
++  const confirmingIdRef = useRef<number | null>(null);
+ 
+-  const settle = useCallback((confirmed: boolean) => {
++  const settle = useCallback((id: number, confirmed: boolean) => {
++    if (requestRef.current?.id !== id) return;
+     const resolve = resolverRef.current;
+     resolverRef.current = null;
++    requestRef.current = null;
+     setRequest(null);
+     resolve?.(confirmed);
+   }, []);
+ 
+-  const confirm = useCallback(
+-    (next: ConfirmRequest) => {
+-      // A second request while one is open supersedes it; the superseded caller
+-      // resolves `false` so its promise never dangles.
+-      resolverRef.current?.(false);
++  const confirm = useCallback((next: ConfirmRequest): Promise<boolean> => {
++    // Do not replace an in-flight destructive action. It may have committed
++    // side effects even though its promise has not settled yet.
++    if (confirmingIdRef.current !== null) return Promise.resolve(false);
+ 
+-      return new Promise<boolean>((resolve) => {
+-        resolverRef.current = resolve;
+-        setRequest(next);
+-      });
+-    },
+-    [],
+-  );
++    // Superseding an idle request resolves the prior caller as cancelled.
++    resolverRef.current?.(false);
++    const active = { ...next, id: ++requestIdRef.current };
++    requestRef.current = active;
++    setRequest(active);
+ 
+-  const handleConfirm = useCallback(async () => {
+-    // Captured before awaiting: `settle` clears the request, and a later
+-    // supersede must not run this request's work twice.
+-    const pending = request;
+-    if (!pending) return;
++    return new Promise<boolean>((resolve) => {
++      resolverRef.current = resolve;
++    });
++  }, []);
++
++  const handleConfirm = useCallback(async (id: number) => {
++    const pending = requestRef.current;
++    if (!pending || pending.id !== id || confirmingIdRef.current !== null) return;
+ 
++    confirmingIdRef.current = id;
+     try {
+       await pending.onConfirm?.();
++      // Only a completed action can report success. On rejection the dialog
++      // remains open, so the user can retry or cancel instead of getting true.
++      settle(id, true);
+     } finally {
+-      settle(true);
++      if (confirmingIdRef.current === id) confirmingIdRef.current = null;
+     }
+-  }, [request, settle]);
++  }, [settle]);
+ 
+-  const handleCancel = useCallback(() => settle(false), [settle]);
++  const handleCancel = useCallback((id: number) => {
++    if (confirmingIdRef.current !== null) return;
++    settle(id, false);
++  }, [settle]);
+ 
+   const confirmationDialog = useMemo(() => {
+     if (!request) return null;
+ 
+     return (
+       <ConfirmModal
++        key={request.id}
+         visible
+         title={request.title}
+         message={request.message}
+@@ -103,8 +118,8 @@ export function useConfirm(): UseConfirmResult {
+         cancelLabel={request.cancelLabel ?? 'Cancel'}
+         destructive={request.destructive}
+         icon={request.icon}
+-        onConfirm={handleConfirm}
+-        onCancel={handleCancel}
++        onConfirm={() => handleConfirm(request.id)}
++        onCancel={() => handleCancel(request.id)}
+       />
+     );
+   }, [request, handleConfirm, handleCancel]);
+-- 
+2.43.0
+
+
+From d3436dfe185595fa443e2092578a16a1a41e07d8 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <brycembusiness2@gmail.com>
+Date: Wed, 7 Oct 2026 23:53:57 -0400
+Subject: [PATCH 2/7] fix(confirm): show accessible redacted retry error
+ without leaking failures
+
+---
+ src/components/ConfirmModal.tsx | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/components/ConfirmModal.tsx b/src/components/ConfirmModal.tsx
+index 6d6d68d..0be086e 100644
+--- a/src/components/ConfirmModal.tsx
++++ b/src/components/ConfirmModal.tsx
+@@ -57,6 +57,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
+   // Tracks an async `onConfirm` so every caller gets the same spinner/disabled
+   // treatment without re-implementing the pending state at each call site.
+   const [isConfirming, setIsConfirming] = useState(false);
++  const [confirmError, setConfirmError] = useState(false);
+   const isConfirmingRef = useRef(false);
+   const isMountedRef = useRef(true);
+ 
+@@ -73,17 +74,22 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
+   const handleConfirm = useCallback(async () => {
+     // The ref guard closes the window between two taps landing before React
+     // re-renders the button as disabled.
+-    if (confirmDisabled || isLoading || isConfirmingRef.current) return;
++    if (!visible || confirmDisabled || isLoading || isConfirmingRef.current) return;
+ 
+     isConfirmingRef.current = true;
+     setIsConfirming(true);
++    setConfirmError(false);
+     try {
+       await onConfirm();
++    } catch {
++      // The hook leaves failed confirmations open for retry. Never surface
++      // thrown wallet/storage exception messages, which may contain secrets.
++      if (isMountedRef.current) setConfirmError(true);
+     } finally {
+       isConfirmingRef.current = false;
+       if (isMountedRef.current) setIsConfirming(false);
+     }
+-  }, [confirmDisabled, isLoading, onConfirm]);
++  }, [visible, confirmDisabled, isLoading, onConfirm]);
+ 
+   const handleCancel = useCallback(() => {
+     if (busy) return;
+@@ -132,6 +138,16 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
+           >
+             <Text style={styles.title}>{title}</Text>
+             <Text style={styles.message}>{message}</Text>
++            {confirmError ? (
++              <Text
++                testID="confirm-action-error"
++                style={styles.confirmError}
++                accessibilityRole="alert"
++                accessibilityLiveRegion="polite"
++              >
++                Unable to complete this action. Please try again.
++              </Text>
++            ) : null}
+ 
+             {children ? <View style={styles.customContent}>{children}</View> : null}
+           </ScrollView>
+@@ -256,6 +272,13 @@ const createStyles = (colors: ThemeColors) =>
+       lineHeight: 20,
+       marginBottom: SIZES.lg,
+     },
++    confirmError: {
++      color: colors.error,
++      textAlign: 'center',
++      fontSize: 13,
++      lineHeight: 20,
++      marginBottom: SIZES.sm,
++    },
+     customContent: {
+       marginBottom: SIZES.xs,
+     },
+-- 
+2.43.0
+
+
+From 1f03b049831105fa3ebfbe466a007fa4fd542b56 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <brycembusiness2@gmail.com>
+Date: Wed, 7 Oct 2026 23:54:21 -0400
+Subject: [PATCH 3/7] test(confirm): cover failure retry, stale dialogs, and
+ duplicate submits
+
+---
+ tests/async-confirmation-failure.test.tsx | 120 ++++++++++++++++++++++
+ 1 file changed, 120 insertions(+)
+ create mode 100644 tests/async-confirmation-failure.test.tsx
+
+diff --git a/tests/async-confirmation-failure.test.tsx b/tests/async-confirmation-failure.test.tsx
+new file mode 100644
+index 0000000..69f4f15
+--- /dev/null
++++ b/tests/async-confirmation-failure.test.tsx
+@@ -0,0 +1,120 @@
++import React from 'react';
++import { act, renderHook } from '@testing-library/react-native';
++import { ConfirmModal, ConfirmModalProps } from '../src/components/ConfirmModal';
++import { useConfirm } from '../src/hooks/useConfirm';
++
++function activeDialog(result: { current: ReturnType<typeof useConfirm> }) {
++  const dialog = result.current.confirmationDialog as React.ReactElement<ConfirmModalProps>;
++  expect(dialog.type).toBe(ConfirmModal);
++  return dialog.props;
++}
++
++describe('async confirmation failure and lifecycle', () => {
++  it('does not resolve true on a rejected destructive action and permits retry', async () => {
++    const { result } = renderHook(() => useConfirm());
++    let attempts = 0;
++    let decision!: Promise<boolean>;
++    const settled = jest.fn();
++
++    act(() => {
++      decision = result.current.confirm({
++        title: 'Delete Contact',
++        message: 'Confirm deletion',
++        destructive: true,
++        onConfirm: async () => {
++          attempts += 1;
++          if (attempts === 1) throw new Error('private provider detail');
++        },
++      });
++      void decision.then(settled);
++    });
++
++    await act(async () => {
++      await expect(activeDialog(result).onConfirm()).rejects.toThrow('private provider detail');
++    });
++    expect(result.current.isVisible).toBe(true);
++    expect(settled).not.toHaveBeenCalled();
++
++    await act(async () => {
++      await activeDialog(result).onConfirm();
++    });
++    expect(await decision).toBe(true);
++    expect(settled).toHaveBeenCalledWith(true);
++    expect(attempts).toBe(2);
++    expect(result.current.isVisible).toBe(false);
++  });
++
++  it('cannot let a superseded dialog settle its replacement', async () => {
++    const { result } = renderHook(() => useConfirm());
++    const oldAction = jest.fn();
++    const newAction = jest.fn();
++    let first!: Promise<boolean>;
++    let second!: Promise<boolean>;
++    act(() => {
++      first = result.current.confirm({
++        title: 'First',
++        message: 'First operation',
++        onConfirm: oldAction,
++      });
++    });
++    const stale = activeDialog(result);
++
++    act(() => {
++      second = result.current.confirm({
++        title: 'Second',
++        message: 'New operation',
++        onConfirm: newAction,
++      });
++    });
++    expect(await first).toBe(false);
++
++    await act(async () => {
++      stale.onCancel();
++      await stale.onConfirm();
++    });
++    expect(oldAction).not.toHaveBeenCalled();
++    expect(newAction).not.toHaveBeenCalled();
++    expect(result.current.isVisible).toBe(true);
++    expect(activeDialog(result).title).toBe('Second');
++
++    act(() => activeDialog(result).onCancel());
++    expect(await second).toBe(false);
++  });
++
++  it('blocks duplicate submits, cancellation and supersession during an in-flight action', async () => {
++    const { result } = renderHook(() => useConfirm());
++    let complete!: () => void;
++    const work = new Promise<void>((resolve) => { complete = resolve; });
++    const perform = jest.fn(() => work);
++    let first!: Promise<boolean>;
++    act(() => {
++      first = result.current.confirm({
++        title: 'Save',
++        message: 'Commit an action',
++        onConfirm: perform,
++      });
++    });
++
++    const modal = activeDialog(result);
++    let pending!: Promise<void>;
++    act(() => {
++      pending = modal.onConfirm() as Promise<void>;
++      void modal.onConfirm();
++      modal.onCancel();
++    });
++    let rejectedNew!: Promise<boolean>;
++    act(() => {
++      rejectedNew = result.current.confirm({ title: 'Other', message: 'Other action' });
++    });
++    expect(await rejectedNew).toBe(false);
++    expect(perform).toHaveBeenCalledTimes(1);
++    expect(result.current.isVisible).toBe(true);
++
++    await act(async () => {
++      complete();
++      await pending;
++    });
++    expect(await first).toBe(true);
++    expect(result.current.isVisible).toBe(false);
++  });
++});
+-- 
+2.43.0
+
+
+From 76f45097ecdffc13831a603953413189f90d6edb Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <brycembusiness2@gmail.com>
+Date: Wed, 7 Oct 2026 23:54:34 -0400
+Subject: [PATCH 4/7] docs(confirm): document fail-closed retries and
+ supersession rules
+
+---
+ docs/async-actions-and-confirmations.md | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/docs/async-actions-and-confirmations.md b/docs/async-actions-and-confirmations.md
+index 143ddd7..1c56086 100644
+--- a/docs/async-actions-and-confirmations.md
++++ b/docs/async-actions-and-confirmations.md
+@@ -90,9 +90,19 @@ Two ways to use the result, depending on where the work belongs:
+ - **Await the promise** — `const ok = await confirm({...})` resolves `true`/`false`
+   after the dialog closes. Use this when the follow-up work belongs to the caller.
+ 
+-`confirm()` always resolves, so the promise never dangles: cancelling resolves
+-`false`, and raising a second confirmation supersedes the first (resolving the
+-superseded one `false`).
++A successful `onConfirm` resolves `confirm()` to `true`. A rejected or
++throwing action does **not** count as confirmed: the dialog remains open, its
++spinner clears, and the user gets a generic, screen-reader-announced message
++with a retry or cancel path. Raw exception messages are deliberately never
++shown because wallet/storage failures can include sensitive values. The caller's
++`confirm()` promise remains pending until an eventual success or cancellation.
++
++Cancelling resolves `false`. A new request supersedes an *idle* dialog
++(resolving the earlier one `false`), while an in-flight confirmation rejects
++new requests as `false` without interrupting work that may already have side
++effects. Callbacks retained from superseded dialogs cannot confirm or dismiss
++the next request; the shared modal also blocks duplicate presses until the
++current action settles.
+ 
+ > **Why not `Alert.alert`?** The native alert cannot stay open while async work
+ > runs, cannot be themed, and cannot show progress — so a slow delete looked
+-- 
+2.43.0
+
+
+From 706c732d779f7c0b358499c9e9a18dd71b7d12da Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <brycembusiness2@gmail.com>
+Date: Wed, 7 Oct 2026 23:55:26 -0400
+Subject: [PATCH 5/7] fix(confirm): clear stale error when declarative dialog
+ reopens
+
+---
+ src/components/ConfirmModal.tsx | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/components/ConfirmModal.tsx b/src/components/ConfirmModal.tsx
+index 0be086e..0046184 100644
+--- a/src/components/ConfirmModal.tsx
++++ b/src/components/ConfirmModal.tsx
+@@ -58,6 +58,10 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
+   // treatment without re-implementing the pending state at each call site.
+   const [isConfirming, setIsConfirming] = useState(false);
+   const [confirmError, setConfirmError] = useState(false);
++  useEffect(() => {
++    // Declarative users can hide/reopen the same modal instance.
++    if (!visible) setConfirmError(false);
++  }, [visible]);
+   const isConfirmingRef = useRef(false);
+   const isMountedRef = useRef(true);
+ 
+-- 
+2.43.0
+
+
+From 6d150e5955373b47dfd19fea9b1e8f0e0bf3e927 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:47:26 +0000
+Subject: [PATCH 6/7] test(confirm): stub lucide icons so the #400 regression
+ suite loads
+
+The new async-confirmation-failure suite imports ConfirmModal, which pulls
+in lucide-react-native. That package ships untransformed ESM, so Jest
+failed with "Unexpected token 'export'" before any case ran. Mock the two
+icons ConfirmModal uses, as the existing useConfirm/ConfirmModal suites do.
+
+Refs #400
+---
+ tests/async-confirmation-failure.test.tsx | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/tests/async-confirmation-failure.test.tsx b/tests/async-confirmation-failure.test.tsx
+index 69f4f15..79a197a 100644
+--- a/tests/async-confirmation-failure.test.tsx
++++ b/tests/async-confirmation-failure.test.tsx
+@@ -1,5 +1,13 @@
+ import React from 'react';
+ import { act, renderHook } from '@testing-library/react-native';
++
++// lucide-react-native ships untransformed ESM; stub the icons ConfirmModal uses,
++// as the other ConfirmModal/useConfirm suites do.
++jest.mock('lucide-react-native', () => ({
++  X: () => null,
++  AlertTriangle: () => null,
++}));
++
+ import { ConfirmModal, ConfirmModalProps } from '../src/components/ConfirmModal';
+ import { useConfirm } from '../src/hooks/useConfirm';
+ 
+-- 
+2.43.0
+
+
+From e47c4bb7939205131fe2aa64b1049c0246d70cdd Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:48:21 +0000
+Subject: [PATCH 7/7] test(confirm): cover the rendered redacted retry error
+ for #400
+
+Exercise the ConfirmModal error path end to end through useConfirm: a
+rejected destructive action keeps the dialog open, shows the generic
+alert-role message without the thrown error text, and a successful retry
+resolves true and closes the dialog. Also cover the declarative reopen
+path that clears a stale failure message.
+
+Refs #400
+---
+ tests/async-confirmation-failure.test.tsx | 81 ++++++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/tests/async-confirmation-failure.test.tsx b/tests/async-confirmation-failure.test.tsx
+index 79a197a..da3f412 100644
+--- a/tests/async-confirmation-failure.test.tsx
++++ b/tests/async-confirmation-failure.test.tsx
+@@ -1,5 +1,6 @@
+ import React from 'react';
+-import { act, renderHook } from '@testing-library/react-native';
++import { Text } from 'react-native';
++import { act, fireEvent, render, renderHook } from '@testing-library/react-native';
+ 
+ // lucide-react-native ships untransformed ESM; stub the icons ConfirmModal uses,
+ // as the other ConfirmModal/useConfirm suites do.
+@@ -125,4 +126,82 @@ describe('async confirmation failure and lifecycle', () => {
+     expect(await first).toBe(true);
+     expect(result.current.isVisible).toBe(false);
+   });
++
++  it('shows a redacted, accessible retry error in the rendered dialog and clears it on success', async () => {
++    let attempts = 0;
++    const onResolved = jest.fn();
++    const Harness = () => {
++      const { confirm, confirmationDialog, isVisible } = useConfirm();
++      return (
++        <>
++          <Text
++            accessibilityRole="button"
++            accessibilityLabel="raise"
++            onPress={() => {
++              void confirm({
++                title: 'Delete Contact',
++                message: 'Are you sure?',
++                confirmLabel: 'Delete',
++                destructive: true,
++                onConfirm: async () => {
++                  attempts += 1;
++                  if (attempts === 1) throw new Error('secret seed in provider error');
++                },
++              }).then(onResolved);
++            }}
++          >
++            raise
++          </Text>
++          <Text>{isVisible ? 'dialog-open' : 'dialog-closed'}</Text>
++          {confirmationDialog}
++        </>
++      );
++    };
++
++    const { getByLabelText, getByTestId, getByText, queryByTestId, queryByText } = render(<Harness />);
++    await act(async () => {
++      fireEvent.press(getByLabelText('raise'));
++    });
++    await act(async () => {
++      fireEvent.press(getByLabelText('Delete'));
++    });
++
++    const alert = getByTestId('confirm-action-error');
++    expect(alert.props.accessibilityRole).toBe('alert');
++    expect(getByText('Unable to complete this action. Please try again.')).toBeTruthy();
++    expect(queryByText(/secret seed/)).toBeNull();
++    expect(getByText('dialog-open')).toBeTruthy();
++    expect(onResolved).not.toHaveBeenCalled();
++
++    await act(async () => {
++      fireEvent.press(getByLabelText('Delete'));
++    });
++    expect(attempts).toBe(2);
++    expect(onResolved).toHaveBeenCalledWith(true);
++    expect(getByText('dialog-closed')).toBeTruthy();
++    expect(queryByTestId('confirm-action-error')).toBeNull();
++  });
++
++  it('clears a previous failure when a declarative modal is hidden and reopened', async () => {
++    const onConfirm = jest.fn(async () => {
++      throw new Error('private storage detail');
++    });
++    const props = {
++      title: 'Reset Wallet',
++      message: 'Remove this wallet from the device?',
++      confirmLabel: 'Reset',
++      onConfirm,
++      onCancel: jest.fn(),
++    };
++
++    const { getByLabelText, queryByTestId, rerender } = render(<ConfirmModal visible {...props} />);
++    await act(async () => {
++      fireEvent.press(getByLabelText('Reset'));
++    });
++    expect(queryByTestId('confirm-action-error')).not.toBeNull();
++
++    rerender(<ConfirmModal visible={false} {...props} />);
++    rerender(<ConfirmModal visible {...props} />);
++    expect(queryByTestId('confirm-action-error')).toBeNull();
++  });
+ });
+-- 
+2.43.0
+

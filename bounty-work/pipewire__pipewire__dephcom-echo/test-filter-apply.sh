@@ -126,10 +126,56 @@ check "second record stream routed to mic.echo-cancel" wait_for 10 dev_is source
 check "still exactly one module-echo-cancel" test "$(ec_modules)" = 1
 kill $REC2; wait $REC2 2>/dev/null
 
+echo "== moving a filtered stream to another device moves the filter along"
+pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=mic2 media.class=Audio/Source/Virtual object.linger=true audio.position=[MONO] }' > /dev/null
+wait_for 10 sh -c 'pactl list short sources | grep -qw mic2'
+REC_IDX=$(pactl -f json list source-outputs | python3 -c "import json,sys; print(next(s['index'] for s in json.load(sys.stdin) if s['properties'].get('application.name')=='voip-rec'))")
+pactl move-source-output "$REC_IDX" mic2
+check "record stream re-filtered on mic2.echo-cancel" wait_for 10 dev_is source-outputs voip-rec mic2.echo-cancel
+check "new echo-canceller uses mic2 as source master" sh -c 'pactl list short modules | grep module-echo-cancel | grep -q "source_master=\"mic2\""'
+check "playback follows to the new echo-canceller" wait_for 10 sh -c 'pactl -f json list sink-inputs | python3 -c "
+import json,sys,subprocess
+si=[s for s in json.load(sys.stdin) if s[\"properties\"].get(\"application.name\")==\"voip-play\"][0]
+mods=[l.split() for l in subprocess.run([\"pactl\",\"list\",\"short\",\"modules\"],capture_output=True,text=True).stdout.splitlines() if \"mic2\" in l]
+sinks=json.loads(subprocess.run([\"pactl\",\"-f\",\"json\",\"list\",\"sinks\"],capture_output=True,text=True).stdout)
+own=[k for k in sinks if k[\"index\"]==si[\"sink\"]][0]
+sys.exit(0 if mods and own[\"owner_module\"]==int(mods[0][0]) else 1)"'
+check "old echo-canceller unloaded" wait_for 20 n_ec_is 1
+
+echo "== the master device goes away -> filter is rebuilt on the new device"
+pw-cli destroy mic2 > /dev/null 2>&1 || pw-cli destroy "$(pw-cli ls Node | grep -B2 'node.name = "mic2"' | awk '/id/ {print $2}' | tr -d ,)" > /dev/null
+check "record stream re-filtered on mic.echo-cancel" wait_for 15 dev_is source-outputs voip-rec mic.echo-cancel
+check "one echo-canceller left" wait_for 20 n_ec_is 1
+
 echo "== streams end -> filter is unloaded"
 kill $PLAY $REC; wait $PLAY $REC 2>/dev/null
 check "module-echo-cancel unloaded when unused" wait_for 20 n_ec_is 0
 check "echo-cancel nodes removed" sh -c '! pactl list short sinks | grep -q echo-cancel'
+
+echo "== unloading the filter by hand puts the streams back and does not reload it"
+pacat --playback --raw --client-name=voip-play --property=media.role=phone --property=filter.want=echo-cancel /dev/zero & PLAY=$!; PIDS+=($PLAY)
+parec --raw --client-name=voip-rec --property=media.role=phone --property=filter.want=echo-cancel > /dev/null & REC=$!; PIDS+=($REC)
+check "filter loaded for the new call" wait_for 10 dev_is source-outputs voip-rec mic.echo-cancel
+pactl unload-module "$(pactl list short modules | awk '/module-echo-cancel/ {print $1}')"
+check "playback back on speakers" wait_for 10 dev_is sink-inputs voip-play speakers
+check "record back on mic" wait_for 10 dev_is source-outputs voip-rec mic
+sleep 2
+check "filter not reloaded" n_ec_is 0
+kill $PLAY $REC; wait $PLAY $REC 2>/dev/null
+
+echo "== filter.want is ignored on devices meant for calls, filter.apply is not"
+pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=headset media.class=Audio/Sink object.linger=true audio.position=[MONO] device.intended-roles=Communication }' > /dev/null
+wait_for 10 sh -c 'pactl list short sinks | grep -qw headset'
+pacat --playback --raw --device=headset --client-name=hs-play --property=media.role=phone --property=filter.want=echo-cancel /dev/zero & HSP=$!; PIDS+=($HSP)
+parec --raw --client-name=hs-rec --property=media.role=phone --property=filter.want=echo-cancel > /dev/null & HSR=$!; PIDS+=($HSR)
+sleep 3
+check "no echo-canceller for a headset call" n_ec_is 0
+check "headset playback untouched" dev_is sink-inputs hs-play headset
+kill $HSP $HSR; wait $HSP $HSR 2>/dev/null
+pacat --playback --raw --device=headset --client-name=hs-play --property=media.role=phone --property=filter.apply=echo-cancel /dev/zero & HSP=$!; PIDS+=($HSP)
+parec --raw --client-name=hs-rec --property=media.role=phone --property=filter.apply=echo-cancel > /dev/null & HSR=$!; PIDS+=($HSR)
+check "explicit filter.apply loads the echo-canceller" wait_for 10 dev_is sink-inputs hs-play headset.echo-cancel
+kill $HSP $HSR; wait $HSP $HSR 2>/dev/null
 
 if [ $FAIL != 0 ]; then
 	echo "---- wireplumber log"; tail -30 "$WORK/wireplumber.log"

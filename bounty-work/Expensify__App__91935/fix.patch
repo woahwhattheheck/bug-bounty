@@ -1,0 +1,206 @@
+From c197fcc2b94af321aabcf1162c6cb0c1cbfa501b Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:08:27 +0000
+Subject: [PATCH 1/2] fix: restore report Date default sort direction (#91935)
+
+---
+ .../MoneyRequestReportTableHeader.tsx                      | 1 +
+ src/components/Search/SortableHeaderText.tsx               | 7 ++++++-
+ src/components/Search/SortableTableHeader.tsx              | 4 +++-
+ 3 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/components/MoneyRequestReportView/MoneyRequestReportTableHeader.tsx b/src/components/MoneyRequestReportView/MoneyRequestReportTableHeader.tsx
+index d328b2b08a9..7f6fb54f648 100644
+--- a/src/components/MoneyRequestReportView/MoneyRequestReportTableHeader.tsx
++++ b/src/components/MoneyRequestReportView/MoneyRequestReportTableHeader.tsx
+@@ -42,6 +42,7 @@ function MoneyRequestReportTableHeader({
+             ...getExpenseHeaders().map((header) => ({
+                 ...header,
+                 isColumnSortable: isSortableColumnName(header.columnName),
++                defaultSortOrder: header.columnName === CONST.SEARCH.TABLE_COLUMNS.DATE ? CONST.SEARCH.SORT_ORDER.ASC : undefined,
+             })),
+             {
+                 columnName: CONST.SEARCH.TABLE_COLUMNS.COMMENTS,
+diff --git a/src/components/Search/SortableHeaderText.tsx b/src/components/Search/SortableHeaderText.tsx
+index 27d1c532871..ed2462b1a85 100644
+--- a/src/components/Search/SortableHeaderText.tsx
++++ b/src/components/Search/SortableHeaderText.tsx
+@@ -22,6 +22,7 @@ type SearchTableHeaderColumnProps = WithSentryLabel & {
+     icon?: IconAsset;
+     isActive: boolean;
+     sortOrder: SortOrder;
++    defaultSortOrder?: SortOrder;
+     isSortable?: boolean;
+     containerStyle?: StyleProp<ViewStyle>;
+ 
+@@ -35,6 +36,7 @@ export default function SortableHeaderText({
+     text,
+     icon,
+     sortOrder,
++    defaultSortOrder = CONST.SEARCH.SORT_ORDER.DESC,
+     isActive,
+     textStyle,
+     containerStyle,
+@@ -76,7 +78,10 @@ export default function SortableHeaderText({
+     const displayIcon = isActive;
+     const activeColumnStyle = isSortable && isActive && styles.searchTableHeaderActive;
+ 
+-    const nextSortOrder = isActive && sortOrder === CONST.SEARCH.SORT_ORDER.DESC ? CONST.SEARCH.SORT_ORDER.ASC : CONST.SEARCH.SORT_ORDER.DESC;
++    let nextSortOrder = defaultSortOrder;
++    if (isActive) {
++        nextSortOrder = sortOrder === CONST.SEARCH.SORT_ORDER.DESC ? CONST.SEARCH.SORT_ORDER.ASC : CONST.SEARCH.SORT_ORDER.DESC;
++    }
+ 
+     return (
+         <View style={containerStyle}>
+diff --git a/src/components/Search/SortableTableHeader.tsx b/src/components/Search/SortableTableHeader.tsx
+index e370e4558e3..7a6930f5318 100644
+--- a/src/components/Search/SortableTableHeader.tsx
++++ b/src/components/Search/SortableTableHeader.tsx
+@@ -22,6 +22,7 @@ type ColumnConfig = {
+     icon?: IconAsset;
+     isColumnSortable?: boolean;
+     sortColumnName?: SearchSortBy;
++    defaultSortOrder?: SortOrder;
+     canBeMissing?: boolean;
+     canEdit?: boolean;
+ };
+@@ -75,7 +76,7 @@ function SortableTableHeader({
+     return (
+         <View style={[styles.flex1]}>
+             <View style={[styles.flex1, styles.flexRow, styles.gap3, containerStyles]}>
+-                {columns.map(({columnName, translationKey, icon, isColumnSortable, sortColumnName, canEdit}) => {
++                {columns.map(({columnName, translationKey, icon, isColumnSortable, sortColumnName, defaultSortOrder, canEdit}) => {
+                     if (!shouldShowColumn(columnName)) {
+                         return null;
+                     }
+@@ -101,6 +102,7 @@ function SortableTableHeader({
+                             icon={icon}
+                             textStyle={textStyle}
+                             sortOrder={sortOrder ?? CONST.SEARCH.SORT_ORDER.ASC}
++                            defaultSortOrder={defaultSortOrder}
+                             isActive={isActive}
+                             sentryLabel={CONST.SENTRY_LABEL.SEARCH.SORTABLE_HEADER}
+                             innerContainerStyle={canEdit && styles.editableCellHeader}
+-- 
+2.43.0
+
+
+From de07df28f1fd4b4389ed6211e5471a0515164767 Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 04:08:27 +0000
+Subject: [PATCH 2/2] test: cover sortable header default directions
+
+---
+ tests/unit/SortableHeaderTextTest.tsx | 99 +++++++++++++++++++++++++++
+ 1 file changed, 99 insertions(+)
+ create mode 100644 tests/unit/SortableHeaderTextTest.tsx
+
+diff --git a/tests/unit/SortableHeaderTextTest.tsx b/tests/unit/SortableHeaderTextTest.tsx
+new file mode 100644
+index 00000000000..ac28ee62406
+--- /dev/null
++++ b/tests/unit/SortableHeaderTextTest.tsx
+@@ -0,0 +1,99 @@
++import {fireEvent, render, screen} from '@testing-library/react-native';
++
++import SortableHeaderText from '@components/Search/SortableHeaderText';
++
++import CONST from '@src/CONST';
++
++import type {ComponentType} from 'react';
++import type {ViewProps} from 'react-native';
++
++import React from 'react';
++
++type PressableProps = {
++    onPress: () => void;
++};
++
++type ReactNativeActual = {
++    View: ComponentType<ViewProps & {onPress?: () => void}>;
++};
++
++jest.mock('@components/Icon', () => () => null);
++jest.mock('@components/Text', () => () => null);
++jest.mock('@components/Pressable/PressableWithFeedback', () => {
++    const {createElement} = jest.requireActual<typeof React>('react');
++    const {View} = jest.requireActual<ReactNativeActual>('react-native');
++
++    return ({onPress}: PressableProps) =>
++        createElement(View, {
++            onPress,
++            testID: 'sortable-header-pressable',
++        });
++});
++
++jest.mock('@hooks/useLazyAsset', () => ({
++    useMemoizedLazyExpensifyIcons: () => ({ArrowDownLong: 'arrow-down', ArrowUpLong: 'arrow-up'}),
++}));
++jest.mock('@hooks/useTheme', () => () => ({icon: 'icon'}));
++jest.mock('@hooks/useThemeStyles', () => () => ({
++    flexRow: {},
++    alignItemsCenter: {},
++    gap1: {},
++    textMicroSupporting: {},
++    searchTableHeaderActive: {},
++}));
++
++function pressHeader({isActive, sortOrder, defaultSortOrder}: {isActive: boolean; sortOrder: 'asc' | 'desc'; defaultSortOrder?: 'asc' | 'desc'}) {
++    const onPress = jest.fn();
++
++    render(
++        <SortableHeaderText
++            text="Date"
++            isActive={isActive}
++            sortOrder={sortOrder}
++            defaultSortOrder={defaultSortOrder}
++            onPress={onPress}
++            sentryLabel={CONST.SENTRY_LABEL.SEARCH.SORTABLE_HEADER}
++        />,
++    );
++
++    fireEvent.press(screen.getByTestId('sortable-header-pressable'));
++    return onPress;
++}
++
++describe('SortableHeaderText', () => {
++    it('defaults an inactive column to descending order', () => {
++        const onPress = pressHeader({isActive: false, sortOrder: CONST.SEARCH.SORT_ORDER.ASC});
++
++        expect(onPress).toHaveBeenCalledWith(CONST.SEARCH.SORT_ORDER.DESC);
++    });
++
++    it('uses an opt-in ascending default for an inactive column', () => {
++        const onPress = pressHeader({
++            isActive: false,
++            sortOrder: CONST.SEARCH.SORT_ORDER.DESC,
++            defaultSortOrder: CONST.SEARCH.SORT_ORDER.ASC,
++        });
++
++        expect(onPress).toHaveBeenCalledWith(CONST.SEARCH.SORT_ORDER.ASC);
++    });
++
++    it('toggles an active descending column to ascending regardless of its default', () => {
++        const onPress = pressHeader({
++            isActive: true,
++            sortOrder: CONST.SEARCH.SORT_ORDER.DESC,
++            defaultSortOrder: CONST.SEARCH.SORT_ORDER.DESC,
++        });
++
++        expect(onPress).toHaveBeenCalledWith(CONST.SEARCH.SORT_ORDER.ASC);
++    });
++
++    it('toggles an active ascending column to descending regardless of its default', () => {
++        const onPress = pressHeader({
++            isActive: true,
++            sortOrder: CONST.SEARCH.SORT_ORDER.ASC,
++            defaultSortOrder: CONST.SEARCH.SORT_ORDER.ASC,
++        });
++
++        expect(onPress).toHaveBeenCalledWith(CONST.SEARCH.SORT_ORDER.DESC);
++    });
++});
+-- 
+2.43.0
+

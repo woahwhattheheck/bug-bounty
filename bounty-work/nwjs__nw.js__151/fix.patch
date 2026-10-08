@@ -1,0 +1,326 @@
+From 071a78e07cb68a0a4babc8325c014ba72a22507b Mon Sep 17 00:00:00 2001
+From: woahwhattheheck <293286387+woahwhattheheck@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:49:01 +0000
+Subject: [PATCH] Add window.splash manifest field for a startup splash
+
+Document the new `window.splash` field. It is a page or image (or
+{url, width, height, min_duration, transparent}) shown in a frameless,
+centered, always-on-top window while the main window loads. The main
+window is then shown and the splash closed. The window bootstrap
+scripts live in nwjs/chromium.src (chrome/browser/resources/nwjs/
+newwin.js and default.js) and are changed in the companion commit
+there.
+
+In this repo:
+- add the `splash` manifest key constant and keep it out of the
+  attributes inherited by windows opened from the app
+- document the field in Manifest Format.md
+- add sanity tests for an HTML splash (size, min_duration, main window
+  shown afterwards) and an image splash (auto-sized to the image,
+  together with "show": false)
+
+Fixes #151
+---
+ docs/References/Manifest Format.md            |  43 ++++++++++++++++++
+ src/browser/nw_extensions_browser_hooks.cc    |   3 +-
+ src/common/shell_switches.cc                  |   3 ++
+ src/common/shell_switches.h                   |   1 +
+ test/sanity/manifest-splash-image/index.html  |  17 +++++++
+ .../sanity/manifest-splash-image/package.json |  11 +++++
+ test/sanity/manifest-splash-image/splash.png  | Bin 0 -> 356 bytes
+ test/sanity/manifest-splash-image/test.py     |  25 ++++++++++
+ test/sanity/manifest-splash/index.html        |  10 ++++
+ test/sanity/manifest-splash/package.json      |  14 ++++++
+ test/sanity/manifest-splash/splash.html       |  14 ++++++
+ test/sanity/manifest-splash/test.py           |  31 +++++++++++++
+ 12 files changed, 171 insertions(+), 1 deletion(-)
+ create mode 100644 test/sanity/manifest-splash-image/index.html
+ create mode 100644 test/sanity/manifest-splash-image/package.json
+ create mode 100644 test/sanity/manifest-splash-image/splash.png
+ create mode 100644 test/sanity/manifest-splash-image/test.py
+ create mode 100644 test/sanity/manifest-splash/index.html
+ create mode 100644 test/sanity/manifest-splash/package.json
+ create mode 100644 test/sanity/manifest-splash/splash.html
+ create mode 100644 test/sanity/manifest-splash/test.py
+
+diff --git a/docs/References/Manifest Format.md b/docs/References/Manifest Format.md
+index 3bc5d083..3f8f714b 100644
+--- a/docs/References/Manifest Format.md	
++++ b/docs/References/Manifest Format.md	
+@@ -184,6 +184,7 @@ Most of window subfields are inherited by sub windows opened by `window.open()`
+ * `position` -> `null`
+ * `resizable` -> `true`
+ * `show` -> `true`
++* `splash` -> no splash
+ 
+ All of the window subfields can be overwritten by using [`new-win-policy` event](Window.md#event-new-win-policy-frame-url-policy).
+ 
+@@ -280,6 +281,48 @@ Frameless apps do not have a title bar for the user to click and drag the window
+ 
+ * `{Boolean}` specify it to `false` if you want your app to be hidden on startup 
+ 
++### splash
++
++* `{String}` or `{Object}` a page or image shown in a small window while the main window is loading. The default is no splash.
++
++As a string, it is the path of the splash page or image, relative to the package root like [`main`](#main), or a URL:
++
++```json
++"window": {
++  "splash": "splash.png"
++}
++```
++
++As an object, it accepts the following fields:
++
++* `url` `{String}` path or URL of the splash page or image. Required.
++* `width` `{Integer}` _Optional_ inner width of the splash window.
++* `height` `{Integer}` _Optional_ inner height of the splash window.
++* `min_duration` `{Integer}` _Optional_ minimum time in milliseconds the splash stays on screen. The default is `0`.
++* `transparent` `{Boolean}` _Optional_ turn on [transparent](#transparent) mode for the splash window, for non-rectangular splash pages. The default is `false`.
++
++```json
++"window": {
++  "width": 1024,
++  "height": 768,
++  "splash": {
++    "url": "splash.html",
++    "width": 480,
++    "height": 270,
++    "min_duration": 1500
++  }
++}
++```
++
++The splash window is frameless, not resizable, centered on the screen, always on top and not shown in the taskbar. For an image without `width` and `height`, the window takes the size of the image; otherwise the default size is 400x300. Use an HTML page as the splash to show an animation (CSS animation, animated GIF/SVG, etc.).
++
++The main window is created hidden at the same time. When it has finished loading (the [`loaded` event](Window.md#event-loaded)) and `min_duration` milliseconds have passed since the splash appeared, the main window is shown and the splash window is closed. If [`show`](#show) is `false`, the splash is closed when the main window has loaded and the main window stays hidden until your app calls [`win.show()`](Window.md#winshowis_show). If the main window is closed before it finishes loading, the splash is closed as well.
++
++!!! note
++    The splash is shown once the app package has been read, so it covers the time spent loading the main window (scripts, Node.js modules, resources), not the time spent extracting a package that is zipped into the executable.
++
++`splash` only applies to the main window. It is not inherited by windows opened with `window.open()` or [`nw.Window.open()`](Window.md#windowopenurl-options-callback).
++
+ ### kiosk
+ 
+ * `{Boolean}` whether to use `Kiosk` mode. In `Kiosk` mode, the app will be fullscreen and try to prevent users from leaving the app, so you should remember to provide a way in app to leave `Kiosk` mode. This mode is mainly used for presentation on public displays
+diff --git a/src/browser/nw_extensions_browser_hooks.cc b/src/browser/nw_extensions_browser_hooks.cc
+index a330ec3c..3be75199 100644
+--- a/src/browser/nw_extensions_browser_hooks.cc
++++ b/src/browser/nw_extensions_browser_hooks.cc
+@@ -150,7 +150,8 @@ base::Value MergeManifest(const std::string& in_manifest) {
+                                                     switches::kmKiosk,
+                                                     switches::kmPosition,
+                                                     switches::kmResizable,
+-                                                    switches::kmShow
++                                                    switches::kmShow,
++                                                    switches::kmSplash
+                                                     };
+   base::DictValue manifest;
+ 
+diff --git a/src/common/shell_switches.cc b/src/common/shell_switches.cc
+index ea0e951e..dd4272c6 100644
+--- a/src/common/shell_switches.cc
++++ b/src/common/shell_switches.cc
+@@ -92,6 +92,9 @@ const char kmAlwaysOnTop[] = "always_on_top";
+ // Make window visible on all workspaces.
+ const char kmVisibleOnAllWorkspaces[] = "visible_on_all_workspaces";
+ 
++// Splash page or image shown while the main window loads.
++const char kmSplash[] = "splash";
++
+ // Whether we should support WebGL.
+ const char kmWebgl[] = "webgl";
+ 
+diff --git a/src/common/shell_switches.h b/src/common/shell_switches.h
+index b2eb3fc5..3a86d34d 100644
+--- a/src/common/shell_switches.h
++++ b/src/common/shell_switches.h
+@@ -59,6 +59,7 @@ extern NW_EXPORT const char kmShowInTaskbar[];
+ extern NW_EXPORT const char kmKiosk[];
+ extern NW_EXPORT const char kmAlwaysOnTop[];
+ extern NW_EXPORT const char kmVisibleOnAllWorkspaces[];
++extern NW_EXPORT const char kmSplash[];
+ extern NW_EXPORT const char kmInitialFocus[];
+ extern NW_EXPORT const char kmTransparent[];
+ extern NW_EXPORT const char kmDisableTransparency[];
+diff --git a/test/sanity/manifest-splash-image/index.html b/test/sanity/manifest-splash-image/index.html
+new file mode 100644
+index 00000000..f1617413
+--- /dev/null
++++ b/test/sanity/manifest-splash-image/index.html
+@@ -0,0 +1,17 @@
++<!DOCTYPE html>
++<html>
++  <head>
++    <meta charset="UTF-8">
++    <title>main</title>
++  </head>
++  <body>
++    <div id="main">main</div>
++    <script>
++      // `show` is false: the app decides when to show its window
++      setTimeout(function() {
++        nw.Window.get().show();
++        document.getElementById('main').innerHTML = 'shown';
++      }, 1000);
++    </script>
++  </body>
++</html>
+diff --git a/test/sanity/manifest-splash-image/package.json b/test/sanity/manifest-splash-image/package.json
+new file mode 100644
+index 00000000..0dcc4fe4
+--- /dev/null
++++ b/test/sanity/manifest-splash-image/package.json
+@@ -0,0 +1,11 @@
++{
++  "name": "manifest-splash-image",
++  "main": "index.html",
++  "window": {
++    "show": false,
++    "splash": {
++      "url": "splash.png",
++      "min_duration": 3000
++    }
++  }
++}
+diff --git a/test/sanity/manifest-splash-image/splash.png b/test/sanity/manifest-splash-image/splash.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..a42309a58d066832edb5d473c1a3a072ba041093
+GIT binary patch
+literal 356
+zcmeAS@N?(olHy`uVBq!ia0vp^AAq=>g9%737jWLgz`&^O>EaktaqI0JM?nSy4i>{d
+zSEL>l+>koJU}7G4;LU7{$PI25j7@Bg%?lhaa7eN6f|-IQP^NN*0EFpwK>@<-1*(HE
+z!CF8}!n&W$U$Fk>BF<YZxoR24j<b;%J{O=OJ{QuO%s^6LhVT|RBT{%vymbXD8~F}X
+f$RNgBiHq2stIkK<Ren1U7<vqzu6{1-oD!M<Dt&4F
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/sanity/manifest-splash-image/test.py b/test/sanity/manifest-splash-image/test.py
+new file mode 100644
+index 00000000..f79f63e2
+--- /dev/null
++++ b/test/sanity/manifest-splash-image/test.py
+@@ -0,0 +1,25 @@
++import os
++import sys
++import time
++sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++from nw_util import *
++from selenium.webdriver.chrome.options import Options
++chrome_options = Options()
++chrome_options.add_argument('nwapp=' + os.path.dirname(os.path.abspath(__file__)))
++driver = get_configured_webdriver(chrome_options_instance=chrome_options)
++driver.implicitly_wait(2)
++try:
++    # an image splash without width/height takes the size of the image (240x135)
++    wait_window_handles(driver, 2, timeout=20)
++    wait_switch_window_url(driver, 'splash.png', timeout=20)
++    size = wait_for_execute_script(driver, 'return [window.innerWidth, window.innerHeight]')
++    print('splash size: %s' % size)
++    assert abs(size[0] - 240) <= 1 and abs(size[1] - 135) <= 1
++    # closed after the main window has loaded and min_duration has passed;
++    # with "show": false the app shows its window itself
++    wait_window_handles(driver, 1, timeout=30)
++    driver.switch_to.window(driver.window_handles[0])
++    assert driver.current_url.endswith('index.html')
++    wait_for_element_id_content(driver, 'main', 'shown', timeout=10)
++finally:
++    driver.quit()
+diff --git a/test/sanity/manifest-splash/index.html b/test/sanity/manifest-splash/index.html
+new file mode 100644
+index 00000000..82639065
+--- /dev/null
++++ b/test/sanity/manifest-splash/index.html
+@@ -0,0 +1,10 @@
++<!DOCTYPE html>
++<html>
++  <head>
++    <meta charset="UTF-8">
++    <title>main</title>
++  </head>
++  <body>
++    <div id="main">main</div>
++  </body>
++</html>
+diff --git a/test/sanity/manifest-splash/package.json b/test/sanity/manifest-splash/package.json
+new file mode 100644
+index 00000000..1fe57406
+--- /dev/null
++++ b/test/sanity/manifest-splash/package.json
+@@ -0,0 +1,14 @@
++{
++  "name": "manifest-splash",
++  "main": "index.html",
++  "window": {
++    "width": 400,
++    "height": 300,
++    "splash": {
++      "url": "splash.html",
++      "width": 320,
++      "height": 180,
++      "min_duration": 4000
++    }
++  }
++}
+diff --git a/test/sanity/manifest-splash/splash.html b/test/sanity/manifest-splash/splash.html
+new file mode 100644
+index 00000000..34586100
+--- /dev/null
++++ b/test/sanity/manifest-splash/splash.html
+@@ -0,0 +1,14 @@
++<!DOCTYPE html>
++<html>
++  <head>
++    <meta charset="UTF-8">
++    <title>splash</title>
++  </head>
++  <body style="margin: 0; background: #2b6cb0; color: white;">
++    <div id="splash">splash</div>
++    <div id="size"></div>
++    <script>
++      document.getElementById('size').innerHTML = window.innerWidth + ',' + window.innerHeight;
++    </script>
++  </body>
++</html>
+diff --git a/test/sanity/manifest-splash/test.py b/test/sanity/manifest-splash/test.py
+new file mode 100644
+index 00000000..78feef74
+--- /dev/null
++++ b/test/sanity/manifest-splash/test.py
+@@ -0,0 +1,31 @@
++import os
++import sys
++import time
++sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++from nw_util import *
++from selenium.webdriver.chrome.options import Options
++chrome_options = Options()
++chrome_options.add_argument('nwapp=' + os.path.dirname(os.path.abspath(__file__)))
++driver = get_configured_webdriver(chrome_options_instance=chrome_options)
++driver.implicitly_wait(2)
++try:
++    # the splash window is open next to the (hidden) main window
++    wait_window_handles(driver, 2, timeout=20)
++    wait_switch_window_url(driver, 'splash.html', timeout=20)
++    seen = time.time()
++    assert 'splash' in wait_for_element_id(driver, 'splash')
++    size = wait_for_element_id(driver, 'size')
++    print('splash size: ' + size)
++    width, height = [int(v) for v in size.split(',')]
++    assert abs(width - 320) <= 1 and abs(height - 180) <= 1
++    # it is closed once the main window has loaded and min_duration has passed
++    wait_window_handles(driver, 1, timeout=30)
++    elapsed = time.time() - seen
++    print('splash closed after %.1fs' % elapsed)
++    assert elapsed >= 2  # min_duration is 4s; allow for polling delay
++    driver.switch_to.window(driver.window_handles[0])
++    assert driver.current_url.endswith('index.html')
++    assert 'main' in wait_for_element_id(driver, 'main')
++    assert driver.execute_script('return document.visibilityState') == 'visible'
++finally:
++    driver.quit()
+-- 
+2.43.0
+

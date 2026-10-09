@@ -23,6 +23,25 @@ mkdir -p "$IN" "$CAL" "$REC" "$SHOTS" "$RUN/xdg/config" "$RUN/xdg/data" "$RUN/xd
 # Stage inputs (make_inputs.sh wrote everything under $IN; isolate calib pair)
 mv "$IN/calib.mp4" "$IN/calib.gcsv" "$CAL/" 2>/dev/null || true
 
+# Stop immediately on an invalid synthetic telemetry rate, before costly UI driving.
+# Timestamp units are milliseconds because each sidecar declares tscale=0.001.
+for gcsv in "$IN"/uniq.gcsv "$IN"/amb.gcsv "$IN"/lensfb.gcsv "$CAL"/calib.gcsv; do
+  if ! awk -F, '
+    $1 == "t" && $2 == "gx" {
+      if (getline <= 0) exit 1
+      first = $1
+      if (getline <= 0) exit 1
+      delta = $1 - first
+      found = 1
+    }
+    END { if (!found || delta < 1 || delta > 20) exit 1 }
+  ' "$gcsv"; then
+    echo "ABORT: IMU rate below 50 Hz or invalid telemetry: $gcsv" >&2
+    exit 1
+  fi
+done
+
+
 MARKS=$REC/marks.txt; : > "$MARKS"
 Xvfb :142 -screen 0 1600x1000x24 -noreset > "$REC/xvfb.log" 2>&1 &
 XVFB=$!

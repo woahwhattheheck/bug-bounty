@@ -21,11 +21,13 @@ import sys
 
 IN = sys.argv[1]
 
-# 120 IMU rows @ 90 ms (tscale 0.001) -> ~10.8 s of gyro+accel samples.
+# 2,000 IMU rows @ 5 ms (tscale 0.001) -> 200 Hz over 9.995 s.
+# Gyroflow blocks calibration below 50 Hz; this matches the 10 s video and
+# avoids the sampling-rate modal that defeated the previous current-head demo.
 def rows():
     out = []
-    for i in range(120):
-        t = i * 90
+    for i in range(2000):
+        t = i * 5
         gx = 18.0 * ((i % 9) / 4.0 - 1.0)
         gy = 12.0 * ((i % 7) / 3.0 - 1.0)
         gz = 6.0 * ((i % 5) / 2.0 - 1.0)

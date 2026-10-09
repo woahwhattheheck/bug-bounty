@@ -156,8 +156,8 @@ jobs:
         working-directory: gyro
         run: |
           set -e
-          . "$GITHUB_WORKSPACE/evi/$EVI/env.sh"
           export GYRO_DIR="$GITHUB_WORKSPACE/gyro"
+          . "$GITHUB_WORKSPACE/evi/$EVI/env.sh"
           cargo build --profile deploy --locked -j"$(nproc)"
           mkdir -p "$GITHUB_WORKSPACE/evi/$EVI/run"
           sha256sum target/deploy/gyroflow | tee "$GITHUB_WORKSPACE/evi/$EVI/run/bin_sha256.txt"

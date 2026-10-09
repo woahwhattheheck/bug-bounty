@@ -1,0 +1,227 @@
+name: gyroflow742 current-head demo
+# Focused evidence run: build the real Gyroflow desktop app at an exact PR #1244
+# head and record three behaviors that changed after the earlier demo
+# (tree 74e2508f): zoom focal-range upload validation, legacy lens-info
+# metadata prefill fallback, and unbranded camera prefill ambiguity.
+# Manual dispatch only; no suite, no push/PR triggers.
+on:
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "Exact woahwhattheheck/gyroflow commit to build and record"
+        required: true
+        default: "122d742e0b80cfcde7dda436969953056985998d"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gyroflow742-head-demo
+  cancel-in-progress: false
+
+env:
+  EVI: bounty-work/gyroflow__gyroflow__742/current-head-demo
+  GYRO_REPO: woahwhattheheck/gyroflow
+
+jobs:
+  build-and-record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout evidence branch
+        uses: actions/checkout@v4
+        with:
+          path: evi
+
+      - name: Runtime identity
+        run: |
+          echo "runner=$RUNNER_NAME os=$RUNNER_OS image=$ImageOS arch=$RUNNER_ARCH"
+          uname -a
+          rustc --version; cargo --version
+          df -h / | tail -1
+          free -h | head -2
+          lsb_release -d 2>/dev/null || cat /etc/os-release | head -2
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android /usr/share/dotnet \
+            /opt/ghc /usr/local/share/boost /usr/lib/jvm 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            p7zip-full python3-pip clang libclang-dev bison pkg-config gperf curl unzip zip git \
+            libc++-dev libva-dev libvdpau-dev libvdpau1 mesa-va-drivers ocl-icd-opencl-dev opencl-headers \
+            libpulse-dev libasound-dev libxkbcommon-dev libfontconfig1 libfreetype6 \
+            libx11-dev libxft-dev libxext-dev autoconf libtool libglfw3 libgles2-mesa-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libxdamage-dev libxinerama-dev libxxf86vm-dev libdbus-1-dev libxtst-dev \
+            cmake ninja-build build-essential \
+            libxcb1 libxcb-util1 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 libxcb-cursor0 libxcb-randr0 \
+            libxcb-render0 libxcb-shm0 libxcb-sync1 libxcb-glx0 libxxf86vm1 libsm6 libice6 \
+            libx11-xcb1 libxcb-dri3-0 libxkbcommon-x11-0 libgl1 libegl1 libgles2 \
+            xvfb xdotool imagemagick bc ffmpeg fonts-liberation
+          pip3 install --break-system-packages -U aqtinstall numpy pillow
+          clang --version | head -1
+          ls -d /usr/lib/llvm-*/lib 2>/dev/null | sort -V | tail -1
+
+      - name: Clone source at exact head
+        run: |
+          git init gyro
+          cd gyro
+          git remote add origin "https://github.com/${{ env.GYRO_REPO }}"
+          git fetch --depth 1 origin "${{ inputs.head_sha }}" || {
+            git remote add upstream https://github.com/gyroflow/gyroflow
+            git fetch --depth 1 upstream "${{ inputs.head_sha }}"
+          }
+          git checkout --detach FETCH_HEAD
+          mkdir -p ext
+          echo "actual_head=$(git rev-parse HEAD)" | tee -a "$GITHUB_ENV"
+          echo "actual_tree=$(git rev-parse 'HEAD^{tree}')" | tee -a "$GITHUB_ENV"
+          test "$(git rev-parse HEAD)" = "${{ inputs.head_sha }}"
+
+      - name: Cache ext dependencies
+        uses: actions/cache@v4
+        id: extcache
+        with:
+          path: gyro/ext
+          key: g742-ext-qt643-ff9-opencv4120-mdk-v1
+
+      - name: Install Qt 6.4.3 (aqt)
+        if: steps.extcache.outputs.cache-hit != 'true'
+        run: python3 -m aqt install-qt linux desktop 6.4.3 gcc_64 -O gyro/ext -m qtsvg qtimageformats qtshadertools
+
+      - name: Download FFmpeg 9.0 (avbuild)
+        if: steps.extcache.outputs.cache-hit != 'true'
+        working-directory: gyro/ext
+        run: |
+          curl -L "https://sourceforge.net/projects/avbuild/files/linux/ffmpeg-9.0-linux-clang-gpl-lite.tar.xz/download" -o ffmpeg.tar.xz
+          sha256sum ffmpeg.tar.xz
+          7z x -aoa ffmpeg.tar.xz && tar -xf ffmpeg.tar
+          rm ffmpeg.tar ffmpeg.tar.xz
+          ls ffmpeg-9.0-linux-clang-gpl-lite/lib/amd64 | head -5
+
+      - name: Download MDK SDK (qml-video-rs URL)
+        if: steps.extcache.outputs.cache-hit != 'true'
+        working-directory: gyro/ext
+        run: |
+          curl -L "https://master.dl.sourceforge.net/project/mdk-sdk/mdk-sdk-linux.tar.xz?viasf=1" -o mdk-sdk-linux.tar.xz
+          sha256sum mdk-sdk-linux.tar.xz
+          tar -xf mdk-sdk-linux.tar.xz
+          test -f mdk-sdk/lib/amd64/libmdk.so || { ls -la; find . -name 'libmdk*' -o -name 'mdk.lib' | head; }
+          ls mdk-sdk/lib/amd64 | head -5
+
+      - name: Build OpenCV 4.12.0 (shared, focused module list)
+        if: steps.extcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch 4.12.0 https://github.com/opencv/opencv opencv-src
+          cmake -GNinja -S opencv-src -B opencv-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_LIST=core,imgproc,imgcodecs,calib3d,features2d,flann,video \
+            -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_opencv_apps=OFF \
+            -DBUILD_JAVA=OFF -DBUILD_opencv_python3=OFF -DBUILD_PROTOBUF=OFF \
+            -DWITH_CUDA=OFF -DWITH_IPP=OFF -DBUILD_IPP_IW=OFF -DWITH_ITT=OFF \
+            -DWITH_OPENCL=ON -DWITH_OPENMP=OFF -DWITH_TBB=OFF -DWITH_PTHREADS_PF=ON \
+            -DWITH_FFMPEG=OFF -DWITH_GSTREAMER=OFF -DWITH_GTK=OFF -DWITH_QT=OFF \
+            -DWITH_V4L=OFF -DWITH_VTK=OFF -DWITH_PROTOBUF=OFF -DWITH_VULKAN=OFF \
+            -DWITH_OPENEXR=OFF -DWITH_OPENJPEG=OFF -DWITH_JASPER=OFF -DWITH_WEBP=OFF \
+            -DWITH_TIFF=OFF -DWITH_1394=OFF -DWITH_VA_INTEL=OFF \
+            -DWITH_OPENCLAMDFFT=OFF -DWITH_OPENCLAMDBLAS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/gyro/ext/opencv-4.12.0"
+          cmake --build opencv-build -j"$(nproc)"
+          cmake --install opencv-build
+          ln -sf /usr/lib/x86_64-linux-gnu/libOpenCL.so.1 gyro/ext/opencv-4.12.0/lib/libOpenCL.so
+          rm -rf opencv-src opencv-build
+          ls gyro/ext/opencv-4.12.0/lib | head
+
+      - name: Fetch lens profile database (build.rs URL)
+        run: |
+          mkdir -p gyro/resources/camera_presets
+          curl -L "https://github.com/gyroflow/lens_profiles/releases/latest/download/profiles.cbor.gz" \
+            -o gyro/resources/camera_presets/profiles.cbor.gz
+          sha256sum gyro/resources/camera_presets/profiles.cbor.gz
+
+      - name: Cache cargo target and registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            gyro/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: g742-cargo-${{ inputs.head_sha }}
+
+      - name: Build gyroflow (deploy profile, locked)
+        working-directory: gyro
+        run: |
+          set -e
+          . "$GITHUB_WORKSPACE/evi/$EVI/env.sh"
+          export GYRO_DIR="$GITHUB_WORKSPACE/gyro"
+          cargo build --profile deploy --locked -j"$(nproc)"
+          mkdir -p "$GITHUB_WORKSPACE/evi/$EVI/run"
+          sha256sum target/deploy/gyroflow | tee "$GITHUB_WORKSPACE/evi/$EVI/run/bin_sha256.txt"
+
+      - name: Prepare demo inputs (chessboard clip + gcsv sidecars)
+        run: GYRO_DIR="$GITHUB_WORKSPACE/gyro" bash "$GITHUB_WORKSPACE/evi/$EVI/make_inputs.sh"
+
+      - name: Record focused demo under Xvfb
+        id: record
+        run: |
+          set -o pipefail
+          GYRO_DIR="$GITHUB_WORKSPACE/gyro" bash "$GITHUB_WORKSPACE/evi/$EVI/record.sh" 2>&1 | tee "$GITHUB_WORKSPACE/evi/$EVI/run/record_stdout.txt"
+
+      - name: Collect result.json
+        if: always()
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/evi/$EVI"
+          python3 - <<'PY'
+          import json, hashlib, os, glob, subprocess
+          run = "run"
+          def sha(p):
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for c in iter(lambda: f.read(1 << 20), b""): h.update(c)
+              return h.hexdigest()
+          files = {}
+          for p in sorted(glob.glob(run + "/**/*.*", recursive=True)):
+              if os.path.isfile(p): files[p] = {"sha256": sha(p), "bytes": os.path.getsize(p)}
+          appv = ""
+          try:
+              for line in open(run + "/app_A.log", encoding="utf-8", errors="replace"):
+                  if "Gyroflow" in line: appv = line.strip(); break
+          except OSError: pass
+          marks = ""
+          try: marks = open(run + "rec/marks.txt", encoding="utf-8", errors="replace").read()
+          except OSError: pass
+          result = {
+            "work_order": "GYROFLOW742-CURRENTHEAD-CLOUD-DEMO-20261008-CH-01",
+            "pr": "https://github.com/gyroflow/gyroflow/pull/1244",
+            "issue": "https://github.com/gyroflow/gyroflow/issues/742",
+            "requested_head": "${{ inputs.head_sha }}",
+            "actual_head": os.environ.get("actual_head"),
+            "actual_tree": os.environ.get("actual_tree"),
+            "run": {"id": "${{ github.run_id }}", "attempt": "${{ github.run_attempt }}",
+                    "number": "${{ github.run_number }}",
+                    "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                    "evidence_sha": "${{ github.sha }}", "ref": "${{ github.ref }}"},
+            "host": {"runner": os.environ.get("RUNNER_NAME"), "os": os.environ.get("RUNNER_OS"),
+                     "image": os.environ.get("ImageOS"), "arch": os.environ.get("RUNNER_ARCH")},
+            "app_version_log": appv,
+            "files": files,
+            "marks": marks,
+          }
+          with open(run + "/result.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, indent=2, ensure_ascii=False)
+          print(json.dumps(result, indent=2)[:4000])
+          PY
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gyroflow742-head-demo-${{ github.run_id }}
+          path: |
+            evi/bounty-work/gyroflow__gyroflow__742/current-head-demo/run/
+          if-no-files-found: warn

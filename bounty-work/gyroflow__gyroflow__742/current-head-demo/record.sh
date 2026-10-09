@@ -54,13 +54,25 @@ mark() { echo "$(echo "$(date +%s.%N) - $T0" | bc) $*" >> "$MARKS"; }
 sleep 1
 
 abort() { echo "ABORT: $*"; mark "ABORT $*"; kill -INT $FF 2>/dev/null; wait $FF 2>/dev/null; exit 1; }
+# A solid-black root capture cannot substantiate a GUI acceptance claim.
+# ImageMagick is installed by the existing focused evidence workflow.
+visible_shot() {
+  shot "$1" >/dev/null || abort "screenshot failed: $1"
+  local colors
+  colors=$(identify -format "%k" "$SHOTS/$1.png") || abort "screenshot unreadable: $1"
+  [ "$colors" -ge 8 ] || abort "blank GUI screenshot: $1 ($colors distinct colors)"
+  echo "$SHOTS/$1.png"
+}
 
 launch() {  # launch <file-or-empty> <tag> <cwd>
   (
     . "$EVI_DIR/env.sh"
     export LD_LIBRARY_PATH=$P/target/deploy:$LD_LIBRARY_PATH
     export DISPLAY=:142 XDG_CONFIG_HOME=$RUN/xdg/config XDG_DATA_HOME=$RUN/xdg/data XDG_CACHE_HOME=$RUN/xdg/cache
-    cd "$3" && exec "$BIN" $1
+    cd "$3" || exit 1
+    # A positional video path enters Gyroflow's headless export CLI. Use
+    # --open to load the input in the actual QML desktop interface.
+    if [ -n "$1" ]; then exec "$BIN" --open "$1"; else exec "$BIN"; fi
   ) > "$REC/app_$2.log" 2>&1 &
   echo $!
 }
@@ -89,7 +101,7 @@ APP=$(launch "$IN/uniq.mp4" A "$IN")
 wait_ready $APP "$REC/app_A.log"
 wait_identifier "$REC/app_A.log"
 pause 6
-shot segA_loaded
+visible_shot segA_loaded
 click 95 127; pause 2            # collapse Video information
 shot segA_selectors              # expect: brand=Sony, model=ILCE-7M4 prefilled
 move 170 500; wheel 170 500 down 12; pause 1; shot segA_lower
@@ -102,7 +114,7 @@ APP=$(launch "$IN/amb.mp4" B "$IN")
 wait_ready $APP "$REC/app_B.log"
 wait_identifier "$REC/app_B.log"
 pause 6
-shot segB_loaded
+visible_shot segB_loaded
 click 95 127; pause 2
 shot segB_selectors              # expect: brand empty, model 'a77' as manual Other text
 mark "segB done"
@@ -114,7 +126,7 @@ APP=$(launch "$IN/lensfb.mp4" C "$IN")
 wait_ready $APP "$REC/app_C.log"
 wait_identifier "$REC/app_C.log"
 pause 6
-shot segC_loaded
+visible_shot segC_loaded
 click 95 127; pause 2
 shot segC_selectors              # expect: lens combo = Canon EF-S 18-55mm f/3.5-5.6 IS II
 mark "segC done"
@@ -144,7 +156,9 @@ click 249 720; pause 1.5          # Advanced
 wheel 250 600 down 40; pause 1.5
 click 109 925; pause 1.5          # Plain chessboard pattern
 wheel 250 400 up 60; pause 1.5
+shot segD_before_autocalibrate
 move 264 345; pause 0.5; xdotool click 1   # Auto calibrate
+pause 3; shot segD_after_autocalibrate
 mark "segD auto calibrate"
 move 900 900
 n=0; until grep -q "rms:" "$REC/app_D.log"; do sleep 0.5; n=$((n+1)); [ $n -gt 600 ] && abort "calibration did not finish"; done

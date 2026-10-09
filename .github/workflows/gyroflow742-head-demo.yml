@@ -91,7 +91,7 @@ jobs:
 
       - name: Install Qt 6.4.3 (aqt)
         if: steps.extcache.outputs.cache-hit != 'true'
-        run: python3 -m aqt install-qt linux desktop 6.4.3 gcc_64 -O gyro/ext -m qtsvg qtimageformats qtshadertools
+        run: python3 -m aqt install-qt linux desktop 6.4.3 gcc_64 -O gyro/ext
 
       - name: Download FFmpeg 9.0 (avbuild)
         if: steps.extcache.outputs.cache-hit != 'true'
@@ -176,6 +176,7 @@ jobs:
         run: |
           set -e
           cd "$GITHUB_WORKSPACE/evi/$EVI"
+          mkdir -p run
           python3 - <<'PY'
           import json, hashlib, os, glob, subprocess
           run = "run"

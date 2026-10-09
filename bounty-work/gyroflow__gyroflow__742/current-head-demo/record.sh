@@ -18,6 +18,7 @@ BIN=$P/target/deploy/gyroflow
 IN=$RUN/input
 CAL=$RUN/input_cal          # calibrator dir: contains ONLY calib.mp4 + calib.gcsv
 mkdir -p "$IN" "$CAL" "$REC" "$SHOTS" "$RUN/xdg/config" "$RUN/xdg/data" "$RUN/xdg/cache"
+. "$EVI_DIR/drive.sh"
 
 # Stage inputs (make_inputs.sh wrote everything under $IN; isolate calib pair)
 mv "$IN/calib.mp4" "$IN/calib.gcsv" "$CAL/" 2>/dev/null || true
@@ -136,22 +137,22 @@ mark "segD export1: zoom without focal length"
 click 249 714; pause 2            # Export lens profile (upload checked)
 click 1047 673; pause 4           # accept file name -> validation refuses
 shot segD_err_nofocal             # "Specify the actual focal length used to calibrate this zoom lens"
-click 897 591; pause 1.5          # Cancel
+click 897 577; pause 1.5          # Cancel (validation-warning dialog button row)
 
 mark "segD focal=200 (outside 18-55)"
 wheel 250 600 down 40; pause 1.5
 click 109 710; pause 1.5          # Focal length checkbox
 click 320 751; pause 0.5; key ctrl+a; typetext "200"; key Return; pause 2
 shot segD_focal200
-click 249 714; pause 2            # Export again
+click 249 242; pause 2            # Export again (panel scrolled: button at top of view)
 click 1047 673; pause 4
 shot segD_err_range               # "outside the selected zoom lens's documented range"
-click 897 591; pause 1.5          # Cancel
+click 897 577; pause 1.5          # Cancel
 
 mark "segD focal=55 (inside 18-55)"
 click 320 751; pause 0.5; key ctrl+a; typetext "55"; key Return; pause 2
 shot segD_focal55
-click 249 714; pause 2            # Export again
+click 249 242; pause 2            # Export again (panel still scrolled)
 click 1047 673; pause 4
 shot segD_gpl_prompt              # GPLv3 upload consent -> validation passed
 click 836 591; pause 4            # No = save locally, nothing uploaded

@@ -190,11 +190,11 @@ jobs:
               if os.path.isfile(p): files[p] = {"sha256": sha(p), "bytes": os.path.getsize(p)}
           appv = ""
           try:
-              for line in open(run + "/app_A.log", encoding="utf-8", errors="replace"):
+              for line in open(run + "/rec/app_A.log", encoding="utf-8", errors="replace"):
                   if "Gyroflow" in line: appv = line.strip(); break
           except OSError: pass
           marks = ""
-          try: marks = open(run + "rec/marks.txt", encoding="utf-8", errors="replace").read()
+          try: marks = open(run + "/rec/marks.txt", encoding="utf-8", errors="replace").read()
           except OSError: pass
           result = {
             "work_order": "GYROFLOW742-CURRENTHEAD-CLOUD-DEMO-20261008-CH-01",

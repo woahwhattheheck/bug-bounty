@@ -95,6 +95,7 @@ wait_identifier() {  # wait for telemetry parse (non-fatal, bounded)
 mark "env: $(uname -r) $(cat /etc/os-release | head -1 | cut -d'"' -f2) | source $(cd $P && git rev-parse HEAD)"
 mark "binary sha256 $(sha256sum $BIN | cut -d' ' -f1)"
 
+if [ "${EVI_ONLY_SEGMENT_D:-false}" != "true" ]; then
 # ---------- Segment A: unbranded UNIQUE alias -> auto prefill ----------
 mark "segA launch uniq.mp4 (vendor empty, id=Alpha 7 IV)"
 APP=$(launch "$IN/uniq.mp4" A "$IN")
@@ -132,15 +133,27 @@ shot segC_selectors              # expect: lens combo = Canon EF-S 18-55mm f/3.5
 mark "segC done"
 kill $APP 2>/dev/null; wait $APP 2>/dev/null
 
+fi  # segments A-C have independent, accepted evidence in run 37903791073
 # ---------- Segment D: calibrator + zoom focal-range validation ----------
 mark "segD launch (calibrator, calib.mp4 + calib.gcsv)"
-APP=$(launch "" D "$CAL")
+APP=$(launch "$CAL/calib.mp4" D "$CAL")
 wait_ready $APP "$REC/app_D.log"
-pause 4
+wait_identifier "$REC/app_D.log"
+pause 6
 click 95 127; pause 2            # collapse Video information (empty anyway)
 shot segD_main
 click 232 617                    # Create new -> Lens calibrator window
-n=0; until xdotool search --onlyvisible --name "Lens calibrator" >/dev/null 2>&1; do sleep 0.5; n=$((n+1)); [ $n -gt 80 ] && abort "calibrator window did not open"; done
+n=0; until xdotool search --onlyvisible --name "Lens calibrator" >/dev/null 2>&1; do
+  sleep 0.5; n=$((n+1))
+  if [ $n -gt 80 ]; then
+    # Retain a precise window-state and visual receipt, not a guessed GUI pass.
+    xdotool search --onlyvisible --name "." 2>/dev/null | while read -r wid; do
+      printf "%s " "$wid"; xdotool getwindowname "$wid" 2>/dev/null || true
+    done > "$REC/segD_visible_windows.txt" || true
+    shot segD_calibrator_missing
+    abort "calibrator window did not open"
+  fi
+done
 pause 3
 W=$(xdotool search --onlyvisible --name "Lens calibrator" | head -1)
 xdotool windowsize "$W" 1440 920 windowmove "$W" 80 40; pause 2
